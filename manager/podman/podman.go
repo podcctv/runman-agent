@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runman-agent/manager/podman/cpualloc"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -622,7 +623,58 @@ func (m *Manager) getUsage(_ context.Context, vmID string) (cpuPct float32, memU
 		err = fmt.Errorf("podman stats stream closed without a report")
 		return
 	}
-	return usageFromStatsReport(report)
+	cpuPct, memUsed, netIn, netOut, err = usageFromStatsReport(report)
+	if err != nil {
+		return
+	}
+
+	// Podman 4.x can return CPU and memory data while omitting the Network map.
+	// Read the container network namespace counters in that case, rather than
+	// reporting a false zero-traffic sample to the control plane.
+	if netIn == 0 && netOut == 0 {
+		if in, out, procErr := m.getProcNetDev(vmID); procErr == nil {
+			netIn, netOut = in, out
+		}
+	}
+	return
+}
+
+// getProcNetDev reads cumulative byte counters from a running container's
+// network namespace. It is a compatibility fallback for Podman versions whose
+// stats API does not populate the Network map.
+func (m *Manager) getProcNetDev(vmID string) (in, out int64, err error) {
+	inspect, err := containers.Inspect(m.timeoutCtx(), vmID, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	if inspect.State == nil || inspect.State.Pid <= 0 {
+		return 0, 0, fmt.Errorf("container %s is not running", vmID)
+	}
+
+	file, err := os.Open(fmt.Sprintf("/proc/%d/net/dev", inspect.State.Pid))
+	if err != nil {
+		return 0, 0, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		parts := strings.SplitN(strings.TrimSpace(scanner.Text()), ":", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "lo" {
+			continue
+		}
+		fields := strings.Fields(parts[1])
+		if len(fields) < 9 {
+			continue
+		}
+		if rx, parseErr := strconv.ParseInt(fields[0], 10, 64); parseErr == nil {
+			in += rx
+		}
+		if tx, parseErr := strconv.ParseInt(fields[8], 10, 64); parseErr == nil {
+			out += tx
+		}
+	}
+	return in, out, scanner.Err()
 }
 
 func (m *Manager) ListVMs(ctx context.Context) ([]*agent.VMSummary, error) {
