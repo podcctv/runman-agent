@@ -79,7 +79,10 @@ jobs:
         run: |
           build_version="${{ github.ref_name }}"
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            upstream_base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${GITHUB_SHA}")
+            # Fork checkouts do not reliably include upstream tags. Fetch them
+            # explicitly, then choose only a tag reachable from this fork SHA.
+            git fetch --force --tags https://github.com/narwhal-cloud/runman-agent.git
+            upstream_base=$(git tag --merged "${GITHUB_SHA}" --list 'v[0-9]*' --sort=-version:refname | head -n1)
             [ -n "$upstream_base" ] || { echo "Unable to resolve upstream release baseline" >&2; exit 1; }
             build_version="${upstream_base}-diy.${GITHUB_SHA::12}"
           fi
@@ -179,7 +182,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          upstream_base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${GITHUB_SHA}")
+          git fetch --force --tags https://github.com/narwhal-cloud/runman-agent.git
+          upstream_base=$(git tag --merged "${GITHUB_SHA}" --list 'v[0-9]*' --sort=-version:refname | head -n1)
           [ -n "$upstream_base" ] || { echo "Unable to resolve upstream release baseline" >&2; exit 1; }
           diy_version="${upstream_base}-diy.${GITHUB_SHA::12}"
           notes="DIY build based on upstream ${upstream_base}; fork commit ${GITHUB_SHA}."
