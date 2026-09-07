@@ -16,6 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v7
         with:
@@ -59,6 +61,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v7
         with:
@@ -73,8 +77,7 @@ jobs:
         run: |
           build_version="${{ github.ref_name }}"
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            upstream_base=$(git ls-remote --tags --refs https://github.com/narwhal-cloud/runman-agent.git 'v*' \
-              | awk -F/ '{print $3}' | sort -V | tail -n1)
+            upstream_base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${GITHUB_SHA}")
             [ -n "$upstream_base" ] || { echo "Unable to resolve upstream release baseline" >&2; exit 1; }
             build_version="${upstream_base}-diy.${GITHUB_SHA::12}"
           fi
@@ -104,6 +107,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           repository: narwhal-cloud/rfw
           ref: dev
 
@@ -146,6 +150,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Download artifacts
         uses: actions/download-artifact@v8
@@ -169,8 +175,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          upstream_base=$(git ls-remote --tags --refs https://github.com/narwhal-cloud/runman-agent.git 'v*' \
-            | awk -F/ '{print $3}' | sort -V | tail -n1)
+          upstream_base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${GITHUB_SHA}")
           [ -n "$upstream_base" ] || { echo "Unable to resolve upstream release baseline" >&2; exit 1; }
           diy_version="${upstream_base}-diy.${GITHUB_SHA::12}"
           gh release delete continuous --yes 2>/dev/null || true
