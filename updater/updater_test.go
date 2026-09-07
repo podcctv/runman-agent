@@ -11,13 +11,13 @@ import (
 )
 
 func TestReleaseChannels(t *testing.T) {
-	for _, version := range []string{"main", "continuous", "continuous-" + strings.Repeat("a", 40), "v1.2.3"} {
+	for _, version := range []string{"main", "continuous", "continuous-" + strings.Repeat("a", 40), "v1.2.3", "v0.3.2-diy.abcdef123456"} {
 		t.Run(version, func(t *testing.T) {
 			api, base := releaseAPIURL(version), releaseDownloadBase(version)
 			if !strings.Contains(api, "repos/podcctv/runman-agent/") || !strings.Contains(base, "/podcctv/runman-agent/") {
 				t.Fatalf("wrong repository: %s %s", api, base)
 			}
-			if strings.HasPrefix(version, "v") {
+			if releaseChannel(version) == "latest" {
 				if !strings.HasSuffix(api, "/latest") || !strings.HasSuffix(base, "/latest/download") {
 					t.Fatal("stable channel changed")
 				}
@@ -58,6 +58,21 @@ func TestRollingVersionIdentity(t *testing.T) {
 	}
 	if _, err := releaseVersion(githubRelease{}, "latest"); err == nil {
 		t.Fatal("accepted empty stable version")
+	}
+}
+
+func TestDIYReleaseIdentityAndChannel(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	diy := "v0.3.2-diy." + sha[:12]
+	got, err := releaseVersion(githubRelease{TagName: "continuous", TargetCommitish: sha, Name: diy}, "continuous")
+	if err != nil || got != diy {
+		t.Fatalf("DIY release = %q, %v", got, err)
+	}
+	if releaseChannel(diy) != "continuous" {
+		t.Fatal("DIY version incorrectly selected the upstream stable channel")
+	}
+	if _, err := releaseVersion(githubRelease{TagName: "continuous", TargetCommitish: sha, Name: "v0.3.2-diy.bbbbbbb"}, "continuous"); err == nil {
+		t.Fatal("accepted DIY title for a different commit")
 	}
 }
 

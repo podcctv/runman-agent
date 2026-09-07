@@ -530,32 +530,13 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, _ *http.Request) {
 	jsonOK(w, resp)
 }
 
-// checkLatestVersion 从 GitHub Releases 获取最新版本号
+// checkLatestVersion reuses the updater's fork-aware release channel. DIY
+// builds must never be compared with the upstream latest tag.
 func (s *Server) checkLatestVersion() (version string, err error) {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get("https://api.github.com/repos/narwhal-cloud/runman-agent/releases/latest")
-	if err != nil {
-		return "", err
+	if s.updater == nil {
+		return "", fmt.Errorf("updater is not configured")
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("github api returned %d", resp.StatusCode)
-	}
-
-	var release struct {
-		TagName string `json:"tag_name"`
-	}
-
-	if err = json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		return "", err
-	}
-
-	if release.TagName == "" {
-		return "", fmt.Errorf("no releases found")
-	}
-
-	return release.TagName, nil
+	return s.updater.CheckLatestVersion()
 }
 
 type upgradeResponse struct {

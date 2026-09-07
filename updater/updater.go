@@ -26,6 +26,7 @@ const (
 type githubRelease struct {
 	TagName         string `json:"tag_name"`
 	TargetCommitish string `json:"target_commitish"`
+	Name            string `json:"name"`
 }
 
 type Service struct {
@@ -35,9 +36,15 @@ type Service struct {
 	updateMu    sync.Mutex
 }
 
-// Rolling releases must compare the embedded commit, not the constant tag
-// "continuous" (or the old build version "main"). Tagged builds stay stable.
+var diyVersionPattern = regexp.MustCompile(`^v[0-9]+(?:\.[0-9]+){1,2}(?:[-+][0-9A-Za-z.-]+)?-diy\.([0-9a-fA-F]{7,40})$`)
+
+// Rolling DIY releases are built from the fork's continuous channel even though
+// their display version starts with the upstream vX.Y.Z baseline. Tagged
+// upstream builds remain on the stable latest channel.
 func releaseChannel(version string) string {
+	if diyVersionPattern.MatchString(strings.TrimSpace(version)) {
+		return "continuous"
+	}
 	if strings.HasPrefix(version, "v") {
 		return "latest"
 	}
@@ -67,6 +74,15 @@ func releaseVersion(rel githubRelease, channel string) (string, error) {
 		sha := strings.TrimSpace(rel.TargetCommitish)
 		if rel.TagName != "continuous" || !commitPattern.MatchString(sha) {
 			return "", fmt.Errorf("continuous release has no immutable commit identity")
+		}
+		if name := strings.TrimSpace(rel.Name); diyVersionPattern.MatchString(name) {
+			// The title carries the upstream baseline. Require its embedded commit
+			// prefix to match the immutable release target before displaying it.
+			match := diyVersionPattern.FindStringSubmatch(name)
+			if strings.HasPrefix(strings.ToLower(sha), strings.ToLower(match[1])) {
+				return name, nil
+			}
+			return "", fmt.Errorf("DIY release title does not match target commit")
 		}
 		return "continuous-" + strings.ToLower(sha), nil
 	}
@@ -199,6 +215,12 @@ func (s *Service) fetchLatestVersion() (string, error) {
 	}
 
 	return releaseVersion(rel, releaseChannel(s.currentVer))
+}
+
+// CheckLatestVersion exposes the same fork-aware release channel used by the
+// automatic updater so the web panel cannot compare a DIY build with upstream.
+func (s *Service) CheckLatestVersion() (string, error) {
+	return s.fetchLatestVersion()
 }
 
 func (s *Service) executeUpdate() error {

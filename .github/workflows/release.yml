@@ -73,7 +73,10 @@ jobs:
         run: |
           build_version="${{ github.ref_name }}"
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            build_version="continuous-${{ github.sha }}"
+            upstream_base=$(git ls-remote --tags --refs https://github.com/narwhal-cloud/runman-agent.git 'v*' \
+              | awk -F/ '{print $3}' | sort -V | tail -n1)
+            [ -n "$upstream_base" ] || { echo "Unable to resolve upstream release baseline" >&2; exit 1; }
+            build_version="${upstream_base}-diy.${GITHUB_SHA::12}"
           fi
           go build \
             -tags containers_image_openpgp \
@@ -166,6 +169,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          upstream_base=$(git ls-remote --tags --refs https://github.com/narwhal-cloud/runman-agent.git 'v*' \
+            | awk -F/ '{print $3}' | sort -V | tail -n1)
+          [ -n "$upstream_base" ] || { echo "Unable to resolve upstream release baseline" >&2; exit 1; }
+          diy_version="${upstream_base}-diy.${GITHUB_SHA::12}"
           gh release delete continuous --yes 2>/dev/null || true
           git push origin :refs/tags/continuous 2>/dev/null || true
           gh release create continuous \
@@ -176,5 +183,5 @@ jobs:
             rfw-arm64 \
             --target "${GITHUB_SHA}" \
             --prerelease \
-            --title "Continuous (main)" \
-            --notes "Rolling release from the latest main branch commit (${GITHUB_SHA})."
+            --title "$diy_version" \
+            --notes "DIY build based on upstream ${upstream_base}; fork commit ${GITHUB_SHA}."
