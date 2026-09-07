@@ -1464,7 +1464,7 @@ EOF
 rfw_api_ready() {
     local attempts="${1:-10}" i
     for ((i = 0; i < attempts; i++)); do
-        curl -sf "http://$RFW_API_ADDR/api/rules" >/dev/null 2>&1 && return 0
+        curl -sf "http://$RFW_API_ADDR/api/status" >/dev/null 2>&1 && return 0
         sleep 1
     done
     return 1
@@ -1511,6 +1511,7 @@ install_rfw() {
         fi
     fi
 
+    _rfw_unit_changed=0
     if [ ! -f "/etc/systemd/system/rfw.service" ]; then
         # 过滤掉 lo 及虚拟网桥
         mapfile -t interfaces < <(ip -o link show | awk -F': ' '{print $2}' \
@@ -1551,7 +1552,8 @@ After=network.target
 [Service]
 Type=simple
 User=root
-Environment=RUST_LOG=info
+# Per-packet INFO logs can overwhelm journald during normal high traffic or an attack.
+Environment=RUST_LOG=warn
 WorkingDirectory=$RFW_BIN_DIR
 ExecStart=$RFW_BIN_DIR/rfw --iface $SEL_IFACE --api-addr $RFW_API_ADDR
 Restart=always
@@ -1561,17 +1563,28 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
+        _rfw_unit_changed=1
         log "$(t "✓ rfw service file written. API listens on $RFW_API_ADDR (local only)." "✓ rfw 服务文件已写入，API 监听 $RFW_API_ADDR（仅本地）。")"
+    elif grep -Fqx "Environment=RUST_LOG=info" /etc/systemd/system/rfw.service; then
+        # Upgrade installer-managed units so normal packet events do not flood journald.
+        sed -i 's/^Environment=RUST_LOG=info$/Environment=RUST_LOG=warn/' /etc/systemd/system/rfw.service
+        systemctl daemon-reload
+        _rfw_unit_changed=1
+        log "$(t "rfw packet logging changed to warn level." "rfw 逐包日志已调整为 warn 级别。")"
     fi
     
+    if [ "$_rfw_unit_changed" = "1" ] && systemctl is-active --quiet rfw; then
+        systemctl restart rfw
+    fi
     start_service rfw
 
-    # The API starts only after eBPF/XDP attaches. Some cloud NICs (notably
-    # ARM virtual NICs) reject the default native mode but support generic SKB.
+    # The API starts after eBPF attaches and persisted GeoIP rules are restored;
+    # a cold download may take up to the rfw HTTP client's 30-second timeout.
+    # Some cloud NICs reject the default native XDP mode but support generic SKB.
     _rfw_ready=0
-    if rfw_api_ready 10; then
+    if rfw_api_ready 45; then
         _rfw_ready=1
-    elif journalctl -u rfw --no-pager -n 60 2>/dev/null | grep -Eiq 'XDP.*(attach|附加)|attach.*XDP'; then
+    elif journalctl -u rfw -b --no-pager -n 120 2>/dev/null | grep -Eiq 'XDP.*(附加失败|attach failed)|failed to attach.*XDP'; then
         log "$(t "rfw XDP native mode is unsupported; retrying in SKB mode." "rfw 默认 XDP 模式不受该网卡支持，正在改用兼容的 SKB 模式重试。")"
         if enable_rfw_skb_mode && rfw_api_ready 15; then
             _rfw_ready=1

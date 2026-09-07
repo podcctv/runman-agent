@@ -222,7 +222,9 @@ cp "$TEST_ROOT/new-agent" "$3"
         self.assertIn('rfw_api_ready()', source)
         self.assertIn('enable_rfw_skb_mode()', source)
         self.assertIn('--xdp-mode skb', source)
-        self.assertIn('XDP.*(attach|附加)', source)
+        self.assertIn('XDP.*(附加失败|attach failed)', source)
+        self.assertIn('rfw_api_ready 45', source)
+        self.assertIn('/api/status', source)
 
 
 if __name__ == "__main__":
