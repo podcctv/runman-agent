@@ -575,45 +575,54 @@ func (m *Manager) GetVMInfo(ctx context.Context, vmID string) (*agent.VMSummary,
 	}, nil
 }
 
+// usageFromStatsReport extracts cumulative network counters from one Podman
+// snapshot. Network bytes are already cumulative, so unlike CPU percentage
+// they must not wait for a second streamed sample.
+func usageFromStatsReport(report entTypes.ContainerStatsReport) (cpuPct float32, memUsed, netIn, netOut int64, err error) {
+	if report.Error != nil {
+		err = fmt.Errorf("read podman stats: %w", report.Error)
+		return
+	}
+	if len(report.Stats) == 0 {
+		err = fmt.Errorf("podman returned no stats")
+		return
+	}
+
+	for _, s := range report.Stats {
+		cpuPct = float32(s.CPU)
+		memUsed = int64(s.MemUsage)
+		for name, n := range s.Network {
+			if name == "lo" {
+				continue
+			}
+			netIn += int64(n.RxBytes)
+			netOut += int64(n.TxBytes)
+		}
+	}
+	return
+}
+
 func (m *Manager) getUsage(_ context.Context, vmID string) (cpuPct float32, memUsed, netIn, netOut int64, err error) {
 	statsCtx, cancel := context.WithCancel(m.timeoutCtx())
 	defer cancel()
 
 	statsCh, err := containers.Stats(statsCtx, []string{vmID}, &containers.StatsOptions{
-		All:      ptr(false),
-		Stream:   ptr(true),
-		Interval: ptr(1),
+		All: ptr(false),
+		// A single report is sufficient for cumulative network byte counters.
+		// Streaming and discarding the first report makes one-shot Podman
+		// responses look like a successful zero-byte sample.
+		Stream: ptr(false),
 	})
 	if err != nil {
 		return
 	}
 
-	// 跳过第一个采样（基准值），取第二个计算速率
-	i := 0
-	for report := range statsCh {
-		if i == 0 {
-			i++
-			continue
-		}
-		for _, s := range report.Stats {
-			for name, n := range s.Network {
-				if name == "lo" {
-					continue
-				}
-				netIn += int64(n.RxBytes)
-				netOut += int64(n.TxBytes)
-			}
-			cpuPct = float32(s.CPU)
-			memUsed = int64(s.MemUsage)
-			cancel()
-			go func() {
-				for range statsCh {
-				}
-			}()
-			return
-		}
+	report, ok := <-statsCh
+	if !ok {
+		err = fmt.Errorf("podman stats stream closed without a report")
+		return
 	}
-	return
+	return usageFromStatsReport(report)
 }
 
 func (m *Manager) ListVMs(ctx context.Context) ([]*agent.VMSummary, error) {
