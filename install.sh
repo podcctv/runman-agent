@@ -753,10 +753,13 @@ download_with_retry() {
     local url=$1 dest=$2 max=3 attempt=1 curl_status
     while [ $attempt -le $max ]; do
         log "$(t "Downloading $url (attempt $attempt)..." "下载 $url (第 $attempt 次)...")"
-        if curl -fsSL -o "$dest" "$url"; then return 0; fi
-        curl_status=$?
-        rm -f "$dest"
-        log "$(t "Download attempt failed (curl exit $curl_status): $url" "下载尝试失败（curl 退出码 $curl_status）: $url")"
+        if curl -fsSL -o "$dest" "$url"; then
+            return 0
+        else
+            curl_status=$?
+            rm -f "$dest"
+            log "$(t "Download attempt failed (curl exit $curl_status): $url" "下载尝试失败（curl 退出码 $curl_status）: $url")"
+        fi
         [ $attempt -eq $max ] && { log "$(t "Download failed." "下载失败。")"; return 1; }
         attempt=$((attempt + 1)); sleep 5
     done

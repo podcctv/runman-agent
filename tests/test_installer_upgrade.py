@@ -216,6 +216,7 @@ cp "$TEST_ROOT/new-agent" "$3"
         self.assertIn('MIRROR_IMPORT_REASON="no_matching_arch"', source)
         self.assertNotIn('[ "$ARCH" = "amd64" ]', source)
         self.assertIn('curl 退出码 $curl_status', source)
+        self.assertIn('else\n            curl_status=$?', source)
 
     def test_rfw_retries_xdp_attach_failures_in_skb_mode(self):
         source = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
