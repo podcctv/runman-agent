@@ -457,11 +457,31 @@ show_agent_status() {
         "PANEL=http://$panel_host:$AGENT_WEB_PORT"
 }
 
+disable_podman_network_dns() {
+    local network_json="/etc/containers/networks/${PODMAN_NETWORK}.json" tmp
+    [ -f "$network_json" ] || die "$(t "Podman network config not found: $network_json" "Podman 网络配置不存在: $network_json")"
+    jq -e '.dns_enabled == false' "$network_json" >/dev/null 2>&1 && return 0
+
+    # Netavark JSON may be compact or pretty-printed. Preserve all other options
+    # and file permissions, and replace the file only after successful validation.
+    tmp=$(mktemp "${network_json}.XXXXXX") || die "Cannot prepare Podman DNS config update."
+    if ! cp -p "$network_json" "$tmp" \
+        || ! jq 'if type == "object" then .dns_enabled = false else error("Expected network object") end' "$network_json" > "$tmp" \
+        || ! mv "$tmp" "$network_json"; then
+        rm -f "$tmp"
+        die "$(t "Failed to disable Podman internal DNS: $network_json" "禁用 Podman 内部 DNS 失败: $network_json")"
+    fi
+    log "$(t "Podman internal DNS disabled; containers use their configured DNS servers." "Podman 内部 DNS 已禁用；容器使用各自配置的 DNS 服务器。")"
+}
+
 ensure_podman_network_from_config() {
     [ -f "$AGENT_CONFIG_FILE" ] || return 0
     command -v jq >/dev/null 2>&1 && command -v podman >/dev/null 2>&1 || return 0
     [ "$(jq -r '.virt_type // ""' "$AGENT_CONFIG_FILE" 2>/dev/null)" = "podman" ] || return 0
-    podman network exists "$PODMAN_NETWORK" 2>/dev/null && return 0
+    if podman network exists "$PODMAN_NETWORK" 2>/dev/null; then
+        disable_podman_network_dns
+        return 0
+    fi
 
     local mode subnet container_base container_gw network_json
     mode=$(jq -r '.ipv6_mode // "none"' "$AGENT_CONFIG_FILE")
@@ -469,11 +489,11 @@ ensure_podman_network_from_config() {
         "Podman 网络 $PODMAN_NETWORK 缺失，正在按现有配置重建。")"
     case "$mode" in
         none)
-            podman network create --driver=bridge \
+            podman network create --driver=bridge --disable-dns \
                 --subnet=10.91.0.0/20 --gateway=10.91.0.1 "$PODMAN_NETWORK"
             ;;
         snat)
-            podman network create --driver=bridge \
+            podman network create --driver=bridge --disable-dns \
                 --subnet=10.91.0.0/20 --gateway=10.91.0.1 \
                 --ipv6 --subnet=fd91:cafe:cafe:10::/64 --gateway=fd91:cafe:cafe:10::1 \
                 "$PODMAN_NETWORK"
@@ -493,7 +513,7 @@ container_net = ipaddress.IPv6Network(f'{ipaddress.IPv6Address(container_int)}/1
 print(container_net.network_address, container_net.network_address + 1)
 PYEOF
 )"
-            podman network create --driver=bridge \
+            podman network create --driver=bridge --disable-dns \
                 --subnet=10.91.0.0/20 --gateway=10.91.0.1 \
                 --ipv6 --subnet="${container_base}/112" --gateway="$container_gw" \
                 "$PODMAN_NETWORK"
@@ -700,7 +720,7 @@ install_packages() {
     elif [ "$virt_type" = "incus" ]; then
         extra_packages="incus uidmap acl bridge-utils"
     else
-        extra_packages="podman lxcfs xfsprogs"
+        extra_packages="podman aardvark-dns lxcfs xfsprogs"
     fi
 
     while [ $attempt -le $max ]; do
@@ -2392,6 +2412,9 @@ if systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null || [ -f "$AGENT_BINA
             mv /usr/libexec/podman/netavark.new /usr/libexec/podman/netavark
             log "$(t "✓ Custom netavark updated." "✓ 自定义 netavark 已更新。")"
         fi
+        if [ -f "/usr/lib/podman/aardvark-dns" ] && [ ! -f "/usr/libexec/podman/aardvark-dns" ]; then
+            ln -sf /usr/lib/podman/aardvark-dns /usr/libexec/podman/aardvark-dns
+        fi
     fi
 
     if systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null; then
@@ -2800,13 +2823,19 @@ elif [ "$VIRT_TYPE" = "podman" ]; then
     else
         log "$(t "Warning: netavark download failed, using system default." "警告: netavark 下载失败，使用系统默认版本。")"
     fi
+    # 确保 netavark 能找到 aardvark-dns（Debian 默认安装在 /usr/lib/podman 下）
+    if [ -f "/usr/lib/podman/aardvark-dns" ] && [ ! -f "/usr/libexec/podman/aardvark-dns" ]; then
+        ln -sf /usr/lib/podman/aardvark-dns /usr/libexec/podman/aardvark-dns
+    fi
 
 if podman network exists "$PODMAN_NETWORK" 2>/dev/null; then
     log "$(t "Podman network $PODMAN_NETWORK already exists, skipping." "Podman 网络 $PODMAN_NETWORK 已存在，跳过创建。")"
+    disable_podman_network_dns
 elif [ "$IPV6_MODE" = "none" ]; then
     log "$(t "Creating Podman network (IPv4 only)..." "创建 Podman 网络（仅 IPv4）...")"
     podman network create \
         --driver=bridge \
+        --disable-dns \
         --subnet=10.91.0.0/20 \
         --gateway=10.91.0.1 \
         "$PODMAN_NETWORK"
@@ -2815,6 +2844,7 @@ elif [ "$IPV6_MODE" = "snat" ]; then
     log "$(t "Creating Podman network (ULA IPv6, SNAT)..." "创建 Podman 网络（ULA IPv6，SNAT 模式）...")"
     podman network create \
         --driver=bridge \
+        --disable-dns \
         --subnet=10.91.0.0/20 \
         --gateway=10.91.0.1 \
         --ipv6 \
@@ -2844,6 +2874,7 @@ PYEOF
 
     podman network create \
         --driver=bridge \
+        --disable-dns \
         --subnet=10.91.0.0/20 --gateway=10.91.0.1 \
         --ipv6 \
         --subnet="${CONTAINER_BASE}/112" --gateway="$CONTAINER_GW" \

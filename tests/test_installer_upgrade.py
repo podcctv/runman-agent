@@ -45,6 +45,9 @@ class UpgradeTests(unittest.TestCase):
         source = source.replace("/opt/narwhal-agent", str(self.agent))
         source = source.replace("/var/lib/narwhal-agent", str(self.data))
         source = source.replace("/run/lock/narwhal-agent-install.lock", str(self.root / "install.lock"))
+        source = source.replace("/etc/containers/networks/", str(self.root / "networks") + "/")
+        source = source.replace("/usr/libexec/podman/", str(self.root / "libexec") + "/")
+        source = source.replace("/usr/lib/podman/", str(self.root / "lib") + "/")
         self.script = self.root / "install.sh"
         self.script.write_text(source)
         self.env = dict(os.environ, PATH=str(self.mock) + ":" + os.environ["PATH"],
@@ -82,8 +85,9 @@ cp "$TEST_ROOT/new-agent" "$3"
     def write_config(self):
         (self.agent / "config.json").write_text(json.dumps(self.config))
 
-    def run_installer(self, *args, success=True):
-        result = subprocess.run(["bash", str(self.script), "en", "--update-only",
+    def run_installer(self, *args, success=True, agent_only=True):
+        update_args = ["--update-only"] if agent_only else []
+        result = subprocess.run(["bash", str(self.script), "en", *update_args,
                                  "--non-interactive", *args], cwd=self.root, env=self.env,
                                 text=True, capture_output=True, timeout=30)
         output = result.stdout + result.stderr
@@ -114,6 +118,46 @@ cp "$TEST_ROOT/new-agent" "$3"
         self.env["TEST_ACTIVE"] = "0"
         _, calls = self.run_installer()
         self.assertNotIn("systemctl restart", calls)
+
+    def test_podman_agent_only_upgrade_preserves_network_dns(self):
+        self.config["virt_type"] = "podman"
+        self.write_config()
+        network_dir = self.root / "networks"
+        network_dir.mkdir()
+        network = network_dir / "narwhal-net.json"
+        original = '{"name":"narwhal-net","dns_enabled":true,"options":{"custom":"keep"}}'
+        network.write_text(original)
+        self.run_installer()
+        self.assertEqual(network.read_text(), original)
+
+    def test_normal_podman_upgrade_migrates_existing_network_dns(self):
+        self.config["virt_type"] = "podman"
+        self.write_config()
+        network_dir = self.root / "networks"
+        network_dir.mkdir()
+        network = network_dir / "narwhal-net.json"
+        original = {"name": "narwhal-net", "dns_enabled": True, "options": {"custom": "keep"}}
+        network.write_text(json.dumps(original, separators=(",", ":")))
+        # Isolate unrelated host setup, but run the real normal-upgrade dispatcher
+        # and network migration. All unexpected host commands still fail.
+        stubs = "\n".join(name + "() { :; }" for name in (
+            "check_podman_version", "enable_bbr", "configure_journald",
+            "configure_podman_registry_mirror", "install_podman_forwarding_compat", "install_rfw",
+        )) + "\n"
+        source = self.script.read_text()
+        marker = 'if systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null || [ -f "$AGENT_BINARY" ]'
+        self.assertIn(marker, source)
+        self.script.write_text(source.replace(marker, stubs + marker, 1))
+        self.tool("podman", r'''
+printf 'podman %s\n' "$*" >> "$TEST_CALLS"
+if [ "$*" = 'network exists narwhal-net' ]; then exit 0; fi
+echo "FORBIDDEN podman $*" >> "$TEST_CALLS"
+exit 93
+''')
+        output, calls = self.run_installer(agent_only=False)
+        self.assertIn("Update complete!", output)
+        self.assertIn("podman network exists narwhal-net", calls)
+        self.assertEqual(json.loads(network.read_text()), dict(original, dns_enabled=False))
 
     def test_menu_agent_only_upgrade(self):
         result = subprocess.run(["bash", str(self.script), "en", "--menu"],
