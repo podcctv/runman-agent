@@ -528,6 +528,12 @@ bash install.sh --uninstall --purge-incus
 
 **Web 管理面板**：`http://<服务器IP>:8792`
 
+浏览器访问面板时会进入独立登录页，使用原有 `web_user` 和面板密码登录，支持中英文切换、
+密码显示及页内错误提示。右上角 **Sign out** 可退出；会话在 12 小时后、Agent 重启或
+管理员账号/密码变更后失效。密码不会写入浏览器存储。脚本仍可通过 `curl -u` 使用 Basic Auth
+访问 API；未登录 API 返回 `401`，浏览器页面跳转到 `/login`。HTTPS 反向代理应保留原始
+`Host`，并设置 `X-Forwarded-Proto: https`，以启用安全 Cookie。
+
 ---
 
 ## 第三步 — 对接与轮换 Token
@@ -718,7 +724,7 @@ curl -u 'admin:<面板密码>' http://127.0.0.1:8792/api/vms/<实例名>/portfwd
 
 # Token 与面板
 bash install.sh --show-token
-curl -I http://127.0.0.1:8792   # 未认证返回 401 属正常
+curl -I http://127.0.0.1:8792   # 未认证返回 303，跳转到 /login 属正常
 ```
 
 手工 `/64` 先用菜单 **6** 验证，再安装；必须分别覆盖路由/隧道（HE、WireGuard、供应商静态

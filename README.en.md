@@ -238,6 +238,15 @@ installation stops when live source-address verification fails.
 
 **Web panel**: `http://<server-ip>:8792`
 
+The browser now opens a dedicated sign-in page using the existing `web_user` and
+panel password, with English/Chinese switching, password visibility and inline
+errors. Use **Sign out** in the top-right to end the session. Sessions expire
+after 12 hours, an Agent restart, or a username/password change. Passwords are not
+saved in browser storage. Scripts can still use `curl -u` for Basic Auth API
+access; unauthenticated APIs return `401`, while browser pages redirect to
+`/login`. HTTPS reverse proxies should preserve the original `Host` and send
+`X-Forwarded-Proto: https` for secure cookies.
+
 ## Step 3 — Integration Token and Rotation
 
 Pass an existing platform Token with `--token`, or use `--generate-token` (or

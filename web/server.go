@@ -60,6 +60,7 @@ type Server struct {
 	vmSnapshotMu sync.Mutex
 	version      string
 	updater      *updater.Service
+	webAuth      *webAuthenticator
 
 	monitorHst map[string][]vmListItem
 	monitorMu  sync.RWMutex
@@ -75,46 +76,28 @@ func NewServer(database *db.DB, mgr manager.VMManager, hostMon *monitor.HostMoni
 	}
 
 	return &Server{
-		db:          database,
-		cfg:         cfg,
-		mgr:         mgr,
-		cloudHVMgr:  cloudHVMgr,
-		hostMon:     hostMon,
-		pf:          pf,
-		wg:          wg,
-		agent:       agent,
-		version:     version,
-		updater:     upd,
+		db:         database,
+		cfg:        cfg,
+		mgr:        mgr,
+		cloudHVMgr: cloudHVMgr,
+		hostMon:    hostMon,
+		pf:         pf,
+		wg:         wg,
+		agent:      agent,
+		version:    version,
+		updater:    upd,
+		webAuth: newWebAuthenticator(func() (string, string) {
+			conf := cfg.Get()
+			return conf.WebUser, conf.WebPassHash
+		}),
 		vmSnapshots: make(map[string]*vmNetSnapshot),
 		monitorHst:  make(map[string][]vmListItem),
 	}
 }
 
-// authMiddleware enforces HTTP Basic Auth when WebUser is configured.
-// If no credentials are stored in config the request passes through.
-// /api/vm-status is always public (used by VMs to report status).
+// authMiddleware uses browser sessions and keeps Basic Auth for API clients.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip auth for VM status reporting endpoint (VMs use it)
-		if r.URL.Path == "/api/vm-status" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		conf := s.cfg.Get()
-		if conf.WebUser == "" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		user, pass, ok := r.BasicAuth()
-		if !ok || user != conf.WebUser ||
-			bcrypt.CompareHashAndPassword([]byte(conf.WebPassHash), []byte(pass)) != nil {
-			w.Header().Set("WWW-Authenticate", `Basic realm="narwhalcloud"`)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	return s.webAuth.wrap(next)
 }
 
 func (s *Server) ListenAndServe(addr string) error {
@@ -191,8 +174,12 @@ func (s *Server) ListenAndServe(addr string) error {
 
 	// 静态文件
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			data, err := staticFiles.ReadFile("static/index.html")
+		if r.URL.Path == "/" || r.URL.Path == "/login" {
+			page := "static/index.html"
+			if r.URL.Path == "/login" {
+				page = "static/login.html"
+			}
+			data, err := staticFiles.ReadFile(page)
 			if err != nil {
 				http.NotFound(w, r)
 				return

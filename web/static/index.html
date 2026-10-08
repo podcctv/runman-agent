@@ -49,6 +49,7 @@
                 <span id="version-text">v-</span>
             </button>
             <span class="w-2.5 h-2.5 bg-green-400 rounded-full pulse"></span>
+            <button id="sign-out" type="button" onclick="signOut()" class="hidden min-h-[44px] px-3 rounded-lg border border-indigo-400 hover:bg-indigo-600 focus:outline-none focus:ring-2 focus:ring-white transition-colors" title="Sign out / 退出登录">Sign out</button>
         </div>
     </div>
 </nav>
@@ -862,10 +863,34 @@ function disableAllButtons(disabled) {
     });
 }
 
+let redirectingToLogin = false;
+async function authenticatedFetch(path, opts = {}) {
+    const res = await fetch(path, opts);
+    if (res.status === 401 && !redirectingToLogin) {
+        redirectingToLogin = true;
+        location.replace('/login?reason=expired&next=' + encodeURIComponent(location.pathname + location.search + location.hash));
+    }
+    return res;
+}
+
+async function signOut() {
+    const button = $('sign-out');
+    button.disabled = true;
+    try {
+        const res = await fetch('/api/auth/logout', {method: 'POST', credentials: 'same-origin'});
+        if (!res.ok) throw new Error('Unable to sign out. Please try again.');
+        redirectingToLogin = true;
+        location.replace('/login?reason=logout');
+    } catch (error) {
+        button.disabled = false;
+        alert(error.message);
+    }
+}
+
 async function api(method, path, body) {
     const opts = { method, headers: {'Content-Type':'application/json'} };
     if (body) opts.body = JSON.stringify(body);
-    const res = await fetch(path, opts);
+    const res = await authenticatedFetch(path, opts);
     if (!res.ok) throw new Error(await res.text());
     if (res.status === 204) return null;
     return res.json().catch(()=>null);
@@ -1999,7 +2024,7 @@ async function rfwDeleteRule(id, btn) {
     if (!confirm(`Delete firewall rule #${id}?`)) return;
     btn.disabled = true;
     try {
-        const r = await fetch(`/rfw/api/rules/${id}`, { method: 'DELETE' });
+        const r = await authenticatedFetch(`/rfw/api/rules/${id}`, { method: 'DELETE' });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         rfwRefreshRules();
     } catch(e) {
@@ -2033,7 +2058,7 @@ async function rfwCreateRule(e) {
     msg.textContent = '';
     msg.className = 'text-xs';
     try {
-        const r = await fetch('/rfw/api/rules', {
+        const r = await authenticatedFetch('/rfw/api/rules', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
@@ -2091,6 +2116,8 @@ function rfwOnDirectionChange(val) {
 let currentConf = null;
 
 async function init() {
+    const session = await api('GET', '/api/auth/session');
+    $('sign-out').classList.toggle('hidden', !session?.enabled);
     const [sys, conf, imgs, version] = await Promise.all([
         api('GET','/api/system/info'),
         api('GET','/api/config'),
@@ -2346,6 +2373,9 @@ init().then(() => {
     rfwCheckStatus();
     rfwRefreshRules();
     setInterval(rfwCheckStatus, 10000);
+}).catch(error => {
+    // Session expiry during startup already navigates to the login page.
+    if (!redirectingToLogin) console.error('Unable to load the console:', error);
 });
 </script>
 </body>
