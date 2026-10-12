@@ -113,6 +113,19 @@ bash install.sh en --virt podman --data-size 8G --ipv6-mode none \
   --podman-registry-mirror https://mirror.example.com --non-interactive
 ```
 
+## Reset the panel password
+
+Menu item `4` and `--reset-panel-password` read hidden input from the controlling terminal, independently of a streamed installer's stdin. Passwords must have at least 8 characters and at most 72 UTF-8 bytes (bcrypt limit). Special characters, backslashes, and surrounding spaces are literal. Empty confirmation, short input, and mismatches re-prompt instead of returning to the shell; `Ctrl+C` cancels without changing the password. The Agent is restarted only after a successful save, and restart failure is reported separately.
+
+Download the whole script before a one-shot operation to avoid an early-exit broken pipe from `curl`. Never paste a real password into a shell command:
+
+```bash
+runman_installer=$(mktemp) &&
+curl -fsSL https://raw.githubusercontent.com/podcctv/runman-agent/main/install.sh -o "$runman_installer" &&
+bash "$runman_installer" en --reset-panel-password
+[ -z "${runman_installer:-}" ] || rm -f -- "$runman_installer"
+```
+
 ## Virtualization Types
 
 | # | Type                                  | Description                                                                             |

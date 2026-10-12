@@ -535,20 +535,64 @@ restart_agent_services() {
     show_agent_status
 }
 
-reset_panel_password() {
+read_panel_secret() {
+    local target="$1" prompt="$2" value
+    # Never consume the installer stream (curl | bash), split whitespace, or
+    # interpret backslashes. panel_tty belongs to the reset subshell below.
+    if ! IFS= read -r -s -u "$panel_tty" -p "$prompt" value; then
+        printf '\n' >&"$panel_tty"
+        die "$(t "Password reset cancelled; password unchanged." "已取消密码重置，密码未修改。")"
+    fi
+    printf '\n' >&"$panel_tty"
+    # Some SSH clients paste CRLF even when the terminal only consumes LF.
+    value=${value%$'\r'}
+    printf -v "$target" '%s' "$value"
+}
+
+reset_panel_password() (
     [ -x "$AGENT_BINARY" ] && [ -f "$AGENT_CONFIG_FILE" ] \
         || die "$(t "Agent is not installed." "Agent 尚未安装。")"
-    [ "$NON_INTERACTIVE" != "1" ] && [ -t 0 ] \
+    [ "$NON_INTERACTIVE" != "1" ] \
         || die "$(t "Panel password reset requires an interactive terminal." "重置面板密码需要交互式终端。")"
-    local first second
-    read -rsp "$(t "New panel password (minimum 8 characters): " "新面板密码（至少 8 个字符）: ")" first; echo
-    read -rsp "$(t "Confirm new panel password: " "再次输入新面板密码: ")" second; echo
-    [ "$first" = "$second" ] || die "$(t "Passwords do not match." "两次密码不一致。")"
-    [ "${#first}" -ge 8 ] || die "$(t "Password must contain at least 8 characters." "密码至少需要 8 个字符。")"
-    "$AGENT_BINARY" --config "$AGENT_CONFIG_FILE" --reset-password "$first" >/dev/null
-    systemctl restart "$AGENT_SERVICE"
+    local panel_tty first second
+    if ! { exec {panel_tty}<>/dev/tty; } 2>/dev/null; then
+        die "$(t "Panel password reset requires an interactive terminal." "重置面板密码需要交互式终端。")"
+    fi
+    trap 'printf "\n" >&"$panel_tty"; exit 130' INT
+    trap 'printf "\n" >&"$panel_tty"; exit 143' TERM
+    # Retry in the installer instead of returning to the parent shell with the
+    # next pasted secret still pending. Empty lines from CRLF are harmless.
+    while true; do
+        read_panel_secret first "$(t "New panel password (minimum 8 characters; Ctrl+C to cancel): " "新面板密码（至少 8 个字符；Ctrl+C 取消）: ")"
+        if [ "${#first}" -lt 8 ]; then
+            log "$(t "Password must contain at least 8 characters. Please try again." "密码至少需要 8 个字符，请重新输入。")"
+            continue
+        fi
+        if ! (LC_ALL=C; [ "${#first}" -le 72 ]); then
+            log "$(t "Password must not exceed 72 UTF-8 bytes. Please try again." "密码不能超过 72 个 UTF-8 字节，请重新输入。")"
+            continue
+        fi
+        while true; do
+            read_panel_secret second "$(t "Confirm new panel password: " "再次输入新面板密码: ")"
+            [ -n "$second" ] && break
+            log "$(t "Confirmation is empty. Please enter the password again." "确认密码为空，请再次输入密码。")"
+        done
+        if [ "$first" != "$second" ]; then
+            log "$(t "Passwords do not match. Please enter both passwords again." "两次密码不一致，请重新输入两次密码。")"
+            continue
+        fi
+        break
+    done
+    if ! "$AGENT_BINARY" --config "$AGENT_CONFIG_FILE" --reset-password "$first" >/dev/null; then
+        unset first second
+        die "$(t "Failed to save the panel password; Agent was not restarted." "保存面板密码失败，未重启 Agent。")"
+    fi
+    unset first second
+    if ! systemctl restart "$AGENT_SERVICE"; then
+        die "$(t "Password saved, but Agent restart failed. Run: systemctl restart $AGENT_SERVICE" "密码已保存，但 Agent 重启失败，请执行：systemctl restart $AGENT_SERVICE")"
+    fi
     log "$(t "Panel password reset; Agent restarted." "面板密码已重置，Agent 已重启。")"
-}
+)
 
 show_main_menu() {
     printf '\n%s\n' "$(t "Runman Agent guided operations" "Runman Agent 菜单引导")"

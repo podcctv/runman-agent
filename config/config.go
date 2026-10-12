@@ -2,9 +2,11 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -130,6 +132,21 @@ func (m *Manager) Get() Config {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.cfg
+}
+
+// SetWebPassword validates and hashes a literal password before writing it.
+// In particular, a password starting with "$2" is not already a bcrypt hash.
+func (m *Manager) SetWebPassword(password string) error {
+	if !utf8.ValidString(password) || utf8.RuneCountInString(password) < 8 {
+		return fmt.Errorf("panel password must contain at least 8 valid UTF-8 characters")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("hash panel password (maximum 72 UTF-8 bytes): %w", err)
+	}
+	return m.Update(func(c *Config) {
+		c.WebPassHash = string(hash)
+	})
 }
 
 // Update 原子更新配置内存值并持久化到文件。

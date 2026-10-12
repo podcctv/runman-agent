@@ -134,6 +134,20 @@ bash <(curl -fsSL https://raw.githubusercontent.com/podcctv/runman-agent/main/in
 | 13 | 配置/刷新镜像：Incus URL/离线目录/基础镜像；Podman registry mirror/基础镜像 | 是 |
 | 14 | 仅升级 Agent / 从原版就地迁移，先备份，保留网络和后端 | 是，运行中的 Agent 短暂重启 |
 
+#### 重置面板密码
+
+菜单 `4` 和 `--reset-panel-password` 都从当前终端隐藏读取密码。至少 8 个字符、最多 72 个 UTF-8 字节（bcrypt 限制）；`!`、`*`、反斜杠及前后空格会按原样保留。粘贴带来的空行、输入过短或两次不一致会留在脚本中重试；按 `Ctrl+C` 取消，不修改密码。只有密码保存成功才重启 Agent；重启失败会单独提示。
+
+单次重置建议先完整下载脚本，避免流式执行提前退出时 `curl` 报写入失败。不要在 Shell 命令行中粘贴真实密码：
+
+```bash
+runman_installer=$(mktemp) &&
+curl -fsSL https://raw.githubusercontent.com/podcctv/runman-agent/main/install.sh -o "$runman_installer" &&
+bash "$runman_installer" zh --reset-panel-password
+# 操作结束后，只删除上面创建的临时脚本。
+[ -z "${runman_installer:-}" ] || rm -f -- "$runman_installer"
+```
+
 选择安装后依次引导：虚拟化类型、Podman 数据盘及 registry mirror（如适用）、容器网络、
 对接 Token、rfw 网卡以及 Incus 登录横幅。Incus 网络菜单覆盖：
 
