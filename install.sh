@@ -539,7 +539,7 @@ read_panel_secret() {
     local target="$1" prompt="$2" value
     # Never consume the installer stream (curl | bash), split whitespace, or
     # interpret backslashes. panel_tty belongs to the reset subshell below.
-    if ! IFS= read -r -s -u "$panel_tty" -p "$prompt" value; then
+    if ! IFS= read -r -u "$panel_tty" -p "$prompt" value; then
         printf '\n' >&"$panel_tty"
         die "$(t "Password reset cancelled; password unchanged." "已取消密码重置，密码未修改。")"
     fi
@@ -554,12 +554,22 @@ reset_panel_password() (
         || die "$(t "Agent is not installed." "Agent 尚未安装。")"
     [ "$NON_INTERACTIVE" != "1" ] \
         || die "$(t "Panel password reset requires an interactive terminal." "重置面板密码需要交互式终端。")"
-    local panel_tty first second
+    local panel_tty panel_tty_state first second
     if ! { exec {panel_tty}<>/dev/tty; } 2>/dev/null; then
         die "$(t "Panel password reset requires an interactive terminal." "重置面板密码需要交互式终端。")"
     fi
+    if ! panel_tty_state=$(stty -g <&"$panel_tty"); then
+        die "$(t "Cannot read terminal settings; password unchanged." "无法读取终端设置，密码未修改。")"
+    fi
+    # Keep echo off across all reads and retries: read -s temporarily restores
+    # echo between prompts, which can expose a quickly pasted confirmation.
+    # Restore the exact original state on success, error, EOF, or cancellation.
+    trap 'stty "$panel_tty_state" <&"$panel_tty" 2>/dev/null || true' EXIT
     trap 'printf "\n" >&"$panel_tty"; exit 130' INT
     trap 'printf "\n" >&"$panel_tty"; exit 143' TERM
+    if ! stty -echo <&"$panel_tty"; then
+        die "$(t "Cannot hide terminal input; password unchanged." "无法隐藏终端输入，密码未修改。")"
+    fi
     # Retry in the installer instead of returning to the parent shell with the
     # next pasted secret still pending. Empty lines from CRLF are harmless.
     while true; do
