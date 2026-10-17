@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	incus "github.com/lxc/incus/v6/client"
 	"github.com/lxc/incus/v6/shared/api"
 
@@ -1023,6 +1024,26 @@ func (m *Manager) GetVMInfo(_ context.Context, vmID string) (*agent.VMSummary, e
 		Ips:       ips,
 		RamUsedMb: state.Memory.Usage / 1024 / 1024,
 	}, nil
+}
+
+// GetInstanceIdentity returns the Incus volatile UUID used to distinguish a
+// managed instance from a same-name replacement before host firewall changes.
+func (m *Manager) GetInstanceIdentity(_ context.Context, vmID string) (string, error) {
+	instances, err := m.client.GetInstances(api.InstanceTypeAny)
+	if err != nil {
+		return "", err
+	}
+	for _, instance := range instances {
+		if instance.Name != vmID {
+			continue
+		}
+		identity := strings.TrimSpace(instance.Config["volatile.uuid"])
+		if _, err := uuid.Parse(identity); err != nil {
+			return "", fmt.Errorf("Incus instance %q has no valid volatile.uuid", vmID)
+		}
+		return identity, nil
+	}
+	return "", fmt.Errorf("Incus instance %q not found in the default project", vmID)
 }
 
 func (m *Manager) ListVMs(_ context.Context) ([]*agent.VMSummary, error) {

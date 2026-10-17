@@ -15,8 +15,11 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"runman-agent/config"
+	"runman-agent/controlapi"
 	"runman-agent/db"
+	"runman-agent/firewall/connlimit"
 	"runman-agent/manager"
 	"runman-agent/manager/cloudhv"
 	"runman-agent/manager/incus"
@@ -90,6 +93,7 @@ type Agent struct {
 func main() {
 	configPath := flag.String("config", "/opt/narwhal-agent/config.json", "path to config file")
 	resetPwd := flag.String("reset-password", "", "reset web panel password")
+	expireConnlimit := flag.String("expire-connlimit", "", "expire one temporary container connection-limit policy")
 	flag.Parse()
 	resetRequested := false
 	flag.Visit(func(f *flag.Flag) {
@@ -111,6 +115,22 @@ func main() {
 			log.Fatalf("update password: %v", err)
 		}
 		fmt.Println("Password updated successfully.")
+		return
+	}
+	if *expireConnlimit != "" {
+		cfg, err := config.Load(*configPath)
+		if err != nil {
+			log.Fatalf("load config for connection-limit expiry: %v", err)
+		}
+		conf := cfg.Get()
+		stateDir := filepath.Dir(conf.DB)
+		if conf.DB == "" || stateDir == "." {
+			stateDir = "/opt/narwhal-agent"
+		}
+		limiter := connlimit.New(filepath.Join(stateDir, "connection-limits.json"), *configPath, "")
+		if err := limiter.Expire(*expireConnlimit); err != nil {
+			log.Fatalf("expire connection-limit policy: %v", err)
+		}
 		return
 	}
 
@@ -147,6 +167,59 @@ func main() {
 
 	// VMService 作为服务层包装底层驱动，负责 ID 转换、托管 VM 过滤
 	svc := manager.NewVMService(rawMgr, database)
+	if conf.VirtType == "incus" {
+		if incusMgr, ok := rawMgr.(*incus.Manager); ok {
+			executable, execErr := os.Executable()
+			if execErr != nil {
+				log.Printf("[connlimit] local control disabled: resolve agent executable: %v", execErr)
+			} else {
+				stateDir := filepath.Dir(conf.DB)
+				if conf.DB == "" || stateDir == "." {
+					stateDir = "/opt/narwhal-agent"
+				}
+				limiter := connlimit.New(filepath.Join(stateDir, "connection-limits.json"), *configPath, executable)
+				resolver := func(ctx context.Context, vmID, project string) (controlapi.Target, error) {
+					if project != "default" {
+						return controlapi.Target{}, fmt.Errorf("only the default Incus project is supported")
+					}
+					vms, err := svc.ListVMs(ctx)
+					if err != nil {
+						return controlapi.Target{}, err
+					}
+					var managed *agent.VMSummary
+					for _, vm := range vms {
+						if vm.GetVmId() == vmID {
+							managed = vm
+							break
+						}
+					}
+					if managed == nil {
+						return controlapi.Target{Managed: false}, nil
+					}
+					identity, err := incusMgr.GetInstanceIdentity(ctx, vmID)
+					if err != nil {
+						return controlapi.Target{}, err
+					}
+					info, err := svc.GetVMInfo(ctx, vmID)
+					if err != nil {
+						return controlapi.Target{}, err
+					}
+					return controlapi.Target{
+						Managed: true, Running: managed.GetStatus() == agent.VMStatus_VM_STATUS_RUNNING,
+						InstanceID: identity, IPs: info.GetIps(),
+					}, nil
+				}
+				go func() {
+					if err := controlapi.ListenAndServe(controlapi.ConnlimitSocketPath, resolver, limiter); err != nil {
+						log.Printf("[connlimit] local control stopped: %v", err)
+					}
+				}()
+				go controlapi.ReconcileLoop(context.Background(), resolver, limiter)
+			}
+		} else {
+			log.Printf("[connlimit] local control disabled: Incus manager type is unavailable")
+		}
+	}
 
 	// 恢复因上次重启而中断的自定义镜像拉取（仅 podman）
 	if conf.VirtType == "podman" {
