@@ -138,7 +138,9 @@ func TestApplyReleaseAreScopedAndIdempotent(t *testing.T) {
 	}
 	for _, family := range []string{"iptables", "ip6tables"} {
 		for _, rule := range runner.rules[family][chainName] {
-			if !containsArg(rule, "--comment", "narwhal-climit:"+p.ID) {
+			inbound := containsArg(rule, "--comment", "narwhal-climit:"+p.ID+":in")
+			outbound := containsArg(rule, "--comment", "narwhal-climit:"+p.ID+":out")
+			if !inbound && !outbound {
 				t.Fatalf("rule lacks owned policy marker: %v", rule)
 			}
 			if !containsArg(rule, "--connlimit-above", "500") {
