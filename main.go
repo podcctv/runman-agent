@@ -20,6 +20,7 @@ import (
 	"runman-agent/controlapi"
 	"runman-agent/db"
 	"runman-agent/firewall/connlimit"
+	"runman-agent/firewall/hostpolicy"
 	"runman-agent/manager"
 	"runman-agent/manager/cloudhv"
 	"runman-agent/manager/incus"
@@ -167,16 +168,27 @@ func main() {
 
 	// VMService 作为服务层包装底层驱动，负责 ID 转换、托管 VM 过滤
 	svc := manager.NewVMService(rawMgr, database)
+	stateDir := filepath.Dir(conf.DB)
+	if conf.DB == "" || stateDir == "." {
+		stateDir = "/opt/narwhal-agent"
+	}
+	firewallManager, firewallErr := hostpolicy.New(filepath.Join(stateDir, "host-firewall-policy.json"), conf.RfwAddr)
+	if firewallErr != nil {
+		log.Printf("[host-firewall] local control disabled: %v", firewallErr)
+	} else {
+		go func() {
+			if err := controlapi.ListenAndServeFirewall(controlapi.FirewallSocketPath, firewallManager); err != nil {
+				log.Printf("[host-firewall] local control stopped: %v", err)
+			}
+		}()
+		go firewallManager.ReconcileLoop(context.Background())
+	}
 	if conf.VirtType == "incus" {
 		if incusMgr, ok := rawMgr.(*incus.Manager); ok {
 			executable, execErr := os.Executable()
 			if execErr != nil {
 				log.Printf("[connlimit] local control disabled: resolve agent executable: %v", execErr)
 			} else {
-				stateDir := filepath.Dir(conf.DB)
-				if conf.DB == "" || stateDir == "." {
-					stateDir = "/opt/narwhal-agent"
-				}
 				limiter := connlimit.New(filepath.Join(stateDir, "connection-limits.json"), *configPath, executable)
 				resolver := func(ctx context.Context, vmID, project string) (controlapi.Target, error) {
 					if project != "default" {
