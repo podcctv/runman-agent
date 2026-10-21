@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"runman-agent/firewall/hostpolicy"
@@ -22,6 +23,8 @@ const FirewallSocketPath = "/run/narwhal-agent/firewall.sock"
 
 type FirewallController interface {
 	Apply(context.Context, hostpolicy.Policy) error
+	Events(context.Context, string, int) (hostpolicy.EventPage, error)
+	Readback(context.Context) (hostpolicy.Readback, error)
 	Summary() string
 }
 
@@ -70,6 +73,44 @@ func ListenAndServeFirewall(path string, manager FirewallController) error {
 
 func newFirewallHandler(manager FirewallController) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/firewall/events", func(w http.ResponseWriter, r *http.Request) {
+		cursor := r.URL.Query().Get("cursor")
+		if len(cursor) > 160 {
+			writeFirewallResult(w, http.StatusBadRequest, false, "invalid firewall event cursor")
+			return
+		}
+		limit := 100
+		if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+			parsedLimit, err := strconv.Atoi(rawLimit)
+			if err != nil || parsedLimit < 1 || parsedLimit > 100 {
+				writeFirewallResult(w, http.StatusBadRequest, false, "firewall event limit must be between 1 and 100")
+				return
+			}
+			limit = parsedLimit
+		}
+		page, err := manager.Events(r.Context(), cursor, limit)
+		if err != nil {
+			if errors.Is(err, hostpolicy.ErrRFWEventsUnsupported) {
+				writeFirewallResult(w, http.StatusNotFound, false, "RFW build does not expose an events API")
+				return
+			}
+			writeFirewallResult(w, http.StatusServiceUnavailable, false, "RFW event telemetry is unavailable")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(page)
+	})
+	mux.HandleFunc("GET /v1/firewall/readback", func(w http.ResponseWriter, r *http.Request) {
+		readback, err := manager.Readback(r.Context())
+		if err != nil {
+			writeFirewallResult(w, http.StatusServiceUnavailable, false, "RFW live rule readback is unavailable")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(readback)
+	})
 	mux.HandleFunc("POST /v1/firewall/policy", func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(io.LimitReader(r.Body, 128*1024+1))
 		if err != nil || len(body) > 128*1024 {

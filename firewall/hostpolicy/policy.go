@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,7 +22,16 @@ import (
 	"time"
 )
 
-const maxRules = 100
+// Keep the management API limit aligned with rfw-common::MAX_RULES.
+const maxRules = 64
+
+// ErrRFWEventsUnsupported is returned when the RFW build has no HTTP event
+// endpoint. The current upstream v0.1.0 API exposes status and rules only.
+var ErrRFWEventsUnsupported = errors.New("RFW event API is not supported")
+
+var rfwV010SupportedProtocols = []string{
+	"all", "tcp", "udp", "http", "tls", "socks", "ssh", "fet", "wireguard", "openvpn", "quic",
+}
 
 var ruleKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,80}$`)
 var interfaceNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,15}$`)
@@ -32,6 +42,34 @@ type Policy struct {
 	Revision int64       `json:"revision"`
 	Rules    []Rule      `json:"rules"`
 	Abuse    AbusePolicy `json:"abuse"`
+}
+
+type Event struct {
+	Sequence        uint64   `json:"sequence"`
+	Cursor          string   `json:"cursor"`
+	ObservedAt      int64    `json:"observed_at"`
+	SourceIP        string   `json:"source_ip"`
+	SourcePort      uint16   `json:"source_port"`
+	DestinationIP   string   `json:"destination_ip"`
+	DestinationPort uint16   `json:"destination_port"`
+	Transport       string   `json:"transport"`
+	AppProtocol     string   `json:"app_protocol"`
+	Direction       string   `json:"direction"`
+	Action          string   `json:"action"`
+	RuleIndex       uint8    `json:"rule_index"`
+	RuleID          *uint64  `json:"rule_id"`
+	RuleProtocol    *string  `json:"rule_protocol"`
+	RuleAction      *string  `json:"rule_action"`
+	RuleCountries   []string `json:"rule_countries"`
+}
+
+type EventPage struct {
+	InstanceID   string  `json:"instance_id"`
+	NextCursor   string  `json:"next_cursor"`
+	CursorReset  bool    `json:"cursor_reset"`
+	Dropped      uint64  `json:"dropped"`
+	DroppedTotal uint64  `json:"dropped_total"`
+	Events       []Event `json:"events"`
 }
 
 type Rule struct {
@@ -59,6 +97,62 @@ type managedRule struct {
 	Key         string `json:"key"`
 	ID          int    `json:"id"`
 	Fingerprint string `json:"fingerprint"`
+}
+
+// RuleReadback is a live rule returned by RFW. Ownership comes only from
+// Runman's persisted ID map; rules without a mapping remain manual.
+type RuleReadback struct {
+	ID         int      `json:"id"`
+	Priority   int      `json:"priority"`
+	Direction  string   `json:"direction"`
+	Protocol   string   `json:"protocol"`
+	Action     string   `json:"action"`
+	Enabled    bool     `json:"enabled"`
+	PortStart  int      `json:"port_start"`
+	PortEnd    int      `json:"port_end"`
+	IPType     string   `json:"ip_type"`
+	IP         string   `json:"ip,omitempty"`
+	Countries  []string `json:"countries,omitempty"`
+	Origin     string   `json:"origin"`
+	ManagedKey string   `json:"managed_key,omitempty"`
+	SyncState  string   `json:"sync_state"`
+}
+
+type ExpectedRuleReadback struct {
+	Key       string `json:"key"`
+	ID        int    `json:"id,omitempty"`
+	SyncState string `json:"sync_state"`
+}
+
+// Readback is RFW's current userspace rule table, compared with Runman's
+// persisted desired state. It does not claim a direct eBPF-map inspection.
+type Readback struct {
+	Status             string                 `json:"status"`
+	ObservedAt         int64                  `json:"observed_at"`
+	RFWAPIVersion      string                 `json:"rfw_api_version,omitempty"`
+	CapabilitiesKnown  bool                   `json:"capabilities_known"`
+	SupportedProtocols []string               `json:"supported_protocols"`
+	PolicyRevision     int64                  `json:"policy_revision"`
+	RuleCount          int                    `json:"rule_count"`
+	ManagedRuleCount   int                    `json:"managed_rule_count"`
+	DriftCount         int                    `json:"drift_count"`
+	MissingCount       int                    `json:"missing_count"`
+	Rules              []RuleReadback         `json:"rules"`
+	ExpectedRules      []ExpectedRuleReadback `json:"expected_rules"`
+}
+
+type rfwRule struct {
+	ID        int      `json:"id"`
+	Priority  int      `json:"priority"`
+	Direction string   `json:"direction"`
+	Protocol  string   `json:"protocol"`
+	Action    string   `json:"action"`
+	Enabled   bool     `json:"enabled"`
+	PortStart int      `json:"port_start"`
+	PortEnd   int      `json:"port_end"`
+	IPType    string   `json:"ip_type"`
+	IP        string   `json:"ip"`
+	Countries []string `json:"countries"`
 }
 
 type persistedState struct {
@@ -140,12 +234,13 @@ func validatePolicy(policy Policy) (Policy, error) {
 		}
 		protocol := strings.ToLower(rule.Protocol)
 		switch protocol {
-		case "all", "tcp", "udp", "http", "tls", "socks", "ssh", "fet", "wireguard", "openvpn", "quic":
+		case "all", "tcp", "udp", "http", "tls", "socks", "ssh", "fet", "wireguard", "openvpn", "quic", "mtproto":
 		default:
 			return Policy{}, fmt.Errorf("RFW rule %q has an unsupported protocol", rule.Key)
 		}
-		if rule.Direction == "out" && protocol != "all" && protocol != "tcp" && protocol != "udp" {
-			return Policy{}, fmt.Errorf("RFW protocol %q is inbound-only", protocol)
+		if rule.Direction == "out" && protocol != "all" && protocol != "tcp" && protocol != "udp" &&
+			protocol != "socks" && protocol != "fet" && protocol != "wireguard" && protocol != "mtproto" {
+			return Policy{}, fmt.Errorf("RFW protocol %q is not supported for outbound matching", protocol)
 		}
 		if rule.Action != "block" && rule.Action != "pass" {
 			return Policy{}, fmt.Errorf("RFW rule %q action must be block or pass", rule.Key)
@@ -259,13 +354,22 @@ func (m *Manager) reconcileRFW(ctx context.Context) error {
 	if m.rfwURL == "" {
 		return errors.New("RFW API address is not configured")
 	}
-	actual, err := m.listRfwRules(ctx)
+	if err := m.checkRFWProtocolCapabilities(ctx, m.state.Policy.Rules); err != nil {
+		return err
+	}
+	actual, err := m.listRfwRuleDetails(ctx)
 	if err != nil {
 		return err
 	}
 	actualIDs := make(map[int]bool, len(actual))
-	for _, id := range actual {
-		actualIDs[id] = true
+	actualFingerprints := make(map[int]string, len(actual))
+	for _, row := range actual {
+		fingerprint, err := rfwRuleFingerprint(row)
+		if err != nil {
+			return fmt.Errorf("fingerprint RFW rule %d: %w", row.ID, err)
+		}
+		actualIDs[row.ID] = true
+		actualFingerprints[row.ID] = fingerprint
 	}
 	selected := make(map[int]bool)
 	for _, desired := range m.state.Policy.Rules {
@@ -273,9 +377,15 @@ func (m *Manager) reconcileRFW(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		rfwFingerprint, err := desiredRFWFingerprint(desired)
+		if err != nil {
+			return err
+		}
 		found := false
 		for _, managed := range m.state.Rules {
-			if !selected[managed.ID] && managed.Key == desired.Key && managed.Fingerprint == fingerprint && actualIDs[managed.ID] {
+			actualFingerprint, exists := actualFingerprints[managed.ID]
+			if !selected[managed.ID] && managed.Key == desired.Key && managed.Fingerprint == fingerprint &&
+				exists && actualFingerprint == rfwFingerprint {
 				selected[managed.ID] = true
 				found = true
 				break
@@ -292,6 +402,7 @@ func (m *Manager) reconcileRFW(ctx context.Context) error {
 		m.state.Rules = append(m.state.Rules, managed)
 		selected[id] = true
 		actualIDs[id] = true
+		actualFingerprints[id] = rfwFingerprint
 		if err := m.save(); err != nil {
 			return fmt.Errorf("persist ownership of created rule %d: %w", id, err)
 		}
@@ -340,27 +451,239 @@ func rfwPayload(rule Rule) map[string]any {
 	return payload
 }
 
-func (m *Manager) listRfwRules(ctx context.Context) ([]int, error) {
+func (m *Manager) listRfwRuleDetails(ctx context.Context) ([]rfwRule, error) {
 	body, status, err := m.request(ctx, "GET", "/api/rules", nil)
 	if err != nil {
 		return nil, err
 	}
-	if status != 200 {
+	if status != http.StatusOK {
 		return nil, fmt.Errorf("RFW list returned HTTP %d: %s", status, shortBody(body))
 	}
-	var rows []struct {
-		ID int `json:"id"`
-	}
+	var rows []rfwRule
 	if err := json.Unmarshal(body, &rows); err != nil {
 		return nil, fmt.Errorf("decode RFW rule list: %w", err)
 	}
-	ids := make([]int, 0, len(rows))
+	if len(rows) > 256 {
+		return nil, errors.New("RFW rule list exceeds the 256-rule readback limit")
+	}
+	seen := make(map[int]bool, len(rows))
 	for _, row := range rows {
-		if row.ID > 0 {
-			ids = append(ids, row.ID)
+		if row.ID < 1 || seen[row.ID] {
+			return nil, errors.New("RFW rule list contains an invalid or duplicate ID")
+		}
+		seen[row.ID] = true
+	}
+	return rows, nil
+}
+
+func (m *Manager) rfwProtocolCapabilities(ctx context.Context) (string, map[string]bool, bool) {
+	body, status, err := m.request(ctx, "GET", "/api/status", nil)
+	if err != nil || status != http.StatusOK {
+		return "", nil, false
+	}
+	var response struct {
+		APIVersion         string   `json:"api_version"`
+		SupportedProtocols []string `json:"supported_protocols"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil || len(response.APIVersion) > 64 {
+		return "", nil, false
+	}
+	apiVersion := strings.TrimSpace(response.APIVersion)
+	if apiVersion == "" {
+		return "", nil, false
+	}
+	if response.SupportedProtocols == nil {
+		// RFW's published v0.1.0 OpenAPI contract does not include
+		// supported_protocols in /api/status. Derive capabilities from that
+		// exact contract instead of treating every application rule as unknown.
+		if apiVersion != "0.1.0" {
+			return apiVersion, nil, false
+		}
+		supported := make(map[string]bool, len(rfwV010SupportedProtocols))
+		for _, protocol := range rfwV010SupportedProtocols {
+			supported[protocol] = true
+		}
+		return apiVersion, supported, true
+	}
+	if len(response.SupportedProtocols) == 0 || len(response.SupportedProtocols) > 32 {
+		return apiVersion, nil, false
+	}
+	supported := make(map[string]bool, len(response.SupportedProtocols))
+	for _, protocol := range response.SupportedProtocols {
+		protocol = strings.ToLower(strings.TrimSpace(protocol))
+		if !validRFWProtocol(protocol) || supported[protocol] {
+			return "", nil, false
+		}
+		supported[protocol] = true
+	}
+	return apiVersion, supported, true
+}
+
+func validRFWProtocol(protocol string) bool {
+	switch protocol {
+	case "all", "tcp", "udp", "http", "tls", "socks", "ssh", "fet", "wireguard", "openvpn", "quic", "mtproto":
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Manager) checkRFWProtocolCapabilities(ctx context.Context, rules []Rule) error {
+	if len(rules) == 0 {
+		return nil
+	}
+	apiVersion, supported, known := m.rfwProtocolCapabilities(ctx)
+	for _, rule := range rules {
+		if known {
+			if !supported[rule.Protocol] {
+				return fmt.Errorf("RFW API %s does not support protocol %q; update RFW before applying this policy", apiVersion, rule.Protocol)
+			}
+			continue
+		}
+		if rule.Protocol == "mtproto" {
+			return errors.New("RFW protocol capabilities are unknown; update RFW before applying MTProto rules")
 		}
 	}
-	return ids, nil
+	return nil
+}
+
+func rfwRuleFingerprint(row rfwRule) (string, error) {
+	var portEnd *int
+	if row.PortEnd != row.PortStart {
+		portEnd = &row.PortEnd
+	}
+	countries := append([]string(nil), row.Countries...)
+	for i := range countries {
+		countries[i] = strings.ToUpper(strings.TrimSpace(countries[i]))
+	}
+	sort.Strings(countries)
+	return ruleFingerprint(Rule{
+		Key: "live-readback", Priority: row.Priority, Direction: strings.ToLower(row.Direction),
+		Protocol: strings.ToLower(row.Protocol), Action: strings.ToLower(row.Action), Enabled: row.Enabled,
+		PortStart: row.PortStart, PortEnd: portEnd, IPType: strings.ToLower(row.IPType),
+		IP: strings.TrimSpace(row.IP), Countries: countries,
+	})
+}
+
+func desiredRFWFingerprint(rule Rule) (string, error) {
+	canonical := rule
+	if rule.PortEnd != nil && *rule.PortEnd == rule.PortStart {
+		canonical.PortEnd = nil
+	}
+	return ruleFingerprint(canonical)
+}
+
+// Readback fetches RFW's current rule table and compares it with Runman's
+// persisted ownership map and desired policy. It is read-only; manual rules
+// are visible but are never claimed or deleted by this method.
+func (m *Manager) Readback(ctx context.Context) (Readback, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rows, err := m.listRfwRuleDetails(ctx)
+	if err != nil {
+		return Readback{}, err
+	}
+	apiVersion, supportedProtocols, capabilitiesKnown := m.rfwProtocolCapabilities(ctx)
+	managedByID := make(map[int]managedRule, len(m.state.Rules))
+	desiredByKey := make(map[string]Rule, len(m.state.Policy.Rules))
+	for _, managed := range m.state.Rules {
+		managedByID[managed.ID] = managed
+	}
+	for _, desired := range m.state.Policy.Rules {
+		desiredByKey[desired.Key] = desired
+	}
+	actualByID := make(map[int]rfwRule, len(rows))
+	actualFingerprints := make(map[int]string, len(rows))
+	result := Readback{
+		Status: "in_sync", ObservedAt: time.Now().Unix(), RFWAPIVersion: apiVersion,
+		CapabilitiesKnown: capabilitiesKnown, SupportedProtocols: make([]string, 0, len(supportedProtocols)),
+		PolicyRevision: m.state.Revision,
+		RuleCount:      len(rows), Rules: make([]RuleReadback, 0, len(rows)),
+		ExpectedRules: make([]ExpectedRuleReadback, 0, len(m.state.Policy.Rules)),
+	}
+	for protocol := range supportedProtocols {
+		result.SupportedProtocols = append(result.SupportedProtocols, protocol)
+	}
+	sort.Strings(result.SupportedProtocols)
+	for _, row := range rows {
+		fingerprint, err := rfwRuleFingerprint(row)
+		if err != nil {
+			return Readback{}, fmt.Errorf("fingerprint RFW rule %d: %w", row.ID, err)
+		}
+		actualByID[row.ID] = row
+		actualFingerprints[row.ID] = fingerprint
+		item := RuleReadback{
+			ID: row.ID, Priority: row.Priority, Direction: strings.ToLower(row.Direction),
+			Protocol: strings.ToLower(row.Protocol), Action: strings.ToLower(row.Action), Enabled: row.Enabled,
+			PortStart: row.PortStart, PortEnd: row.PortEnd, IPType: strings.ToLower(row.IPType),
+			IP: row.IP, Countries: append([]string(nil), row.Countries...), Origin: "manual", SyncState: "manual",
+		}
+		if managed, ok := managedByID[row.ID]; ok {
+			item.Origin = "platform"
+			item.ManagedKey = managed.Key
+			result.ManagedRuleCount++
+			if desired, exists := desiredByKey[managed.Key]; !exists {
+				item.SyncState = "orphaned"
+				result.DriftCount++
+				result.Status = "drifted"
+			} else {
+				desiredFingerprint, err := desiredRFWFingerprint(desired)
+				if err != nil {
+					return Readback{}, fmt.Errorf("fingerprint desired RFW rule %q: %w", managed.Key, err)
+				}
+				storedFingerprint, err := ruleFingerprint(desired)
+				if err != nil {
+					return Readback{}, fmt.Errorf("fingerprint stored RFW rule %q: %w", managed.Key, err)
+				}
+				if managed.Fingerprint != storedFingerprint || fingerprint != desiredFingerprint {
+					item.SyncState = "drifted"
+					result.Status = "drifted"
+				} else {
+					item.SyncState = "in_sync"
+				}
+			}
+		}
+		result.Rules = append(result.Rules, item)
+	}
+	for _, desired := range m.state.Policy.Rules {
+		desiredFingerprint, err := desiredRFWFingerprint(desired)
+		if err != nil {
+			return Readback{}, fmt.Errorf("fingerprint desired RFW rule %q: %w", desired.Key, err)
+		}
+		storedFingerprint, err := ruleFingerprint(desired)
+		if err != nil {
+			return Readback{}, fmt.Errorf("fingerprint stored RFW rule %q: %w", desired.Key, err)
+		}
+		status := "missing"
+		id := 0
+		for _, managed := range m.state.Rules {
+			if managed.Key != desired.Key {
+				continue
+			}
+			id = managed.ID
+			if row, exists := actualByID[managed.ID]; exists {
+				fingerprint, err := rfwRuleFingerprint(row)
+				if err != nil {
+					return Readback{}, fmt.Errorf("fingerprint RFW rule %d: %w", managed.ID, err)
+				}
+				if managed.Fingerprint == storedFingerprint && fingerprint == desiredFingerprint {
+					status = "in_sync"
+				} else {
+					status = "drifted"
+				}
+			}
+			break
+		}
+		if status == "missing" {
+			result.MissingCount++
+			result.Status = "drifted"
+		} else if status == "drifted" {
+			result.DriftCount++
+			result.Status = "drifted"
+		}
+		result.ExpectedRules = append(result.ExpectedRules, ExpectedRuleReadback{Key: desired.Key, ID: id, SyncState: status})
+	}
+	return result, nil
 }
 
 func (m *Manager) createRfwRule(ctx context.Context, rule Rule) (int, error) {
@@ -423,6 +746,59 @@ func (m *Manager) request(ctx context.Context, method, path string, body []byte)
 		return nil, resp.StatusCode, errors.New("RFW API response exceeds 64 KiB")
 	}
 	return data, resp.StatusCode, nil
+}
+
+// Events returns bounded RFW DPI events through its loopback-only API. The
+// caller cursor is opaque and is validated again by RFW before use.
+func (m *Manager) Events(ctx context.Context, cursor string, limit int) (EventPage, error) {
+	if len(cursor) > 160 || limit < 1 || limit > 100 {
+		return EventPage{}, errors.New("invalid RFW event cursor or page size")
+	}
+	query := url.Values{}
+	query.Set("cursor", cursor)
+	query.Set("limit", strconv.Itoa(limit))
+	body, status, err := m.request(ctx, "GET", "/api/events?"+query.Encode(), nil)
+	if err != nil {
+		return EventPage{}, err
+	}
+	if status == http.StatusNotFound {
+		return EventPage{}, ErrRFWEventsUnsupported
+	}
+	if status != http.StatusOK {
+		return EventPage{}, fmt.Errorf("RFW events returned HTTP %d: %s", status, shortBody(body))
+	}
+	var page EventPage
+	if err := json.Unmarshal(body, &page); err != nil {
+		return EventPage{}, fmt.Errorf("decode RFW event page: %w", err)
+	}
+	if page.InstanceID == "" || len(page.InstanceID) > 80 || len(page.NextCursor) > 160 || len(page.Events) > limit {
+		return EventPage{}, errors.New("RFW event page exceeded its bounds")
+	}
+	for i := range page.Events {
+		event := &page.Events[i]
+		if event.Sequence == 0 || len(event.Cursor) > 160 || event.ObservedAt <= 0 {
+			return EventPage{}, errors.New("RFW event is missing bounded identity or time")
+		}
+		if _, err := netip.ParseAddr(event.SourceIP); err != nil {
+			return EventPage{}, errors.New("RFW event has an invalid source IP")
+		}
+		if _, err := netip.ParseAddr(event.DestinationIP); err != nil {
+			return EventPage{}, errors.New("RFW event has an invalid destination IP")
+		}
+		if event.Direction != "in" && event.Direction != "out" {
+			return EventPage{}, errors.New("RFW event has an invalid direction")
+		}
+		if event.Action != "pass" && event.Action != "block" {
+			return EventPage{}, errors.New("RFW event has an invalid action")
+		}
+		if event.Transport != "tcp" && event.Transport != "udp" && event.Transport != "unknown" {
+			return EventPage{}, errors.New("RFW event has an invalid transport")
+		}
+		if len(event.RuleCountries) > 30 {
+			return EventPage{}, errors.New("RFW event has too many matched countries")
+		}
+	}
+	return page, nil
 }
 
 func shortBody(body []byte) string {
