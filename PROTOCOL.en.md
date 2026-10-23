@@ -254,7 +254,7 @@ The Agent must maintain port-forwarding rules at the host network layer (e.g. `i
 |-------|-------------|
 | `vm_id` | VM UUID |
 | `protocol` | `PROTOCOL_TCP` or `PROTOCOL_UDP` |
-| `host_port` | Host (external) port; recommended range 1024–65535 |
+| `host_port` | New host (external) ports must be 20000–65535. Persisted 1024–19999 rules continue to restore/run; once deleted, a low-port rule cannot be created again. |
 | `guest_port` | VM internal port |
 | `description` | Label e.g. "SSH", "HTTP" |
 

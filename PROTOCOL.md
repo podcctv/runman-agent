@@ -254,7 +254,7 @@ Agent 需在宿主机的网络层（如 `iptables`/`nftables`）维护端口转�
 |------|------|
 | `vm_id` | VM UUID |
 | `protocol` | `PROTOCOL_TCP` 或 `PROTOCOL_UDP` |
-| `host_port` | 宿主机（外部）端口，建议范围 1024–65535 |
+| `host_port` | 新建宿主机（外部）端口必须为 20000–65535。已持久化的 1024–19999 规则会继续恢复/运行；删除后不能再新建低位端口规则。 |
 | `guest_port` | VM 内部端口 |
 | `description` | 备注（如 "SSH"、"HTTP"） |
 

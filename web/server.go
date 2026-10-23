@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -1018,13 +1019,13 @@ func (s *Server) handleAddPortFwd(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "protocol must be tcp or udp", 400)
 		return
 	}
-	if req.HostPort <= 0 || req.GuestPort <= 0 {
-		http.Error(w, "host_port and guest_port must be positive", 400)
+	if req.GuestPort <= 0 || req.GuestPort > portforward.MaxPort {
+		http.Error(w, "guest_port must be in range 1-65535", http.StatusBadRequest)
 		return
 	}
 
 	if err := s.pf.AddMapping(r.Context(), vmID, req.Protocol, req.HostPort, req.GuestPort, req.Description); err != nil {
-		jsonErr(w, err, 500)
+		jsonErr(w, err, portForwardErrorStatus(err))
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -1036,7 +1037,7 @@ func (s *Server) handleDelPortFwd(w http.ResponseWriter, r *http.Request) {
 	hostPortStr := r.PathValue("hostPort")
 
 	hostPort, err := strconv.Atoi(hostPortStr)
-	if err != nil || hostPort <= 0 {
+	if err != nil || hostPort < portforward.MinPort || hostPort > portforward.MaxPort {
 		http.Error(w, "invalid host_port", 400)
 		return
 	}
@@ -1061,10 +1062,22 @@ func (s *Server) handleSyncPortFwds(w http.ResponseWriter, r *http.Request) {
 	}
 
 	desired := make([]portforward.DesiredRule, 0, len(rules))
+	seen := make(map[string]bool, len(rules))
 	for _, rule := range rules {
 		if rule.Protocol != "tcp" && rule.Protocol != "udp" {
-			continue
+			http.Error(w, "protocol must be tcp or udp", http.StatusBadRequest)
+			return
 		}
+		if rule.GuestPort < 1 || rule.GuestPort > portforward.MaxPort {
+			http.Error(w, "guest_port must be in range 1-65535", http.StatusBadRequest)
+			return
+		}
+		key := fmt.Sprintf("%s/%d", rule.Protocol, rule.HostPort)
+		if seen[key] {
+			http.Error(w, "duplicate port forward rule", http.StatusBadRequest)
+			return
+		}
+		seen[key] = true
 		desired = append(desired, portforward.DesiredRule{
 			Protocol:    rule.Protocol,
 			HostPort:    rule.HostPort,
@@ -1074,10 +1087,19 @@ func (s *Server) handleSyncPortFwds(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.pf.SyncForVM(r.Context(), vmID, desired); err != nil {
-		jsonErr(w, err, 500)
+		jsonErr(w, err, portForwardErrorStatus(err))
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func portForwardErrorStatus(err error) int {
+	if errors.Is(err, portforward.ErrHostPortOutOfRange) ||
+		errors.Is(err, portforward.ErrNewHostPortBelowFloor) ||
+		errors.Is(err, portforward.ErrGuestPortOutOfRange) {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
 }
 
 // ─── WireGuard 绑定 ────────────────────────────────────────────────────────────

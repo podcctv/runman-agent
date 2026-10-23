@@ -489,13 +489,14 @@
                     </div>
                     <div>
                         <label class="label">Host Port</label>
-                        <input type="number" id="pf-hport" class="input" min="1" max="65535" placeholder="2222">
+                        <input type="number" id="pf-hport" class="input" min="20000" max="65535" placeholder="20000+">
                     </div>
                     <div>
                         <label class="label">VM Port</label>
                         <input type="number" id="pf-gport" class="input" min="1" max="65535" placeholder="22">
                     </div>
                 </div>
+                <p class="text-[11px] leading-5 text-slate-500">New host ports: 20000–65535. Existing 1024–19999 forwards keep working until removed.</p>
                 <button onclick="doAddPortFwd()" class="w-full py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-lg">Add Forward Rule</button>
             </div>
             <!-- Unique IP limit -->
@@ -1487,8 +1488,9 @@ async function doSetIPLimit(useGlobal) {
 
 async function doAddPortFwd() {
     hideErr('ports-err');
-    const proto=$('pf-proto').value, hp=parseInt($('pf-hport').value), gp=parseInt($('pf-gport').value);
-    if (!hp||!gp) { showErr('ports-err','Host port and VM port required.'); return; }
+    const proto=$('pf-proto').value, hp=Number($('pf-hport').value), gp=Number($('pf-gport').value);
+    if (!Number.isInteger(hp) || hp < 20000 || hp > 65535) { showErr('ports-err','New host ports must be between 20000 and 65535. Existing lower-port rules remain active until removed.'); return; }
+    if (!Number.isInteger(gp) || gp < 1 || gp > 65535) { showErr('ports-err','VM port must be between 1 and 65535.'); return; }
     disableAllButtons(true);
     try {
         await api('POST', `/api/vms/${activeVmId}/portfwds`, {protocol:proto, host_port:hp, guest_port:gp});

@@ -23,6 +23,7 @@ const FirewallSocketPath = "/run/narwhal-agent/firewall.sock"
 
 type FirewallController interface {
 	Apply(context.Context, hostpolicy.Policy) error
+	DeleteManualRule(context.Context, hostpolicy.RuleReadback) error
 	Events(context.Context, string, int) (hostpolicy.EventPage, error)
 	Readback(context.Context) (hostpolicy.Readback, error)
 	Summary() string
@@ -110,6 +111,38 @@ func newFirewallHandler(manager FirewallController) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(readback)
+	})
+	mux.HandleFunc("DELETE /v1/firewall/rules/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil || id < 1 {
+			writeFirewallResult(w, http.StatusBadRequest, false, "invalid RFW rule ID")
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 16*1024+1))
+		if err != nil || len(body) > 16*1024 {
+			writeFirewallResult(w, http.StatusBadRequest, false, "invalid or oversized RFW rule identity")
+			return
+		}
+		var expected hostpolicy.RuleReadback
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&expected); err != nil {
+			writeFirewallResult(w, http.StatusBadRequest, false, "invalid RFW rule identity JSON")
+			return
+		}
+		if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+			writeFirewallResult(w, http.StatusBadRequest, false, "RFW rule identity must contain one JSON object")
+			return
+		}
+		if expected.ID != id {
+			writeFirewallResult(w, http.StatusBadRequest, false, "RFW rule ID does not match the requested path")
+			return
+		}
+		if err := manager.DeleteManualRule(r.Context(), expected); err != nil {
+			writeFirewallResult(w, http.StatusConflict, false, err.Error())
+			return
+		}
+		writeFirewallResult(w, http.StatusOK, true, "RFW manual rule deleted or already absent")
 	})
 	mux.HandleFunc("POST /v1/firewall/policy", func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(io.LimitReader(r.Body, 128*1024+1))

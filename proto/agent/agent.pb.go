@@ -1834,8 +1834,8 @@ func (x *CmdResetPassword) GetNewPassword() string {
 }
 
 // CmdSetPortForward — 在宿主机上为指定 VM 添加一条端口转发规则。
-// 宿主机端口范围建议限制在 1024–65535。
-// Recommended host port range: 1024–65535.
+// 新建宿主机端口必须为 20000–65535；已持久化的 1024–19999 规则继续运行，删除后不能重建。
+// New host ports must be 20000–65535. Persisted 1024–19999 rules remain active but cannot be recreated after deletion.
 type CmdSetPortForward struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VmId          string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`                  // VM UUID

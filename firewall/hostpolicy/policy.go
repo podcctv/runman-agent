@@ -709,7 +709,7 @@ func (m *Manager) createRfwRule(ctx context.Context, rule Rule) (int, error) {
 
 func (m *Manager) deleteRfwRule(ctx context.Context, id int) error {
 	if id < 1 {
-		return errors.New("invalid owned RFW rule ID")
+		return errors.New("invalid RFW rule ID")
 	}
 	body, status, err := m.request(ctx, "DELETE", "/api/rules/"+strconv.Itoa(id), nil)
 	if err != nil {
@@ -719,6 +719,64 @@ func (m *Manager) deleteRfwRule(ctx context.Context, id int) error {
 		return fmt.Errorf("RFW delete returned HTTP %d: %s", status, shortBody(body))
 	}
 	return nil
+}
+
+// DeleteManualRule removes one exact RFW rule explicitly selected from a fresh
+// readback. Watcher-owned rules must be removed from the desired policy so that
+// reconciliation cannot recreate them.
+func (m *Manager) DeleteManualRule(ctx context.Context, expected RuleReadback) error {
+	if expected.ID < 1 || expected.Origin != "manual" || expected.SyncState != "manual" || expected.ManagedKey != "" {
+		return errors.New("only a confirmed manual RFW rule can be deleted directly")
+	}
+	if expected.Priority < 0 || expected.Priority > 100000 ||
+		(expected.Direction != "in" && expected.Direction != "out") || !validRFWProtocol(expected.Protocol) ||
+		(expected.Action != "block" && expected.Action != "pass") ||
+		expected.PortStart < 0 || expected.PortStart > 65535 || expected.PortEnd < expected.PortStart || expected.PortEnd > 65535 ||
+		(expected.IPType != "any" && expected.IPType != "cidr" && expected.IPType != "geoip") {
+		return errors.New("manual RFW rule identity is invalid")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, managed := range m.state.Rules {
+		if managed.ID == expected.ID {
+			return errors.New("platform-managed RFW rules must be removed from the desired policy")
+		}
+	}
+
+	rows, err := m.listRfwRuleDetails(ctx)
+	if err != nil {
+		return err
+	}
+	var current *rfwRule
+	for i := range rows {
+		if rows[i].ID == expected.ID {
+			current = &rows[i]
+			break
+		}
+	}
+	if current == nil {
+		return nil // Idempotent retry after the RFW accepted a previous delete.
+	}
+
+	expectedRule := rfwRule{
+		ID: expected.ID, Priority: expected.Priority, Direction: expected.Direction,
+		Protocol: expected.Protocol, Action: expected.Action, Enabled: expected.Enabled,
+		PortStart: expected.PortStart, PortEnd: expected.PortEnd, IPType: expected.IPType,
+		IP: expected.IP, Countries: append([]string(nil), expected.Countries...),
+	}
+	currentFingerprint, err := rfwRuleFingerprint(*current)
+	if err != nil {
+		return fmt.Errorf("fingerprint current RFW rule %d: %w", expected.ID, err)
+	}
+	expectedFingerprint, err := rfwRuleFingerprint(expectedRule)
+	if err != nil {
+		return fmt.Errorf("fingerprint requested RFW rule %d: %w", expected.ID, err)
+	}
+	if currentFingerprint != expectedFingerprint {
+		return errors.New("RFW rule changed since it was shown in Watcher; refresh before deleting")
+	}
+	return m.deleteRfwRule(ctx, expected.ID)
 }
 
 func (m *Manager) request(ctx context.Context, method, path string, body []byte) ([]byte, int, error) {

@@ -15,13 +15,21 @@ import (
 )
 
 type firewallEventTestController struct {
-	cursor string
-	limit  int
-	err    error
+	cursor  string
+	limit   int
+	err     error
+	deleted []hostpolicy.RuleReadback
 }
 
 func (f *firewallEventTestController) Apply(context.Context, hostpolicy.Policy) error { return nil }
-func (f *firewallEventTestController) Summary() string                                { return "ready" }
+func (f *firewallEventTestController) DeleteManualRule(_ context.Context, rule hostpolicy.RuleReadback) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.deleted = append(f.deleted, rule)
+	return nil
+}
+func (f *firewallEventTestController) Summary() string { return "ready" }
 func (f *firewallEventTestController) Readback(context.Context) (hostpolicy.Readback, error) {
 	if f.err != nil {
 		return hostpolicy.Readback{}, f.err
@@ -61,6 +69,45 @@ func TestFirewallReadbackIsReadOnlyAndNoStore(t *testing.T) {
 	}
 	if response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("sensitive readback must not be cached: %q", response.Header().Get("Cache-Control"))
+	}
+}
+
+func TestFirewallManualRuleDeleteRequiresExactRuleIdentity(t *testing.T) {
+	controller := &firewallEventTestController{}
+	handler := newFirewallHandler(controller)
+	expected := hostpolicy.RuleReadback{
+		ID: 7, Priority: 100, Direction: "in", Protocol: "tcp", Action: "block", Enabled: true,
+		PortStart: 443, PortEnd: 443, IPType: "any", Origin: "manual", SyncState: "manual",
+	}
+	body, err := json.Marshal(expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/v1/firewall/rules/7", strings.NewReader(string(body))))
+	if response.Code != http.StatusOK || len(controller.deleted) != 1 || controller.deleted[0].ID != 7 {
+		t.Fatalf("manual RFW delete was not forwarded: status=%d body=%s deleted=%#v", response.Code, response.Body.String(), controller.deleted)
+	}
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/v1/firewall/rules/8", strings.NewReader(string(body))))
+	if response.Code != http.StatusBadRequest || len(controller.deleted) != 1 {
+		t.Fatalf("mismatched path/body ID was accepted: status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestFirewallManualRuleDeleteReportsControllerFailure(t *testing.T) {
+	controller := &firewallEventTestController{err: errors.New("private RFW API response")}
+	handler := newFirewallHandler(controller)
+	expected := hostpolicy.RuleReadback{ID: 7, Origin: "manual", SyncState: "manual"}
+	body, err := json.Marshal(expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/v1/firewall/rules/7", strings.NewReader(string(body))))
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "private RFW API response") {
+		t.Fatalf("manual delete failure was not returned to the local caller: status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 

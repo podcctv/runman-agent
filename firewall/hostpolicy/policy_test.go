@@ -189,6 +189,84 @@ func TestApplyOwnsOnlyWatcherRulesAndForwardAbuseChain(t *testing.T) {
 	}
 }
 
+func TestDeleteManualRFWRuleRequiresFreshExactIdentity(t *testing.T) {
+	rows := []rfwRule{{
+		ID: 7, Priority: 100, Direction: "in", Protocol: "tcp", Action: "block", Enabled: true,
+		PortStart: 443, PortEnd: 443, IPType: "any",
+	}}
+	deleted := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/rules", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(rows)
+	})
+	mux.HandleFunc("DELETE /api/rules/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, _ := strconv.Atoi(r.PathValue("id"))
+		kept := rows[:0]
+		for _, row := range rows {
+			if row.ID != id {
+				kept = append(kept, row)
+			}
+		}
+		rows = kept
+		deleted++
+		w.WriteHeader(http.StatusNoContent)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	m := &Manager{rfwURL: server.URL, client: server.Client()}
+	expected := RuleReadback{
+		ID: 7, Priority: 100, Direction: "in", Protocol: "tcp", Action: "block", Enabled: true,
+		PortStart: 443, PortEnd: 443, IPType: "any", Origin: "manual", SyncState: "manual",
+	}
+	if err := m.DeleteManualRule(context.Background(), expected); err != nil {
+		t.Fatalf("fresh manual RFW rule was rejected: %v", err)
+	}
+	if deleted != 1 || len(rows) != 0 {
+		t.Fatalf("expected exactly one selected RFW rule to be deleted, deleted=%d rows=%#v", deleted, rows)
+	}
+	if err := m.DeleteManualRule(context.Background(), expected); err != nil || deleted != 1 {
+		t.Fatalf("idempotent retry should not delete another rule: err=%v deleted=%d", err, deleted)
+	}
+}
+
+func TestDeleteManualRFWRuleRejectsChangedOrManagedRule(t *testing.T) {
+	rows := []rfwRule{{
+		ID: 7, Priority: 100, Direction: "in", Protocol: "tcp", Action: "block", Enabled: true,
+		PortStart: 443, PortEnd: 443, IPType: "any",
+	}}
+	deleted := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/rules", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(rows)
+	})
+	mux.HandleFunc("DELETE /api/rules/{id}", func(w http.ResponseWriter, _ *http.Request) {
+		deleted++
+		w.WriteHeader(http.StatusNoContent)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	expected := RuleReadback{
+		ID: 7, Priority: 100, Direction: "in", Protocol: "tcp", Action: "block", Enabled: true,
+		PortStart: 444, PortEnd: 444, IPType: "any", Origin: "manual", SyncState: "manual",
+	}
+	m := &Manager{rfwURL: server.URL, client: server.Client()}
+	if err := m.DeleteManualRule(context.Background(), expected); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("stale rule identity was not rejected: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatal("stale identity deleted a changed RFW rule")
+	}
+
+	expected.PortStart = 443
+	m.state.Rules = []managedRule{{Key: "managed-rule", ID: 7, Fingerprint: "expected"}}
+	if err := m.DeleteManualRule(context.Background(), expected); err == nil || !strings.Contains(err.Error(), "platform-managed") {
+		t.Fatalf("platform-managed rule was directly deleted: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatal("platform-managed RFW rule was deleted outside its desired policy")
+	}
+}
+
 func TestApplyRequiresConfirmedRFWMtprotoCapability(t *testing.T) {
 	for _, test := range []struct {
 		name       string

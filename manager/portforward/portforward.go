@@ -2,6 +2,7 @@ package portforward
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -24,9 +25,26 @@ type IPCount struct {
 }
 
 const (
-	MinPort = 1024
-	MaxPort = 65535
+	MinPort    = 1024  // 最低保留范围，仅用于恢复既有转发。
+	MinNewPort = 20000 // 新建宿主机转发端口的最低值（含）。
+	MaxPort    = 65535
 )
+
+var (
+	ErrHostPortOutOfRange    = errors.New("host port must be in range 1024-65535")
+	ErrNewHostPortBelowFloor = errors.New("new host ports must be in range 20000-65535; existing 1024-19999 mappings are retained")
+	ErrGuestPortOutOfRange   = errors.New("guest port must be in range 1-65535")
+)
+
+func validateHostPort(hostPort int, allowLegacy bool) error {
+	if hostPort < MinPort || hostPort > MaxPort {
+		return fmt.Errorf("%w: got %d", ErrHostPortOutOfRange, hostPort)
+	}
+	if !allowLegacy && hostPort < MinNewPort {
+		return fmt.Errorf("%w: got %d", ErrNewHostPortBelowFloor, hostPort)
+	}
+	return nil
+}
 
 // --- 转发管理实现 ---
 
@@ -316,9 +334,14 @@ func (m *Manager) AddMapping(ctx context.Context, vmId string, protocol string, 
 	return m.addMapping(ctx, vmId, protocol, hostPort, guestPort, description, true)
 }
 
+// addMapping's checkLimit marks a user-requested rule. Restore and reconciliation
+// use false so existing low-port rows remain available.
 func (m *Manager) addMapping(ctx context.Context, vmId string, protocol string, hostPort, guestPort int, description string, checkLimit bool) error {
-	if hostPort < MinPort || hostPort > MaxPort {
-		return fmt.Errorf("host port %d out of allowed range [%d, %d]", hostPort, MinPort, MaxPort)
+	if err := validateHostPort(hostPort, true); err != nil {
+		return err
+	}
+	if guestPort < 1 || guestPort > MaxPort {
+		return fmt.Errorf("%w: got %d", ErrGuestPortOutOfRange, guestPort)
 	}
 
 	m.mu.Lock()
@@ -334,6 +357,15 @@ func (m *Manager) addMapping(ctx context.Context, vmId string, protocol string, 
 			exists = true
 			break
 		}
+	}
+
+	// API/gRPC 新请求只能新增 20000+ 端口。低位端口仅在同一 VM、同一协议
+	// 的既有活动或持久化映射上允许恢复/更新；删除后 DB 记录消失，不能重新创建。
+	if checkLimit && hostPort < MinNewPort && !exists {
+		if !m.hasPersistedMapping(vmId, protocol, hostPort) {
+			return validateHostPort(hostPort, false)
+		}
+		exists = true
 	}
 
 	if checkLimit && !exists {
@@ -394,6 +426,22 @@ func (m *Manager) addMapping(ctx context.Context, vmId string, protocol string, 
 	return nil
 }
 
+func (m *Manager) hasPersistedMapping(vmID, protocol string, hostPort int) bool {
+	if m.db == nil {
+		return false
+	}
+	rules, err := m.db.ListPortForwards(vmID)
+	if err != nil {
+		return false
+	}
+	for _, rule := range rules {
+		if rule.Protocol == protocol && rule.HostPort == hostPort {
+			return true
+		}
+	}
+	return false
+}
+
 func formatTargetAddress(ip string, port int) string {
 	return net.JoinHostPort(ip, strconv.Itoa(port))
 }
@@ -427,10 +475,44 @@ func (m *Manager) RemoveMapping(_ context.Context, vmId string, protocol string,
 
 // SyncForVM 以 desired 为准全量对齐某个 VM 的端口转发规则
 func (m *Manager) SyncForVM(ctx context.Context, vmId string, desired []DesiredRule) error {
+	// 先读取持久化配置并完成全量预检，避免非法低位新端口导致前面已有规则
+	// 被删除后才报错。原有低位规则可以出现在 desired 中，但不能新建。
+	persisted, err := m.db.ListPortForwards(vmId)
+	if err != nil {
+		return fmt.Errorf("list existing port forwards: %w", err)
+	}
+	legacy := make(map[string]bool, len(persisted))
+	for _, rule := range persisted {
+		if rule.HostPort < MinNewPort {
+			legacy[fmt.Sprintf("%s/%d", rule.Protocol, rule.HostPort)] = true
+		}
+	}
 	m.mu.RLock()
 	current := make([]*Entry, len(m.mappings[vmId]))
 	copy(current, m.mappings[vmId])
 	m.mu.RUnlock()
+	for _, entry := range current {
+		if entry.HostPort < MinNewPort {
+			legacy[fmt.Sprintf("%s/%d", entry.Protocol, entry.HostPort)] = true
+		}
+	}
+	seen := make(map[string]bool, len(desired))
+	for _, rule := range desired {
+		if rule.Protocol != "tcp" && rule.Protocol != "udp" {
+			return fmt.Errorf("unsupported port forward protocol %q", rule.Protocol)
+		}
+		key := fmt.Sprintf("%s/%d", rule.Protocol, rule.HostPort)
+		if seen[key] {
+			return fmt.Errorf("duplicate port forward %s", key)
+		}
+		seen[key] = true
+		if err := validateHostPort(rule.HostPort, legacy[key]); err != nil {
+			return err
+		}
+		if rule.GuestPort < 1 || rule.GuestPort > MaxPort {
+			return fmt.Errorf("%w: got %d", ErrGuestPortOutOfRange, rule.GuestPort)
+		}
+	}
 
 	// 删除不在期望列表中的规则
 	for _, c := range current {
@@ -442,13 +524,17 @@ func (m *Manager) SyncForVM(ctx context.Context, vmId string, desired []DesiredR
 			}
 		}
 		if !found {
-			_ = m.RemoveMapping(ctx, vmId, c.Protocol, c.HostPort)
+			if err := m.RemoveMapping(ctx, vmId, c.Protocol, c.HostPort); err != nil {
+				return err
+			}
 		}
 	}
 
 	// 添加或更新期望的规则
 	for _, d := range desired {
-		_ = m.AddMapping(ctx, vmId, d.Protocol, d.HostPort, d.GuestPort, d.Description)
+		if err := m.AddMapping(ctx, vmId, d.Protocol, d.HostPort, d.GuestPort, d.Description); err != nil {
+			return err
+		}
 	}
 
 	return nil
