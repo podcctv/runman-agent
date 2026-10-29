@@ -29,6 +29,23 @@ RFW_BASE="$DOWNLOAD_BASE"
 DEFAULT_INCUS_IMAGE_MIRROR="https://alpine-incus-base.428048.xyz"
 DEFAULT_INCUS_ALPINE_VERSION="3.24"
 
+# `bash <(curl ...)` keeps the downloader writing while Bash starts executing
+# this file. Short management actions (especially the status menu) can exit
+# before curl reaches EOF, which makes a successful command end with curl (23).
+# Drain only when the top-level script exits; draining from a subshell would
+# steal unread source bytes from the parent Bash process.
+INSTALLER_SOURCE="${BASH_SOURCE[0]:-}"
+finish_streamed_installer() {
+    [ "${BASH_SUBSHELL:-0}" -eq 0 ] || return 0
+    case "$INSTALLER_SOURCE" in
+        /dev/fd/*|/proc/*/fd/*)
+            [ -r "$INSTALLER_SOURCE" ] || return 0
+            cat -- "$INSTALLER_SOURCE" >/dev/null 2>&1 || true
+            ;;
+    esac
+}
+trap 'finish_streamed_installer' EXIT
+
 # t EN ZH — returns the string for current language
 t() { [ "$LANG_CODE" = "zh" ] && echo "$2" || echo "$1"; }
 

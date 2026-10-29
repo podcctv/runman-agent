@@ -39,6 +39,20 @@ jobs:
             exit 1
           fi
           printf '0\n' | bash install.sh zh --menu >/dev/null
+          curl() {
+            case "$*" in
+              *ip.sb*) printf '203.0.113.1\n' ;;
+              *) echo "unexpected curl in streamed status test: $*" >&2; return 127 ;;
+            esac
+          }
+          export -f curl
+          streamed_status_output="$(printf '2\n' | bash <(command curl --limit-rate 8k -fsSL "file://$PWD/install.sh") zh --menu 2>&1)"
+          unset -f curl
+          grep -q 'PANEL=http://203.0.113.1:8792' <<<"$streamed_status_output"
+          if grep -Eq 'curl: \(23\)|Failure writing output to destination' <<<"$streamed_status_output"; then
+            echo 'streamed status reported a downloader write error' >&2
+            exit 1
+          fi
           bash install.sh en --validate-ipv6 --ipv6-mode subnet \
             --ipv6-addr 2001:db8:100::1 --ipv6-subnet 2001:db8:100::/64 \
             --ipv6-iface lo --ipv6-routed --skip-ipv6-probe --non-interactive
