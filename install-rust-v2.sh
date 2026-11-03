@@ -686,7 +686,7 @@ if [ "$MIGRATE_GO" = 1 ]; then
             if python3 - "$MIGRATION_DIR/manifest.json" "$MIGRATION_DIR/legacy-state.json" \
                 "$MIGRATION_DIR/live-inventory.json" "$DATA_DIR/portforwards.json" <<'PY'
 import json, pathlib, sys
-manifest, legacy, inventory, forwards = [json.loads(pathlib.Path(p).read_text()) for p in sys.argv[1:]]
+manifest, legacy, inventory = [json.loads(pathlib.Path(p).read_text()) for p in sys.argv[1:4]]
 if inventory.get('schema') != 1 or not isinstance(inventory.get('items'), list):
     print('invalid Rust inventory schema', file=sys.stderr)
     raise SystemExit(1)
