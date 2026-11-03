@@ -76,10 +76,26 @@ cleanup_partial_apt_indexes() {
         find "$partial" -mindepth 1 -type f -delete
         find "$partial" -depth -mindepth 1 -type d -empty -delete
     fi
-    apt_get clean
+    cleanup_apt_caches
     available=$(LC_ALL=C df -PB1 /var/lib/apt | awk 'NR == 2 {print $4}')
     if [ "${bytes:-0}" -gt 0 ]; then
         log "discarded ${bytes} bytes of incomplete APT index downloads; ${available:-unknown} bytes are now available"
+    fi
+}
+
+cleanup_apt_caches() {
+    local before after
+    before=$(du -sb /var/cache/apt 2>/dev/null | awk 'NR == 1 {print $1}')
+    before=${before:-0}
+    apt_get clean
+    # apt-get update regenerates these indexes; they are disposable and can be
+    # rebuilt on the next package operation. Remove them after package setup so
+    # low-space migration does not carry the indexes into Rust image staging.
+    rm -f -- /var/cache/apt/pkgcache.bin /var/cache/apt/srcpkgcache.bin
+    after=$(du -sb /var/cache/apt 2>/dev/null | awk 'NR == 1 {print $1}')
+    after=${after:-0}
+    if [[ "$before" =~ ^[0-9]+$ && "$after" =~ ^[0-9]+$ ]] && [ "$before" -gt "$after" ]; then
+        log "cleared regenerable APT caches and recovered $((before - after)) bytes"
     fi
 }
 
@@ -92,6 +108,7 @@ install_host_packages() {
     apt_get install --no-install-recommends --no-upgrade \
         ca-certificates curl iproute2 iptables nftables wireguard-tools e2fsprogs tar gzip zstd util-linux kmod lxcfs
     HOST_PACKAGES_INSTALLED=1
+    cleanup_apt_caches
 }
 
 migration_available_bytes() {
@@ -921,7 +938,9 @@ prepare_go_migration() {
     command -v python3 >/dev/null 2>&1 || die "python3 is required for a consistent Go database snapshot"
     command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required to verify Rust release assets"
 
-    WORK=$(mktemp -d)
+    WORK=$(mktemp -d /tmp/runman-agent-rust-v2.XXXXXXXX)
+    # Arm cleanup before any release download, migration prompt, or preflight
+    # can fail. Rollback is gated by MIGRATION_ACTIVE inside cleanup_exit.
     trap cleanup_exit EXIT
     mkdir -p "$WORK/release"
     curl -fsSL --retry 3 --connect-timeout 20 -o "$WORK/SHA256SUMS" "$RELEASE_URL/SHA256SUMS" \
@@ -996,7 +1015,6 @@ prepare_go_migration() {
     [ "$_migration_confirm" = "MIGRATE TO RUST" ] || die "migration cancelled; Go remains active"
 
     MIGRATION_ACTIVE=1
-    trap cleanup_exit EXIT
     migration_confirm_low_space_cleanup
     # On a low-space recovery path, first save the migration parameters, stop
     # Go and its guests, and delete only the ERROR guests covered by the second
@@ -1253,7 +1271,7 @@ systemctl enable --now lxcfs.service >/dev/null 2>&1 || warn "lxcfs is not runni
 
 # ── binaries ────────────────────────────────────────────────────────────────
 
-[ -n "$WORK" ] || WORK=$(mktemp -d)
+[ -n "$WORK" ] || WORK=$(mktemp -d /tmp/runman-agent-rust-v2.XXXXXXXX)
 trap cleanup_exit EXIT
 
 fetch() { # fetch <name> <dest> <base-url>; --from-dir wins when it has the file
