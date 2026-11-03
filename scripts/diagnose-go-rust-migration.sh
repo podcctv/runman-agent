@@ -78,20 +78,24 @@ import re
 import sys
 
 for row in csv.reader(sys.stdin):
-    if len(row) != 3 or row[1].strip().lower() != "running":
+    if len(row) != 3:
         continue
-    try:
-        if int(row[2]) > 1:
+    status = row[1].strip().lower()
+    if status in {"running", "stopped"}:
+        if status == "stopped":
             continue
-    except ValueError:
-        pass
+        try:
+            if int(row[2]) > 1:
+                continue
+        except ValueError:
+            pass
     if re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", row[0]):
         print(row[0])
 ')
         if [ "${#instance_names[@]}" -gt 0 ]; then
-            printf 'legacy-state.json is missing; inspecting running instances with invalid or missing init PIDs.\n'
+            printf 'legacy-state.json is missing; inspecting instances with an error state or invalid/missing init PID.\n'
         else
-            printf 'legacy-state.json is missing; Incus did not report a running instance with an invalid init PID.\n'
+            printf 'legacy-state.json is missing; Incus reported no error-state instance or invalid/missing init PID.\n'
         fi
     else
         instance_names=()
