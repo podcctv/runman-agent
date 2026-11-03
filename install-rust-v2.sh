@@ -699,8 +699,12 @@ prepare_go_migration() {
     if systemctl is-active --quiet lxcfs.service; then MIGRATION_LXCFS_WAS_ACTIVE=1; fi
     if systemctl is-enabled --quiet lxcfs.service; then MIGRATION_LXCFS_WAS_ENABLED=1; fi
 
-    "$MIGRATION_HELPER" export --config "$go_config" --output "$MIGRATION_DIR" \
-        || die "Go migration preflight failed; Go remains active"
+    if ! "$MIGRATION_HELPER" export --config "$go_config" --output "$MIGRATION_DIR"; then
+        printf 'Go migration preflight failed; Go remains active. Snapshot: %s\n' "$MIGRATION_DIR" >&2
+        printf 'Read-only diagnostic: bash %q %q\n' \
+            "$MIGRATION_DIR/$diagnostic_asset" "$MIGRATION_DIR" >&2
+        exit 1
+    fi
     MIGRATION_BACKEND=$(cat "$MIGRATION_DIR/source-backend")
     WEB_LISTEN=$(cat "$MIGRATION_DIR/web-listen")
     migration_ipv4=$(sed -n 's/^ipv4_subnet = "\([^"]*\)"$/\1/p' "$MIGRATION_DIR/config.toml")
