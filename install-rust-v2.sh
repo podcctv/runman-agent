@@ -32,6 +32,7 @@ FROM_DIR=""
 UNINSTALL=0
 PURGE=0
 MIGRATE_GO=0
+CLEANUP_ONLY=0
 MIGRATION_DIR=""
 MIGRATION_HELPER=""
 MIGRATION_BACKEND=""
@@ -136,6 +137,154 @@ cleanup_exit() {
     exit "$rc"
 }
 
+cleanup_incus_cached_images() {
+    local work candidates fingerprint count=0
+    command -v incus >/dev/null 2>&1 || return 0
+    command -v python3 >/dev/null 2>&1 || { warn "python3 is unavailable; skipping Incus image cleanup"; return 0; }
+
+    work=$(mktemp -d)
+    if ! incus list local: --all-projects -c F --format csv,noheader > "$work/used-images.csv" \
+        || ! incus image list local: --format json > "$work/images.json"; then
+        warn "could not inventory Incus image use; skipping Incus image cleanup"
+        rm -rf -- "$work"
+        return 0
+    fi
+    candidates="$work/candidates"
+    if ! python3 - "$work/images.json" "$work/used-images.csv" > "$candidates" <<'PY'
+import datetime
+import json
+import pathlib
+import re
+import sys
+
+try:
+    images = json.loads(pathlib.Path(sys.argv[1]).read_text())
+    used = {line.strip() for line in pathlib.Path(sys.argv[2]).read_text().splitlines() if line.strip()}
+    if not isinstance(images, list):
+        raise ValueError("unexpected Incus image list")
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
+    for image in images:
+        if not isinstance(image, dict) or image.get("cached") is not True:
+            continue
+        if image.get("aliases"):
+            continue
+        fingerprint = image.get("fingerprint", "")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", fingerprint) or fingerprint in used:
+            continue
+        timestamp = image.get("last_used_at") or image.get("created_at")
+        if not timestamp:
+            continue
+        try:
+            parsed = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        if parsed < cutoff:
+            print(fingerprint)
+except Exception as exc:
+    print(f"Incus image inventory could not be parsed: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+    then
+        warn "could not safely parse Incus image inventory; skipping Incus image cleanup"
+        rm -rf -- "$work"
+        return 0
+    fi
+
+    while IFS= read -r fingerprint; do
+        [ -n "$fingerprint" ] || continue
+        if incus image delete "local:$fingerprint" >/dev/null 2>&1; then
+            log "removed unused Incus cached image ${fingerprint:0:12} (older than 7 days)"
+            count=$((count + 1))
+        else
+            warn "Incus refused to remove cached image ${fingerprint:0:12}; it was left in place"
+        fi
+    done < "$candidates"
+    [ "$count" -gt 0 ] || log "no unused Incus cached images older than 7 days"
+    rm -rf -- "$work"
+}
+
+maintenance_cleanup() {
+    local conf=/etc/systemd/journald.conf.d/90-runman-retention.conf
+    local work backup_dir had_conf=0 failed=0
+    work=$(mktemp -d)
+    cat > "$work/desired.conf" <<'EOF'
+# Managed by Runman Agent; system and Podman logs retain at most 7 days.
+[Journal]
+SystemMaxUse=512M
+RuntimeMaxUse=128M
+SystemKeepFree=1G
+MaxRetentionSec=7day
+MaxFileSec=1day
+EOF
+
+    install -d -m 755 /etc/systemd/journald.conf.d
+    if [ -e "$conf" ]; then
+        cp -a "$conf" "$work/original.conf"
+        had_conf=1
+    fi
+    if ! cmp -s "$work/desired.conf" "$conf" 2>/dev/null; then
+        if [ -e "$conf" ]; then
+            backup_dir="/var/backups/runman-agent/maintenance-$(date -u +%Y%m%dT%H%M%SZ)"
+            install -d -m 700 "$backup_dir"
+            cp -a "$conf" "$backup_dir/90-runman-retention.conf.before"
+            log "backed up existing journald drop-in to $backup_dir"
+        fi
+        install -m 644 "$work/desired.conf" "$conf"
+        if ! systemd-analyze cat-config systemd/journald.conf > "$work/effective.conf" \
+            || ! awk -F= '
+                $1 == "SystemMaxUse" { system=$2 }
+                $1 == "RuntimeMaxUse" { runtime=$2 }
+                $1 == "SystemKeepFree" { keep=$2 }
+                $1 == "MaxRetentionSec" { retention=$2 }
+                $1 == "MaxFileSec" { file=$2 }
+                END { exit !(system == "512M" && runtime == "128M" && keep == "1G" && retention == "7day" && file == "1day") }
+            ' "$work/effective.conf"; then
+            if [ "$had_conf" = 1 ]; then cp -a "$work/original.conf" "$conf"; else rm -f "$conf"; fi
+            warn "journald rejected the 7-day retention configuration; restored its previous drop-in"
+            failed=1
+        elif ! systemctl restart systemd-journald.service; then
+            if [ "$had_conf" = 1 ]; then cp -a "$work/original.conf" "$conf"; else rm -f "$conf"; fi
+            systemctl restart systemd-journald.service >/dev/null 2>&1 || true
+            warn "journald could not restart; restored its previous drop-in"
+            failed=1
+        else
+            log "applied 7-day journald retention (512M persistent, 128M runtime cap)"
+        fi
+    fi
+
+    if [ "$failed" = 0 ]; then
+        journalctl --rotate || { warn "could not rotate the active journal"; failed=1; }
+        journalctl --vacuum-time=7d || { warn "could not vacuum journals older than 7 days"; failed=1; }
+    fi
+
+    if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
+        if podman image prune -f; then
+            log "removed dangling Podman images; tagged images and container data were preserved"
+        else
+            warn "Podman dangling-image cleanup failed"
+            failed=1
+        fi
+    fi
+    cleanup_incus_cached_images
+
+    # Remove only rotated archives older than seven days, never active log files.
+    if [ -d /var/log ]; then
+        find /var/log -xdev -type f -mmin +10080 \
+            \( -name '*.gz' -o -name '*.xz' -o -name '*.zst' -o -name '*.old' \
+               -o -name '*.log.[0-9]*' -o -name '*.log-20[0-9][0-9][0-9][0-9][0-9][0-9]*' \) \
+            -print -delete || { warn "could not prune all old rotated log archives"; failed=1; }
+        if [ -d /var/log/installer ]; then
+            find /var/log/installer -xdev -type f -mmin +10080 \
+                \( -name syslog -o -name partman -o -name '*.log' -o -name 'Xorg*' \) \
+                -print -delete || { warn "could not prune all old installer logs"; failed=1; }
+        fi
+    fi
+    rm -rf -- "$work"
+    return "$failed"
+}
+
 usage() {
     cat <<'EOF'
 Usage: install.sh [options]
@@ -160,6 +309,7 @@ Usage: install.sh [options]
                           optionally rfw-<arch>) instead of downloading them
   --migrate-go            Lossy clean-rebuild migration from a supported Go Podman/Incus node;
                           keeps a rollback snapshot until Rust health and port checks pass
+  --cleanup-only          Apply 7-day log retention and prune dangling/unused images, without installing
   --uninstall             Remove the agent; refuses while instances exist
   --purge                 With --uninstall: also delete every instance and all data
   -h, --help              Show this help
@@ -180,6 +330,7 @@ while [ $# -gt 0 ]; do
         --rfw-iface) RFW_IFACE="${2:?--rfw-iface needs a value}"; shift 2 ;;
         --from-dir) FROM_DIR="${2:?--from-dir needs a value}"; shift 2 ;;
         --migrate-go) MIGRATE_GO=1; WITH_RFW=0; shift ;;
+        --cleanup-only) CLEANUP_ONLY=1; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
         --purge) PURGE=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -211,6 +362,11 @@ if [ "$MIGRATE_GO" = 1 ]; then
         || [ "$PURGE" != 0 ] || [ "$WITH_RFW" != 0 ]; then
         die "--migrate-go cannot be combined with token, local assets, RFW, or uninstall options"
     fi
+fi
+
+if [ "$CLEANUP_ONLY" = 1 ] && { [ "$MIGRATE_GO" = 1 ] || [ "$UNINSTALL" = 1 ] \
+    || [ "$PURGE" = 1 ] || [ -n "$TOKEN" ] || [ -n "$FROM_DIR" ]; }; then
+    die "--cleanup-only cannot be combined with migration, uninstall, token, or local asset options"
 fi
 
 case "$(uname -m)" in
@@ -412,7 +568,8 @@ fi
 # runtime. Never overwrite a live Go node or its release/updater path.
 if { [ -f /opt/narwhal-agent/config.json ] || [ -f /opt/narwhal-agent/agent.db ] \
     || [ -f /var/lib/narwhal-agent/agent.db ] \
-    || systemctl is-active --quiet narwhal-agent.service 2>/dev/null; } && [ "$MIGRATE_GO" != 1 ]; then
+    || systemctl is-active --quiet narwhal-agent.service 2>/dev/null; } \
+    && [ "$MIGRATE_GO" != 1 ] && [ "$CLEANUP_ONLY" != 1 ]; then
     die "a Go Runman Agent installation was detected; v2 requires a planned migration and will not take over its Podman/Incus data"
 fi
 
@@ -432,6 +589,11 @@ fi
 kernel=$(uname -r | cut -d- -f1)
 [ "$(printf '%s\n%s\n' "$MIN_KERNEL" "$kernel" | sort -V | head -n1)" = "$MIN_KERNEL" ] \
     || die "kernel $kernel is too old; $MIN_KERNEL or newer is required (idmapped mounts)"
+
+if [ "$CLEANUP_ONLY" = 1 ]; then
+    maintenance_cleanup || die "maintenance cleanup was incomplete; see warnings above"
+    exit 0
+fi
 
 prepare_go_migration
 
@@ -758,6 +920,9 @@ PY
         warn "Rust migration succeeded, but some old guests could not be removed. The Go service stays disabled and cleanup is pending; inspect $MIGRATION_DIR"
     fi
 fi
+
+# Keep host and guest logs bounded after the new agent has passed health checks.
+maintenance_cleanup || warn "installation succeeded, but some maintenance cleanup steps failed"
 
 public_ip=$(curl -4 -fsS --max-time 8 https://api-ipv4.ip.sb/ip 2>/dev/null || echo '<this-host>')
 echo

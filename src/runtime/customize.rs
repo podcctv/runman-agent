@@ -50,9 +50,44 @@ const MEMORY_HEAVY_UNITS: &[&str] = &[
     "motd-news.timer",
 ];
 
-/// journald keeps its runtime journal on /run (tmpfs, charged to the
-/// instance's memory); cap it.
-const JOURNALD_DROPIN: &str = "[Journal]\nRuntimeMaxUse=8M\nSystemMaxUse=64M\n";
+/// Keep guest journals size-bounded and rotate/expire them within seven days.
+const JOURNALD_DROPIN: &str =
+    "[Journal]\nRuntimeMaxUse=8M\nSystemMaxUse=64M\nMaxRetentionSec=7day\nMaxFileSec=1day\n";
+
+const GUEST_LOG_RETENTION_SCRIPT: &str = r##"#!/bin/sh
+set -eu
+if command -v journalctl >/dev/null 2>&1; then
+    journalctl --rotate || true
+    journalctl --vacuum-time=7d || true
+fi
+if [ -d /var/log ]; then
+    find /var/log -xdev -type f -mtime +6 \
+        \( -name '*.gz' -o -name '*.xz' -o -name '*.zst' -o -name '*.old' \
+           -o -name '*.log.[0-9]*' -o -name '*.log-20[0-9][0-9][0-9][0-9][0-9][0-9]*' \) \
+        -exec rm -f -- {} \;
+fi
+"##;
+
+const GUEST_LOG_RETENTION_SERVICE: &str = r#"[Unit]
+Description=Runman 7-day log retention
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/runman-log-retention
+"#;
+
+const GUEST_LOG_RETENTION_TIMER: &str = r#"[Unit]
+Description=Daily Runman log retention
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15m
+Unit=runman-log-retention.service
+
+[Install]
+WantedBy=timers.target
+"#;
 
 const SSH_HOST_KEYS: &[&str] = &["rsa", "ecdsa", "ed25519", "dsa"];
 
@@ -118,9 +153,36 @@ pub fn prepare(root: &RootFs, cfg: &FirstBoot<'_>) -> Result<()> {
             JOURNALD_DROPIN.as_bytes(),
             0o644,
         )?;
+        root.mkdir_all("/usr/local/sbin")?;
+        root.write(
+            "/usr/local/sbin/runman-log-retention",
+            GUEST_LOG_RETENTION_SCRIPT.as_bytes(),
+            0o755,
+        )?;
+        root.write(
+            "/etc/systemd/system/runman-log-retention.service",
+            GUEST_LOG_RETENTION_SERVICE.as_bytes(),
+            0o644,
+        )?;
+        root.write(
+            "/etc/systemd/system/runman-log-retention.timer",
+            GUEST_LOG_RETENTION_TIMER.as_bytes(),
+            0o644,
+        )?;
+        root.mkdir_all("/etc/systemd/system/timers.target.wants")?;
+        root.symlink(
+            "/etc/systemd/system/timers.target.wants/runman-log-retention.timer",
+            "/etc/systemd/system/runman-log-retention.timer",
+        )?;
         for unit in MASKED_UNITS.iter().chain(MEMORY_HEAVY_UNITS) {
             root.symlink(&format!("/etc/systemd/system/{unit}"), "/dev/null")?;
         }
+    } else if root.exists("/etc/periodic/daily") {
+        root.write(
+            "/etc/periodic/daily/runman-log-retention",
+            GUEST_LOG_RETENTION_SCRIPT.as_bytes(),
+            0o755,
+        )?;
     }
     if root.exists("/etc/cloud") {
         root.write("/etc/cloud/cloud-init.disabled", b"", 0o644)?;
