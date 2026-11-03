@@ -390,8 +390,12 @@ where
             || !(1..=10_000_000).contains(&req.threshold)
             || canonical_generation.as_deref() != Some(req.instance_id.as_str())
         {
-            return respond_error(&mut stream, 400, "invalid generation-bound overload stop target")
-                .await;
+            return respond_error(
+                &mut stream,
+                400,
+                "invalid generation-bound overload stop target",
+            )
+            .await;
         }
         let id = match crate::model::VmId::parse(&req.container_name) {
             Ok(id) => id.as_str().to_owned(),

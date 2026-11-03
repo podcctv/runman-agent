@@ -576,7 +576,10 @@ impl Runtime {
         threshold: u32,
         metric_tcp_active: bool,
     ) -> Result<(String, u64)> {
-        anyhow::ensure!(project == "default", "only the default project is supported");
+        anyhow::ensure!(
+            project == "default",
+            "only the default project is supported"
+        );
         anyhow::ensure!(
             (1..=10_000_000).contains(&threshold),
             "connection stop threshold is invalid"
