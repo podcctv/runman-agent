@@ -209,7 +209,7 @@ PY
 
 maintenance_cleanup() {
     local conf=/etc/systemd/journald.conf.d/90-runman-retention.conf
-    local work backup_dir had_conf=0 failed=0
+    local work backup_dir limits had_conf=0 failed=0
     work=$(mktemp -d)
     cat > "$work/desired.conf" <<'EOF'
 # Managed by Runman Agent; system and Podman logs retain at most 7 days.
@@ -253,20 +253,24 @@ EOF
                     if (key == "MaxFileSec") max_file=value
                 }
                 END {
-                    if (system_max == "512M" && runtime_max == "128M" && system_keep_free == "1G" && max_retention == "7day" && max_file == "1day") exit 0
-                    printf "effective journald settings differ: SystemMaxUse=%s RuntimeMaxUse=%s SystemKeepFree=%s MaxRetentionSec=%s MaxFileSec=%s\n", system_max, runtime_max, system_keep_free, max_retention, max_file > "/dev/stderr"
+                    if (max_retention == "7day" && max_file == "1day") {
+                        printf "SystemMaxUse=%s RuntimeMaxUse=%s SystemKeepFree=%s\n", system_max, runtime_max, system_keep_free
+                        exit 0
+                    }
+                    printf "effective journald retention differs: MaxRetentionSec=%s MaxFileSec=%s\n", max_retention, max_file > "/dev/stderr"
                     exit 1
                 }
-            ' "$work/effective.conf"; then
+            ' "$work/effective.conf" > "$work/effective-limits"; then
             if [ "$had_conf" = 1 ]; then cp -a "$work/original.conf" "$conf"; else rm -f "$conf"; fi
-            warn "journald rejected the 7-day retention configuration; restored its previous drop-in"
+            warn "could not verify 7-day journald retention; restored its previous drop-in"
         elif ! systemctl restart systemd-journald.service; then
             if [ "$had_conf" = 1 ]; then cp -a "$work/original.conf" "$conf"; else rm -f "$conf"; fi
             systemctl restart systemd-journald.service >/dev/null 2>&1 || true
             warn "journald could not restart; restored its previous drop-in"
             failed=1
         else
-            log "applied 7-day journald retention (512M persistent, 128M runtime cap)"
+            limits=$(cat "$work/effective-limits")
+            log "applied 7-day journald retention; effective size limits: ${limits:-system defaults}"
         fi
     fi
 
@@ -453,9 +457,10 @@ cleanup_unused_incus() {
         [ -n "$pool" ] || continue
         for volume_type in custom container virtual-machine; do
             count=$((count + 1))
-            if ! incus storage volume list local: "$pool" "type=$volume_type" \
+            if ! incus storage volume list "local:$pool" "type=$volume_type" \
                 --all-projects -c t,n --format csv,noheader >"$work/volumes-$count" 2>&1; then
                 warn "could not inventory Incus $volume_type volumes in pool $pool; keeping Incus"
+                tail -n 8 "$work/volumes-$count" >&2 || true
                 rm -rf -- "$work"
                 return 0
             fi
