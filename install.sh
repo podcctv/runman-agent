@@ -409,6 +409,7 @@ NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
 ORIGINAL_ARGC=$#
 FORCE_MENU=0
 UPDATE_ONLY=0
+RUST_V2_MIGRATION=0
 UPDATE_NETWORK_REQUESTED=0
 GUIDED_INSTALL=0
 PURGE_INCUS="${PURGE_INCUS:-0}"
@@ -432,6 +433,7 @@ Runman Agent installer
   bash install.sh                         Guided menu
   bash install.sh --virt incus            Install/update Incus backend
   bash install.sh --update-only           Back up and update Agent only; require an existing installation
+  bash install.sh --migrate-rust-v2       Lossy clean rebuild from Go Podman/Incus to Rust v2
   bash install.sh --detect-ipv6            Detect native/tunnel IPv6 and routed prefix
   bash install.sh --validate-ipv6 ...      Validate manually supplied IPv6 values
   bash install.sh --show-token             Print current integration Token
@@ -621,6 +623,19 @@ reset_panel_password() (
     log "$(t "Panel password reset; Agent restarted." "面板密码已重置，Agent 已重启。")"
 )
 
+run_rust_v2_migration() (
+    set -euo pipefail
+    local release work
+    release="${RUNMAN_RUST_V2_RELEASE_URL:-https://github.com/podcctv/runman-agent/releases/download/continuous-rs}"
+    work=$(mktemp -d)
+    trap 'rm -rf -- "$work"' EXIT
+    curl -fsSL --retry 3 --connect-timeout 20 -o "$work/SHA256SUMS" "$release/SHA256SUMS"
+    curl -fsSL --retry 3 --connect-timeout 20 -o "$work/install.sh" "$release/install.sh"
+    [ "$(grep -Ec '  \*?install\.sh$' "$work/SHA256SUMS")" = 1 ] || die "Rust release checksum list is invalid"
+    (cd "$work" && grep -E '  \*?install\.sh$' SHA256SUMS | sha256sum -c --quiet -) || die "Rust installer checksum mismatch"
+    bash "$work/install.sh" --migrate-go
+)
+
 show_main_menu() {
     printf '\n%s\n' "$(t "Runman Agent guided operations" "Runman Agent 菜单引导")"
     printf '  1) %s\n' "$(t "Install/update (guided network setup)" "安装/更新（网络引导配置）")"
@@ -637,6 +652,7 @@ show_main_menu() {
     printf ' 12) %s\n' "$(t "Full Incus cleanup and uninstall" "清理 Incus 制品并完整卸载")"
     printf ' 13) %s\n' "$(t "Configure/refresh container images" "配置/刷新容器镜像")"
     printf ' 14) %s\n' "$(t "Agent-only upgrade / migrate from upstream (keep networking)" "仅升级 Agent / 从原版迁移（保留网络）")"
+    printf ' 15) %s\n' "$(t "Lossy clean rebuild migration to Rust v2" "有损重建迁移到 Rust v2（清空旧容器数据）")"
     printf '  0) %s\n' "$(t "Exit" "退出")"
     read -rp '> ' _menu_choice
     case "${_menu_choice}" in
@@ -654,6 +670,7 @@ show_main_menu() {
         12) UNINSTALL=1; PURGE_INCUS=1 ;;
         13) GUIDED_INSTALL=1; FORCE_IMAGE_REFRESH=1; IMAGE_MENU=1 ;;
         14) UPDATE_ONLY=1 ;;
+        15) RUST_V2_MIGRATION=1 ;;
         0) exit 0 ;;
         *) die "$(t "Invalid menu selection." "无效的菜单选项。")" ;;
     esac
@@ -688,6 +705,7 @@ while [[ $# -gt 0 ]]; do
         -y|--yes|--non-interactive) NON_INTERACTIVE=1; shift ;;
         --menu) FORCE_MENU=1; shift ;;
         --update-only) UPDATE_ONLY=1; shift ;;
+        --migrate-rust-v2) RUST_V2_MIGRATION=1; shift ;;
         --detect-ipv6) IPV6_ONESHOT_MODE="detect"; shift ;;
         --validate-ipv6) IPV6_ONESHOT_MODE="validate"; shift ;;
         --backup-ipv6) IPV6_ONESHOT_MODE="backup"; shift ;;
@@ -765,6 +783,13 @@ elif [ "$IPV6_ONESHOT_MODE" = "rollback" ]; then
 fi
 if [ "$UNINSTALL" = "1" ]; then
     do_uninstall
+    exit 0
+fi
+if [ "$RUST_V2_MIGRATION" = "1" ]; then
+    [ "$UPDATE_ONLY" = "0" ] && [ -z "$SYSTEM_ACTION" ] && [ -z "$TOKEN_ACTION" ] \
+        && [ -z "$IPV6_ONESHOT_MODE" ] && [ "$UNINSTALL" != "1" ] \
+        || die "Rust v2 migration cannot be combined with other management actions"
+    run_rust_v2_migration
     exit 0
 fi
 
