@@ -207,8 +207,10 @@ esac
 [ -z "$RFW_IFACE" ] || [[ "$RFW_IFACE" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || die "invalid --rfw-iface"
 
 if [ "$MIGRATE_GO" = 1 ]; then
-    [ -z "$TOKEN" ] && [ -z "$FROM_DIR" ] && [ "$UNINSTALL" = 0 ] && [ "$PURGE" = 0 ] \
-        && [ "$WITH_RFW" = 0 ] || die "--migrate-go cannot be combined with token, local assets, RFW, or uninstall options"
+    if [ -n "$TOKEN" ] || [ -n "$FROM_DIR" ] || [ "$UNINSTALL" != 0 ] \
+        || [ "$PURGE" != 0 ] || [ "$WITH_RFW" != 0 ]; then
+        die "--migrate-go cannot be combined with token, local assets, RFW, or uninstall options"
+    fi
 fi
 
 case "$(uname -m)" in
@@ -219,15 +221,18 @@ esac
 
 prepare_go_migration() {
     local go_config=/opt/narwhal-agent/config.json go_binary=/opt/narwhal-agent/narwhal-agent
-    local go_unit asset go_unit_path host_port
+    local asset go_unit_path host_port
     [ "$MIGRATE_GO" = 1 ] || return 0
     [ -t 0 ] || die "Go -> Rust migration requires an interactive terminal for the destructive confirmation"
-    [ -f "$go_config" ] && [ -x "$go_binary" ] || die "standard Go config/binary not found; no host changes made"
-    [ ! -e "$CONFIG_DIR" ] && [ ! -e "$DATA_DIR" ] && [ ! -e "$BIN" ] \
-        && [ ! -e /etc/systemd/system/runman-agent.service ] && [ ! -e /run/runman-agent ] \
-        && [ ! -S /run/narwhal-agent/connlimit.sock ] && [ ! -S /run/narwhal-agent/firewall.sock ] \
-        && ! systemctl is-active --quiet runman-agent.service 2>/dev/null \
-        || die "a Rust v2 installation already exists; migration will not overwrite it"
+    if [ ! -f "$go_config" ] || [ ! -x "$go_binary" ]; then
+        die "standard Go config/binary not found; no host changes made"
+    fi
+    if [ -e "$CONFIG_DIR" ] || [ -e "$DATA_DIR" ] || [ -e "$BIN" ] \
+        || [ -e /etc/systemd/system/runman-agent.service ] || [ -e /run/runman-agent ] \
+        || [ -S /run/narwhal-agent/connlimit.sock ] || [ -S /run/narwhal-agent/firewall.sock ] \
+        || systemctl is-active --quiet runman-agent.service 2>/dev/null; then
+        die "a Rust v2 installation already exists; migration will not overwrite it"
+    fi
     ! ip link show rmbr0 >/dev/null 2>&1 || die "rmbr0 already exists; refusing to replace an existing network"
     ! nft list table inet runman >/dev/null 2>&1 || die "inet runman firewall table already exists"
     ! nft list table bridge runman >/dev/null 2>&1 || die "bridge runman firewall table already exists"
@@ -271,10 +276,10 @@ prepare_go_migration() {
     MIGRATION_GO_WAS_ENABLED=0
     MIGRATION_LXCFS_WAS_ACTIVE=0
     MIGRATION_LXCFS_WAS_ENABLED=0
-    systemctl is-active --quiet narwhal-agent.service && MIGRATION_GO_WAS_ACTIVE=1 || true
-    systemctl is-enabled --quiet narwhal-agent.service && MIGRATION_GO_WAS_ENABLED=1 || true
-    systemctl is-active --quiet lxcfs.service && MIGRATION_LXCFS_WAS_ACTIVE=1 || true
-    systemctl is-enabled --quiet lxcfs.service && MIGRATION_LXCFS_WAS_ENABLED=1 || true
+    if systemctl is-active --quiet narwhal-agent.service; then MIGRATION_GO_WAS_ACTIVE=1; fi
+    if systemctl is-enabled --quiet narwhal-agent.service; then MIGRATION_GO_WAS_ENABLED=1; fi
+    if systemctl is-active --quiet lxcfs.service; then MIGRATION_LXCFS_WAS_ACTIVE=1; fi
+    if systemctl is-enabled --quiet lxcfs.service; then MIGRATION_LXCFS_WAS_ENABLED=1; fi
 
     "$MIGRATION_HELPER" export --config "$go_config" --output "$MIGRATION_DIR" \
         || die "Go migration preflight failed; Go remains active"
