@@ -93,6 +93,10 @@ enum Desired {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Record {
     id: String,
+    /// Changes whenever an instance is replaced, so external temporary
+    /// controls cannot silently follow a new workload with the same VM ID.
+    #[serde(default)]
+    generation: String,
     idx: u32,
     cpu: u32,
     ram_mb: u64,
@@ -313,6 +317,16 @@ impl Runtime {
             self.net.enable_v6().await?;
         }
         self.reconcile_network().await?;
+        // Older records have no incarnation identity. Assign one before
+        // exposing them to local control APIs.
+        for mut rec in self
+            .records()?
+            .into_iter()
+            .filter(|r| r.generation.is_empty())
+        {
+            rec.generation = uuid::Uuid::new_v4().to_string();
+            self.save(&rec)?;
+        }
         // Records of older agents have no creation time: take the instance
         // directory's (its birth time where the filesystem records one).
         for mut rec in self.records()?.into_iter().filter(|r| r.created == 0) {
@@ -416,6 +430,49 @@ impl Runtime {
             }
         }
         Ok(out)
+    }
+
+    /// Resolve a local-control target against a live, Runman-owned instance.
+    /// The generation value prevents a delayed policy from attaching to a
+    /// replacement that reused the same platform VM UUID.
+    pub async fn connlimit_target(&self, raw_id: &str) -> Result<crate::connlimit::Target> {
+        let id = VmId::parse(raw_id)?;
+        let Some(rec) = self.load(id.as_str())? else {
+            return Ok(crate::connlimit::Target {
+                managed: false,
+                running: false,
+                instance_id: String::new(),
+                ips: Vec::new(),
+            });
+        };
+        if rec.builder {
+            return Ok(crate::connlimit::Target {
+                managed: false,
+                running: false,
+                instance_id: String::new(),
+                ips: Vec::new(),
+            });
+        }
+        let dedicated = self
+            .dedicated
+            .lock()
+            .unwrap()
+            .get(id.as_str())
+            .cloned()
+            .unwrap_or_default();
+        let mut ips = vec![rec.addrs.ipv4.to_string()];
+        if let Some(ip) = rec.addrs.ipv6 {
+            ips.push(ip.to_string());
+        }
+        ips.extend(dedicated.into_iter().map(|ip| ip.to_string()));
+        ips.sort();
+        ips.dedup();
+        Ok(crate::connlimit::Target {
+            managed: true,
+            running: rec.desired == Desired::Running && self.is_active(id.as_str()).await,
+            instance_id: rec.generation,
+            ips,
+        })
     }
 
     fn allocate_idx(&self) -> Result<u32> {
@@ -953,6 +1010,7 @@ impl Runtime {
         let idx = self.allocate_idx()?;
         let rec = Record {
             id: id.to_owned(),
+            generation: uuid::Uuid::new_v4().to_string(),
             idx,
             cpu: spec.cpu,
             ram_mb: spec.ram_mb,

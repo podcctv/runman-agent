@@ -8,8 +8,8 @@
 # binaries and service units are refreshed. It never prompts.
 set -euo pipefail
 
-RELEASE_URL="${RUNMAN_RELEASE_URL:-https://github.com/narwhal-cloud/runman-agent-rs/releases/download/continuous}"
-RFW_URL="${RUNMAN_RFW_URL:-https://github.com/narwhal-cloud/runman-agent/releases/download/continuous}"
+RELEASE_URL="${RUNMAN_RELEASE_URL:-https://github.com/podcctv/runman-agent/releases/download/continuous-rs}"
+RFW_URL="${RUNMAN_RFW_URL:-https://github.com/podcctv/runman-agent/releases/download/continuous}"
 PLATFORM_URL="https://hosting.fuckip.me:443"
 CONFIG_DIR=/etc/runman-agent
 CONFIG="$CONFIG_DIR/config.toml"
@@ -157,6 +157,20 @@ uninstall() {
             ip "$fam" rule del ${rule#*:} 2>/dev/null || true
         done
     done
+    local chain
+    for tool in iptables ip6tables; do
+        command -v "$tool" >/dev/null 2>&1 || continue
+        for chain in RUNMAN_RS_CLIMIT RUNMAN_RS_RFW_ABUSE; do
+            if "$tool" -w -t filter -S "$chain" 2>/dev/null | grep -Fq \
+                -e runman-agent-rs-v2 -e runman-agent-rs-v2-abuse; then
+                while "$tool" -w -t filter -C FORWARD -j "$chain" 2>/dev/null; do
+                    "$tool" -w -t filter -D FORWARD -j "$chain" 2>/dev/null || break
+                done
+                "$tool" -w -t filter -F "$chain" 2>/dev/null || true
+                "$tool" -w -t filter -X "$chain" 2>/dev/null || true
+            fi
+        done
+    done
     if [ -f /etc/systemd/system/rfw.service ]; then
         log "removing rfw"
         systemctl disable --now rfw.service 2>/dev/null || true
@@ -165,6 +179,9 @@ uninstall() {
     rm -f /etc/systemd/system/runman-agent.service /etc/modules-load.d/runman.conf "$BIN" \
         /etc/sysctl.d/90-runman.conf /etc/systemd/system/lxcfs.service.d/runman.conf
     rm -rf "$CONFIG_DIR" /run/runman-agent
+    [ ! -S /run/narwhal-agent/connlimit.sock ] || rm -f /run/narwhal-agent/connlimit.sock
+    [ ! -S /run/narwhal-agent/firewall.sock ] || rm -f /run/narwhal-agent/firewall.sock
+    rmdir /run/narwhal-agent 2>/dev/null || true
     if [ "$PURGE" = 1 ]; then
         local dir
         for dir in "$DATA_DIR"/instances/*/mnt/*; do
@@ -179,6 +196,14 @@ uninstall() {
 if [ "$UNINSTALL" = 1 ]; then
     uninstall
     exit 0
+fi
+
+# The Rust major line has a different configuration, database, and container
+# runtime. Never overwrite a live Go node or its release/updater path.
+if [ -f /opt/narwhal-agent/config.json ] || [ -f /opt/narwhal-agent/agent.db ] \
+    || [ -f /var/lib/narwhal-agent/agent.db ] \
+    || systemctl is-active --quiet narwhal-agent.service 2>/dev/null; then
+    die "a Go Runman Agent installation was detected; v2 requires a planned migration and will not take over its Podman/Incus data"
 fi
 
 # ── host checks ─────────────────────────────────────────────────────────────
@@ -205,7 +230,7 @@ log "installing packages"
 apt_get() { LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 -y -q "$@"; }
 apt_get update >/dev/null
 apt_get install --no-install-recommends \
-    ca-certificates curl iproute2 nftables wireguard-tools e2fsprogs tar gzip zstd util-linux kmod lxcfs >/dev/null
+    ca-certificates curl iproute2 iptables nftables wireguard-tools e2fsprogs tar gzip zstd util-linux kmod lxcfs >/dev/null
 
 for mod in wireguard ifb sch_cake tcp_bbr; do
     modprobe "$mod" 2>/dev/null || warn "kernel module $mod is unavailable; related features will fail"

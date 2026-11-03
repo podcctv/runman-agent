@@ -141,6 +141,12 @@ async fn agent_main() -> Result<()> {
     );
 
     let local_wg = Arc::new(LocalWg::load(&cfg.data_dir)?);
+    #[cfg(target_os = "linux")]
+    let mut local_control: Option<(
+        Arc<runman_agent::connlimit::Manager>,
+        Arc<runman_agent::hostpolicy::Manager>,
+        Arc<Runtime>,
+    )> = None;
     let services = match cfg.backend {
         BackendKind::Fake => Fake::new().services(),
         #[cfg(not(target_os = "linux"))]
@@ -148,6 +154,27 @@ async fn agent_main() -> Result<()> {
         #[cfg(target_os = "linux")]
         BackendKind::Container => {
             let rt = Arc::new(Runtime::new(Options::from_config(&cfg))?.with_config(store.clone()));
+            let connlimit = Arc::new(runman_agent::connlimit::Manager::new(
+                cfg.data_dir.join("connlimit.json"),
+                cfg.network.bridge.clone(),
+            )?);
+            let hostpolicy = Arc::new(runman_agent::hostpolicy::Manager::new(
+                cfg.data_dir.join("host-firewall.json"),
+                &cfg.rfw_addr,
+            )?);
+            {
+                let manager = connlimit.clone();
+                let runtime = rt.clone();
+                tokio::spawn(async move {
+                    runman_agent::connlimit::reconcile_loop(manager, move |id| {
+                        let runtime = runtime.clone();
+                        async move { runtime.connlimit_target(&id).await }
+                    })
+                    .await;
+                });
+            }
+            tokio::spawn(runman_agent::hostpolicy::reconcile_loop(hostpolicy.clone()));
+            local_control = Some((connlimit, hostpolicy, rt.clone()));
             {
                 let rt = rt.clone();
                 let store_for_init = store.clone();
@@ -228,6 +255,25 @@ async fn agent_main() -> Result<()> {
         tokio::spawn(async move {
             if let Err(e) = web.serve(listen, stop).await {
                 tracing::error!("management panel: {e:#}");
+            }
+        });
+    }
+    #[cfg(target_os = "linux")]
+    if let Some((connlimit, hostpolicy, runtime)) = local_control {
+        let target_runtime = runtime.clone();
+        tokio::spawn(async move {
+            if let Err(e) = runman_agent::controlapi::serve_connlimit(connlimit, move |id| {
+                let runtime = target_runtime.clone();
+                async move { runtime.connlimit_target(&id).await }
+            })
+            .await
+            {
+                tracing::error!("connection-limit control socket: {e:#}");
+            }
+        });
+        tokio::spawn(async move {
+            if let Err(e) = runman_agent::controlapi::serve_firewall(hostpolicy).await {
+                tracing::error!("host firewall control socket: {e:#}");
             }
         });
     }

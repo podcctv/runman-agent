@@ -21,7 +21,7 @@ web_user = "admin"
 web_password_hash = ""      # set with `runman-agent set-password`
 rfw_addr = "127.0.0.1:7734"
 
-update_url = "https://github.com/narwhal-cloud/runman-agent-rs/releases/download/continuous"
+update_url = "https://github.com/podcctv/runman-agent/releases/download/continuous-rs"
 auto_update = true
 
 [network]

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_PATH: &str = "/etc/runman-agent/config.toml";
 pub const DEFAULT_PLATFORM_URL: &str = "https://hosting.fuckip.me:443";
 pub const DEFAULT_UPDATE_URL: &str =
-    "https://github.com/narwhal-cloud/runman-agent-rs/releases/download/continuous";
+    "https://github.com/podcctv/runman-agent/releases/download/continuous-rs";
 pub const DEFAULT_MAX_FORWARDS: u32 = 20;
 /// Highest `max_forwards`: more than a host has ports to give.
 pub const MAX_FORWARDS_LIMIT: u32 = 65535;

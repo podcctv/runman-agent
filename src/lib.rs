@@ -7,9 +7,15 @@
 
 pub mod backend;
 pub mod config;
+#[cfg(target_os = "linux")]
+pub mod connlimit;
+#[cfg(target_os = "linux")]
+pub mod controlapi;
 pub mod detect;
 pub mod fake;
 pub mod history;
+#[cfg(target_os = "linux")]
+pub mod hostpolicy;
 pub mod local_wg;
 #[cfg(target_os = "linux")]
 pub mod metrics;

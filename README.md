@@ -19,14 +19,14 @@ Token 只由平台生成，agent 和安装器从不自行生成。
 - **WireGuard 独立 IP**：宿主机内核 WireGuard，独立 IPv4/IPv6 直接配在实例 `eth0` 上，出站、入站、监听都用它；私钥不进实例。
 - **管理面板**（`:8792`）：节点概览、实例操作、浏览器终端、rfw 防火墙规则、Token 轮换。
 - **自愈**：被其他工具清掉的 nftables 规则、被删除的实例网卡会自动恢复。
-- **自更新**：从官方 GitHub Release 下载，只安装校验和正确且能运行的版本。
+- **自更新**：从 fork 的 Rust v2 GitHub Release 下载，只安装校验和正确且能运行的版本。
 
 ## 安装
 
 要求：Debian 12+ / Ubuntu 22.04+（推荐 Debian 13），内核 ≥ 5.19，systemd 与 cgroup v2，KVM 虚拟机或物理机（不能在 LXC / OpenVZ 容器里运行）。
 
 ```bash
-curl -fsSL https://github.com/narwhal-cloud/runman-agent-rs/releases/download/continuous/install.sh -o install.sh
+curl -fsSL https://github.com/podcctv/runman-agent/releases/download/continuous-rs/install.sh -o install.sh
 bash install.sh                                  # 独立模式
 bash install.sh --token '<平台下发的 Token>'      # 接入平台
 ```
@@ -58,13 +58,15 @@ bash install.sh --token '<平台下发的 Token>'      # 接入平台
 
 ## 发布与自更新
 
-推送到 `main` 会发布 `continuous` 预发布版本，推送 `v*` tag 会发布正式版本（`.github/workflows/release.yml`）。每次发布包含：
+Rust v2 在 `rust-v2` 分支并行维护，推送后发布 `continuous-rs`；`rust-v*` tag 发布正式 Rust 版本。Go 版继续使用 `main` 与 `continuous`，两个更新通道互不覆盖。默认安装与自更新地址均指向 Rust v2 的 `continuous-rs`。每次发布包含：
 
 - `runman-agent-linux-amd64`、`runman-agent-linux-arm64`（静态 musl 二进制）
 - `install.sh`
 - `SHA256SUMS`
 
-节点直接从官方 GitHub 仓库的 Release 下载，只安装与 `SHA256SUMS` 校验和匹配、能正常运行的版本，发现新版后随机延迟 0–6 小时再应用，以免整批节点同时重启（面板里可立即更新）。本地编译的版本不会自动更新。
+节点从 fork 的 GitHub Release 下载，只安装与 `SHA256SUMS` 校验和匹配、能正常运行的版本，发现新版后随机延迟 0–6 小时再应用，以免整批节点同时重启（面板里可立即更新）。本地编译的版本不会自动更新。
+
+Rust v2 不读取 Go 版配置、数据库或 Podman/Incus 实例。生产迁移前请按 [Go 到 Rust v2 迁移计划](MIGRATION_GO_TO_RUST_V2.md) 使用独立 canary 身份、验证备份与恢复，并保留 Go 节点回滚能力。
 
 
 ## 实例镜像
