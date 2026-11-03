@@ -12,7 +12,9 @@ The migration supports the standard Go Podman and Incus container backends.
 Preflight reads the Go JSON config, takes an SQLite online backup, verifies the
 live backend objects, and validates every item before stopping the Go agent.
 After confirmation it stops Go, takes a final config/database/live-state
-snapshot, then stops the old guests.
+snapshot, then gracefully stops the old guests. Incus gets up to 120 seconds
+per guest to shut down cleanly; the installer never force-stops a guest after a
+timeout.
 
 A host with no Go instances can use the same migration. The helper permits an
 empty manifest only when both Go instance tables and the complete Podman/Incus

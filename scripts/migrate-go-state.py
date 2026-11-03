@@ -18,6 +18,7 @@ from pathlib import Path
 DEFAULT_CONFIG = Path("/opt/narwhal-agent/config.json")
 DEFAULT_DB = Path("/opt/narwhal-agent/agent.db")
 MAX_DB_BYTES = 2 * 1024 * 1024 * 1024
+INCUS_STOP_TIMEOUT = 120
 DEFAULT_SNAT6_PREFIX = "fd91:cafe:cafe:10::/64"
 
 
@@ -25,9 +26,9 @@ def fail(message):
     raise SystemExit(message)
 
 
-def checked_run(args, *, capture=True):
+def checked_run(args, *, capture=True, timeout=45):
     try:
-        result = subprocess.run(args, check=False, text=True, capture_output=capture, timeout=45)
+        result = subprocess.run(args, check=False, text=True, capture_output=capture, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
         fail(f"cannot run {args[0]}: {exc}")
     if result.returncode != 0:
@@ -426,6 +427,7 @@ def lifecycle(args):
     if backend not in {"podman", "incus"}:
         fail("invalid legacy backend")
     if args.action == "stop":
+        failed_name = ""
         try:
             for row in rows:
                 if row.get("was_running") is not True:
@@ -433,8 +435,31 @@ def lifecycle(args):
                 name = str(row.get("name") or "")
                 if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
                     fail(f"unsupported legacy container name {name!r}")
-                command = ["podman", "stop", "--time", "20", name] if backend == "podman" else ["incus", "stop", name, "--timeout", "30"]
-                checked_run(command)
+                failed_name = name
+                # A previous stop may have completed even if its client timed
+                # out. Make this phase idempotent before retrying a stop.
+                if not live_state(backend, name):
+                    continue
+                if backend == "podman":
+                    checked_run(["podman", "stop", "--time", "20", name])
+                else:
+                    # Give guests more time for a clean shutdown. Keep the
+                    # client timeout longer than Incus's own shutdown timeout.
+                    try:
+                        checked_run(
+                            ["incus", "stop", name, "--timeout", str(INCUS_STOP_TIMEOUT)],
+                            timeout=INCUS_STOP_TIMEOUT + 30,
+                        )
+                    except SystemExit as stop_error:
+                        # Incus can report a timed-out stop after the guest
+                        # actually reached Stopped. Continue only when that
+                        # state is independently confirmed.
+                        try:
+                            stopped = not live_state(backend, name)
+                        except SystemExit as state_error:
+                            fail(f"{name}: stop failed ({stop_error}); state check failed ({state_error})")
+                        if not stopped:
+                            raise stop_error
         except SystemExit as exc:
             restore_errors = []
             for row in rows:
@@ -452,7 +477,18 @@ def lifecycle(args):
                 except SystemExit as restore_exc:
                     restore_errors.append(f"{name}: {restore_exc}")
             if restore_errors:
-                fail(f"{exc}; stop rollback was incomplete: " + "; ".join(restore_errors))
+                message = f"{exc}; stop rollback was incomplete: " + "; ".join(restore_errors)
+                if backend == "incus" and failed_name:
+                    message += (
+                        f"; inspect with `incus info --show-log {failed_name}` "
+                        "and do not force-stop or delete the instance"
+                    )
+                fail(message)
+            if backend == "incus" and failed_name:
+                fail(
+                    f"{failed_name}: {exc}; inspect with `incus info --show-log {failed_name}` "
+                    "and do not force-stop or delete the instance"
+                )
             raise
         return
     if args.action == "start":
