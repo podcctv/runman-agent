@@ -98,6 +98,20 @@ bash <(curl -fsSL https://raw.githubusercontent.com/podcctv/runman-agent/main/in
 需要固定版本时可设置 `AGENT_RELEASE_TAG=vX.Y.Z`，私有镜像或自建下载源可设置
 `RUNMAN_AGENT_DOWNLOAD_BASE=https://...`。
 
+### Rust v2
+
+Rust v2 源码已并入本仓库，并通过独立的 `continuous-rs` 通道发布，不覆盖 Go 版的
+`continuous`。上面的命令仍是 Go 安装器，菜单 **15** 可启动有损的 Go→Rust 迁移。
+Rust v2 安装说明和迁移边界见
+[`README-RUST-V2.md`](README-RUST-V2.md) 和
+[`MIGRATION_GO_TO_RUST_V2.md`](MIGRATION_GO_TO_RUST_V2.md)。
+
+To install Rust v2 directly on a new host, use:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/podcctv/runman-agent/main/install-rust-v2.sh)
+```
+
 ### 新手安装前需要准备什么
 
 安装脚本不会要求填写服务器 root 密码（你已经通过 SSH 登录）；需要准备或现场选择的内容如下。

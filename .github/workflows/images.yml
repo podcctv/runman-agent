@@ -1,0 +1,66 @@
+# Builds the official instance images from Debian/Alpine package sources and
+# publishes them, with an images.json manifest, as the rolling "images" release that
+# agents sync from (image_base_url).
+name: Images
+
+on:
+  schedule:
+    - cron: "0 3 * * 1" # weekly, for security updates
+  push:
+    branches: [main]
+    paths: ["images/**", ".github/workflows/images.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: images
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { distro: debian, arch: amd64, runner: ubuntu-24.04 }
+          - { distro: debian, arch: arm64, runner: ubuntu-24.04-arm }
+          - { distro: alpine, arch: amd64, runner: ubuntu-24.04 }
+          - { distro: alpine, arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mmdebstrap debian-archive-keyring zstd
+      - name: Build
+        run: sudo bash images/build.sh ${{ matrix.distro }} ${{ matrix.arch }} dist "$(date -u +%Y%m%d).${{ github.run_number }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-${{ matrix.distro }}-${{ matrix.arch }}
+          path: dist/*
+          retention-days: 3
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Manifest
+        run: |
+          cd dist
+          jq -s '{version: 1, images: .}' rootfs-*.json > images.json
+          jq -c '.images[] | {id, arch, serial, size}' images.json
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          gh release delete images --yes --cleanup-tag 2>/dev/null || true
+          gh release create images images.json rootfs-*.tar.zst \
+            --title "Instance images" --latest=false --target "${{ github.sha }}" \
+            --notes "Instance root filesystems built by images/build.sh; agents sync them via images.json."

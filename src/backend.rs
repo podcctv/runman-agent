@@ -1,0 +1,228 @@
+//! Service interfaces the protocol layer drives.
+//!
+//! Each trait is implemented once by the real container runtime and once by
+//! [`crate::fake`] for tests. Implementations must be idempotent where the
+//! platform may replay a command (create/delete/port-forward add/remove).
+
+use std::sync::Arc;
+
+use anyhow::Result;
+use async_trait::async_trait;
+use tokio::sync::mpsc;
+
+use crate::model::{
+    BuildInfo, BuildRequest, ConsoleSize, HostSnapshot, ImageInfo, ImageSettings, InstanceDetails,
+    InstanceSpec, L4Proto, PortForward, VmId,
+};
+use crate::proto;
+
+#[async_trait]
+pub trait Instances: Send + Sync {
+    async fn create(&self, spec: &InstanceSpec) -> Result<()>;
+    /// Replace the root filesystem; must also work when the instance is unknown
+    /// locally (state lost), in which case it behaves like `create`.
+    async fn reinstall(&self, spec: &InstanceSpec) -> Result<()>;
+    async fn start(&self, id: &VmId) -> Result<()>;
+    async fn stop(&self, id: &VmId, force: bool) -> Result<()>;
+    async fn restart(&self, id: &VmId) -> Result<()>;
+    /// Deleting an unknown instance succeeds.
+    async fn delete(&self, id: &VmId) -> Result<()>;
+    async fn reset_password(&self, id: &VmId, password: &str) -> Result<()>;
+    /// Runtime summaries (status, usage, IPs, traffic counters) for heartbeats.
+    async fn list(&self) -> Result<Vec<proto::VmSummary>>;
+    async fn images(&self) -> Result<Vec<proto::OsImageInfo>>;
+    async fn open_console(&self, id: &VmId, size: Option<ConsoleSize>) -> Result<ConsoleIo>;
+
+    /// Richer view for the management panel.
+    async fn details(&self) -> Result<Vec<InstanceDetails>> {
+        Ok(self
+            .list()
+            .await?
+            .iter()
+            .map(InstanceDetails::from_summary)
+            .collect())
+    }
+
+    /// Tail of the instance's console output.
+    async fn console_log(&self, _id: &VmId, _max_bytes: usize) -> Result<String> {
+        anyhow::bail!("console log not available")
+    }
+}
+
+/// An attached interactive TTY.
+///
+/// The session ends when `output` yields `None` (the TTY exited) or when the
+/// caller drops `input` (the platform closed the session).
+pub struct ConsoleIo {
+    pub output: mpsc::Receiver<Vec<u8>>,
+    pub input: mpsc::Sender<Vec<u8>>,
+    pub resize: mpsc::Sender<ConsoleSize>,
+}
+
+#[async_trait]
+pub trait PortForwards: Send + Sync {
+    /// Adding an identical existing rule succeeds; a host port owned by
+    /// another rule is an error.
+    async fn add(&self, rule: PortForward) -> Result<()>;
+    async fn remove(&self, id: &VmId, proto: L4Proto, host_port: u16) -> Result<()>;
+    async fn list(&self, id: Option<&VmId>) -> Result<Vec<PortForward>>;
+    async fn remove_all(&self, id: &VmId) -> Result<()>;
+    /// Choose an unused host port for the automatic SSH rule.
+    async fn free_port(&self) -> Result<u16>;
+}
+
+#[async_trait]
+pub trait WgBindings: Send + Sync {
+    /// Converge local bindings to exactly `desired` (full desired-state snapshot).
+    async fn reconcile(&self, desired: Vec<proto::WgBindDesired>) -> Result<()>;
+}
+
+#[async_trait]
+pub trait HostMetrics: Send + Sync {
+    async fn snapshot(&self) -> Result<HostSnapshot>;
+}
+
+/// Image management for the local panel: listing, custom builds, removal.
+#[async_trait]
+pub trait ImageAdmin: Send + Sync {
+    async fn list_images(&self) -> Result<Vec<ImageInfo>>;
+    /// Start a build in the background; returns the build id.
+    fn start_build(&self, req: BuildRequest) -> Result<String>;
+    fn builds(&self) -> Vec<BuildInfo>;
+    fn build_log(&self, build_id: &str) -> Result<String>;
+    /// Stop offering a custom image (files go once no instance uses them).
+    async fn delete_image(&self, id: &str) -> Result<()>;
+    /// Set the display order and which images are offered; the platform
+    /// receives the enabled ones, in this order, with the next heartbeat.
+    async fn set_image_settings(&self, settings: ImageSettings) -> Result<()>;
+}
+
+/// Bundle of services handed to the protocol layer.
+#[derive(Clone)]
+pub struct Services {
+    pub instances: Arc<dyn Instances>,
+    pub port_forwards: Arc<dyn PortForwards>,
+    pub wg: Arc<dyn WgBindings>,
+    pub host: Arc<dyn HostMetrics>,
+    /// None for backends without image management (the in-memory fake).
+    pub images: Option<Arc<dyn ImageAdmin>>,
+    /// Resource history; None for backends that keep none (the fake).
+    pub monitor: Option<Arc<dyn Monitor>>,
+}
+
+/// Recorded resource usage of instances, for the panel.
+#[async_trait]
+pub trait Monitor: Send + Sync {
+    /// Every instance's averages over the last `window` seconds.
+    async fn usage(&self, window: u64) -> Result<Vec<crate::history::Usage>>;
+    /// Chart points of one instance over the last `range` seconds.
+    async fn series(&self, vm: &str, range: u64) -> Result<Vec<crate::history::Point>>;
+}
+
+/// Port forwards capped per instance at the configured `max_forwards`
+/// (TCP and UDP together). Wraps the backend, so platform commands, the
+/// panel and the automatic SSH rule all go through it.
+pub struct LimitedForwards {
+    inner: Arc<dyn PortForwards>,
+    cfg: Arc<crate::config::Store>,
+    /// Serializes adds, so concurrent ones cannot both take the last slot.
+    adding: tokio::sync::Mutex<()>,
+}
+
+/// Refuse `rule` when `vm` already has `max` rules (0 = no limit). A rule
+/// identical to an existing one is a replay, not a new rule.
+pub fn check_forward_limit(existing: &[PortForward], rule: &PortForward, max: u32) -> Result<()> {
+    if max == 0 || existing.iter().any(|f| f == rule) {
+        return Ok(());
+    }
+    let count = existing.iter().filter(|f| f.vm_id == rule.vm_id).count();
+    if count >= max as usize {
+        anyhow::bail!(
+            "instance {} already has {count} port forwards (limit {max})",
+            rule.vm_id
+        );
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl PortForwards for LimitedForwards {
+    async fn add(&self, rule: PortForward) -> Result<()> {
+        let _adding = self.adding.lock().await;
+        let existing = self.inner.list(Some(&rule.vm_id)).await?;
+        check_forward_limit(&existing, &rule, self.cfg.get().max_forwards)?;
+        self.inner.add(rule).await
+    }
+
+    async fn remove(&self, id: &VmId, proto: L4Proto, host_port: u16) -> Result<()> {
+        self.inner.remove(id, proto, host_port).await
+    }
+
+    async fn list(&self, id: Option<&VmId>) -> Result<Vec<PortForward>> {
+        self.inner.list(id).await
+    }
+
+    async fn remove_all(&self, id: &VmId) -> Result<()> {
+        self.inner.remove_all(id).await
+    }
+
+    async fn free_port(&self) -> Result<u16> {
+        self.inner.free_port().await
+    }
+}
+
+impl Services {
+    /// Enforce `max_forwards` from `cfg` on every port forward added.
+    pub fn with_forward_limit(mut self, cfg: Arc<crate::config::Store>) -> Self {
+        self.port_forwards = Arc::new(LimitedForwards {
+            inner: self.port_forwards,
+            cfg,
+            adding: tokio::sync::Mutex::new(()),
+        });
+        self
+    }
+}
+
+/// Every instance gets a random host port forwarded to SSH (22/tcp), as the
+/// Go agent did. Failure is logged, not fatal: the instance itself exists.
+/// Returns the host port of the SSH forward, if there is one.
+pub async fn ensure_ssh_forward(pf: &dyn PortForwards, id: &VmId) -> Option<u16> {
+    match pf.list(Some(id)).await {
+        Ok(rules) => {
+            if let Some(r) = rules
+                .iter()
+                .find(|r| r.proto == L4Proto::Tcp && r.guest_port == 22)
+            {
+                return Some(r.host_port);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("ssh forward for {id}: list rules: {e:#}");
+            return None;
+        }
+    }
+    for _ in 0..5 {
+        let host_port = match pf.free_port().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("ssh forward for {id}: {e:#}");
+                return None;
+            }
+        };
+        let rule = PortForward {
+            vm_id: id.clone(),
+            proto: L4Proto::Tcp,
+            host_port,
+            guest_port: 22,
+            description: "ssh".into(),
+        };
+        match pf.add(rule).await {
+            Ok(()) => {
+                tracing::info!("ssh forward for {id}: {host_port} -> 22");
+                return Some(host_port);
+            }
+            Err(e) => tracing::warn!("ssh forward for {id} on {host_port}: {e:#}"),
+        }
+    }
+    None
+}

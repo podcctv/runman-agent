@@ -1,0 +1,932 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Runman 节点面板</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #6b7385; --line: #e3e6ec;
+  --accent: #2f6fde; --ok: #1f9d55; --warn: #c27c0e; --bad: #d03a3a; --code: #f0f2f5;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #14171c; --panel: #1c2027; --text: #e6e9ef; --muted: #9aa3b5; --line: #2c323c;
+          --accent: #5b8ff0; --ok: #39b56b; --warn: #e0a03a; --bad: #ec6060; --code: #252a33; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+       background: var(--bg); color: var(--text); }
+header { display: flex; align-items: center; gap: 16px; padding: 0 20px; height: 52px; background: var(--panel);
+         border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+header h1 { font-size: 16px; margin: 0; white-space: nowrap; }
+nav { display: flex; gap: 4px; overflow-x: auto; }
+nav button { background: none; border: 0; color: var(--muted); padding: 8px 12px; border-radius: 6px; cursor: pointer; font: inherit; }
+nav button.active { color: var(--accent); background: var(--code); }
+header .spacer { flex: 1; }
+main { max-width: 1200px; margin: 0 auto; padding: 20px 16px 60px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+.card h3 { margin: 0 0 6px; font-size: 13px; color: var(--muted); font-weight: 500; }
+.card .big { font-size: 20px; font-weight: 600; }
+.section { margin-top: 20px; }
+.section h2 { font-size: 15px; margin: 0 0 10px; }
+table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 500; color: var(--muted); font-size: 12px; background: var(--code); }
+th.sortable { cursor: pointer; user-select: none; }
+th.sorted { color: var(--text); }
+td.hot { color: var(--bad); font-weight: 600; }
+td.warm { color: var(--warn); }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.chart h4 { margin: 0 0 4px; font-size: 13px; font-weight: 500; }
+.chart canvas { width: 100%; height: 150px; display: block; }
+.legend { font-size: 12px; color: var(--muted); }
+.legend i { display: inline-block; width: 10px; height: 3px; margin: 0 4px 2px 8px; vertical-align: middle; }
+.legend button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+.legend button.off { opacity: .4; text-decoration: line-through; }
+.chart { position: relative; }
+.chart canvas { touch-action: pan-y; cursor: crosshair; }
+.chart-tip { position: absolute; z-index: 2; pointer-events: none; white-space: nowrap; font-size: 12px; padding: 4px 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.chart-tip[hidden] { display: none; }
+.chart-tip i { display: inline-block; width: 10px; height: 3px; margin-right: 4px; vertical-align: middle; }
+tr:last-child td { border-bottom: 0; }
+.table-wrap { overflow-x: auto; }
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.muted { color: var(--muted); }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; background: var(--code); }
+.badge.running, .badge.ok { color: var(--ok); }
+.badge.stopped { color: var(--muted); }
+.badge.error, .badge.bad { color: var(--bad); }
+.badge.warn { color: var(--warn); }
+button.btn, .btn { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+  padding: 4px 10px; border-radius: 6px; cursor: pointer; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.danger { color: var(--bad); }
+.btn:disabled { opacity: .4; cursor: default; }
+.btn:disabled { opacity: .5; cursor: default; }
+.actions { display: flex; flex-wrap: wrap; gap: 4px; }
+input, select { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); }
+form.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+form.row label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+#login { max-width: 340px; margin: 12vh auto; }
+#login input { width: 100%; margin-bottom: 10px; }
+.hidden { display: none !important; }
+.toast { position: fixed; right: 16px; bottom: 16px; background: var(--text); color: var(--bg); padding: 10px 14px; border-radius: 8px; max-width: 420px; z-index: 50; }
+dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--text); padding: 0; width: min(960px, 96vw); }
+dialog::backdrop { background: rgba(0,0,0,.45); }
+dialog .head { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+dialog .body { padding: 14px; }
+#term { height: 60vh; background: #000; }
+pre.log { max-height: 65vh; overflow: auto; background: var(--code); padding: 10px; margin: 0; white-space: pre-wrap; word-break: break-all; }
+.kv { display: grid; grid-template-columns: 120px 1fr; gap: 6px 12px; }
+@media (max-width: 640px) { header h1 { display: none; } .kv { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div id="login" class="card hidden">
+  <h2 style="margin-top:0">Runman 节点面板</h2>
+  <form id="login-form">
+    <input name="username" placeholder="用户名" autocomplete="username" required>
+    <input name="password" type="password" placeholder="密码" autocomplete="current-password" required>
+    <button class="btn primary" style="width:100%">登录</button>
+  </form>
+  <p id="login-error" class="muted"></p>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <h1>Runman 节点</h1>
+    <nav>
+      <button data-tab="overview" class="active">概览</button>
+      <button data-tab="instances">实例</button>
+      <button data-tab="wg">独立 IP</button>
+      <button data-tab="monitor">监控</button>
+      <button data-tab="images">镜像</button>
+      <button data-tab="firewall">防火墙</button>
+      <button data-tab="settings">设置</button>
+    </nav>
+    <div class="spacer"></div>
+    <button class="btn" id="logout">退出</button>
+  </header>
+  <main>
+    <section id="tab-overview"></section>
+    <section id="tab-instances" class="hidden"></section>
+    <section id="tab-wg" class="hidden"></section>
+    <section id="tab-monitor" class="hidden"></section>
+    <section id="tab-images" class="hidden"></section>
+    <section id="tab-firewall" class="hidden"></section>
+    <section id="tab-settings" class="hidden"></section>
+  </main>
+</div>
+
+<dialog id="dlg">
+  <div class="head"><strong id="dlg-title"></strong><button class="btn" id="dlg-close">关闭</button></div>
+  <div class="body" id="dlg-body"></div>
+</dialog>
+
+<script>
+'use strict';
+const $ = (s, el = document) => el.querySelector(s);
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const bytes = n => { n = Number(n) || 0; const u = ['B','KB','MB','GB','TB']; let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return n.toFixed(i ? 1 : 0) + ' ' + u[i]; };
+const rate = n => bytes(n) + '/s';
+let current = 'overview', timer = null;
+// Refreshed with every overview call: mode decides what the panel may change.
+const node = { mode: 'standalone', images: [], entry: '' };
+async function refreshNode() {
+  const o = await api('/api/overview');
+  node.mode = o.mode; node.images = o.images; node.entry = o.entry.host || o.entry.ipv4 || location.hostname;
+  node.traffic = o.traffic;
+  return o;
+}
+
+// ── bandwidth ──
+function bandwidthCard(b) {
+  const t = b.speedtest, m = t.measured;
+  const measured = m
+    ? `下行 ${m.down_mbps} Mbps · 上行 ${m.up_mbps} Mbps <span class="muted">（${new Date(m.at * 1000).toLocaleString()}）</span>`
+    : '<span class="muted">尚未测速</span>';
+  return `
+    <div class="kv">
+      <span class="muted">测速结果</span><span>${measured}</span>
+      <span class="muted">上报平台</span><span><strong>${b.reported ? b.reported + ' Mbps' : '未知'}</strong>
+        <span class="muted">${b.configured ? '（已手动修正）' : m ? '（取上下行中较小的一个）' : ''}</span></span>
+    </div>
+    ${t.last_error ? `<p class="muted">上次测速失败：${esc(t.last_error)}</p>` : ''}
+    <form class="row section" id="bandwidth-form">
+      <label>修正为（Mbps，0 = 使用测速结果）<input name="bandwidth_mbps" type="number" min="0" ${b.max ? `max="${b.max}"` : ''} value="${esc(b.configured)}" style="width:140px"></label>
+      <button class="btn primary">保存</button>
+      <button class="btn" type="button" id="speedtest-run"${t.running ? ' disabled' : ''}>${t.running ? '测速中…' : '重新测速'}</button>
+    </form>
+    <p class="muted">平台用这个带宽限制此节点上可售套餐的带宽上限。节点首次启动时自动向 Cloudflare 测速一次，之后只在点「重新测速」时再测（8 路并发，每个方向两轮取较好的一轮，最多约 800 MB 流量），取上下行中较小的值。
+      测速受线路和距离影响可能偏低，可以手动修正：可以填任意更低的值，最高为测速结果的 2 倍${b.max ? `（当前最高 ${b.max} Mbps）` : ''}。</p>`;
+}
+
+// ── traffic schedule ──
+const TIMEZONES = [
+  ['-08:00', '美西'], ['-05:00', '美东'], ['+00:00', 'UTC / 伦敦'], ['+01:00', '欧洲中部'],
+  ['+03:00', '莫斯科'], ['+05:30', '印度'], ['+07:00', '曼谷 / 雅加达'],
+  ['+08:00', '北京 / 香港 / 新加坡'], ['+09:00', '东京 / 首尔'], ['+10:00', '悉尼'],
+];
+const offsetMin = tz => { const m = /^([+-])(\d\d):(\d\d)$/.exec(tz) || []; return (m[1] === '-' ? -1 : 1) * ((+m[2] || 0) * 60 + (+m[3] || 0)); };
+// Wall-clock time of a unix timestamp at a UTC offset.
+function atOffset(unix, tz) {
+  const d = new Date((unix + offsetMin(tz) * 60) * 1000), p = n => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+}
+const nextResetText = t => t ? `${atOffset(t.next_reset, t.timezone)}（UTC${t.timezone}）` : '-';
+const standalone = () => node.mode === 'standalone';
+const sshHint = port => port ? `ssh -p ${port} root@${node.entry}` : '（未分配 SSH 端口）';
+
+function toast(msg) {
+  const t = document.createElement('div'); t.className = 'toast'; t.textContent = msg;
+  document.body.appendChild(t); setTimeout(() => t.remove(), 4000);
+}
+
+async function api(path, opts = {}) {
+  const init = { method: opts.method || 'GET', headers: {}, credentials: 'same-origin' };
+  if (init.method !== 'GET') init.headers['X-Runman'] = '1';
+  if (opts.body !== undefined) { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(opts.body); }
+  const r = await fetch(path, init);
+  if (r.status === 401 && path !== '/api/login') { showLogin(); throw new Error('请先登录'); }
+  const text = await r.text();
+  let data; try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!r.ok) { const e = new Error((data && data.error) || text || r.statusText); e.status = r.status; throw e; }
+  return data;
+}
+
+function showLogin() { clearInterval(timer); $('#app').classList.add('hidden'); $('#login').classList.remove('hidden'); }
+function showApp() { $('#login').classList.add('hidden'); $('#app').classList.remove('hidden'); switchTab(current); }
+
+$('#login-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  try {
+    await api('/api/login', { method: 'POST', body: { username: f.get('username'), password: f.get('password') } });
+    $('#login-error').textContent = ''; showApp();
+  } catch (err) { $('#login-error').textContent = err.message; }
+});
+$('#logout').addEventListener('click', async () => { await api('/api/logout', { method: 'POST' }).catch(() => {}); showLogin(); });
+
+document.querySelectorAll('nav button').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
+function switchTab(tab) {
+  current = tab;
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('main > section').forEach(s => s.classList.toggle('hidden', s.id !== 'tab-' + tab));
+  clearInterval(timer);
+  const load = { overview: loadOverview, instances: loadInstances, wg: loadWg, monitor: loadMonitor, images: loadImages, firewall: loadFirewall, settings: loadSettings }[tab];
+  load();
+  if (tab === 'overview' || tab === 'instances' || tab === 'images') timer = setInterval(load, 10000);
+  if (tab === 'monitor') timer = setInterval(load, 60000);
+}
+
+// ── overview ──
+async function loadOverview() {
+  const el = $('#tab-overview');
+  try {
+    const [o, rfw] = await Promise.all([refreshNode(), api('/api/rfw/status').catch(() => null)]);
+    const h = o.host || {}, p = o.platform;
+    const plat = o.mode === 'standalone'
+      ? '<span class="badge">独立模式</span><div class="muted">未设置平台 Token，节点完全由本面板管理</div>'
+      : p.connected ? '<span class="badge ok">已连接平台</span>'
+      : `<span class="badge bad">未连接</span><div class="muted">${esc(p.last_error)}</div>`;
+    const fw = !rfw ? '<span class="badge warn">未知</span>'
+      : rfw.service === 'active' ? `<span class="badge ok">运行中</span><div class="muted">${esc(rfw.api ? rfw.api.iface + ' · ' + rfw.api.rule_count + ' 条规则' : 'API 无响应')}</div>`
+      : `<span class="badge warn">${esc(rfw.service || '未安装')}</span>`;
+    el.innerHTML = `
+      <div class="grid">
+        <div class="card"><h3>管理模式</h3>${plat}${o.mode === 'standalone' ? '' : `<div class="muted mono">${esc(p.url)}</div>`}</div>
+        <div class="card"><h3>入口地址</h3><div class="mono">${esc(o.entry.host || o.entry.ipv4 || '-')}</div><div class="muted mono">${esc(o.entry.ipv6 || '')}</div></div>
+        <div class="card"><h3>CPU</h3><div class="big">${(h.cpu_pct ?? 0).toFixed(1)}%</div><div class="muted">${h.cpus ?? '-'} 核 · 负载 ${(h.load || []).map(x => x.toFixed(2)).join(' ')}</div></div>
+        <div class="card"><h3>内存</h3><div class="big">${h.ram_used_mb ?? '-'} / ${h.ram_total_mb ?? '-'} MB</div></div>
+        <div class="card"><h3>磁盘</h3><div class="big">${h.disk_used_gb ?? '-'} / ${h.disk_total_gb ?? '-'} GB</div></div>
+        <div class="card"><h3>网络</h3><div>↓ ${rate(h.net_in_bps)}　↑ ${rate(h.net_out_bps)}</div></div>
+        <div class="card"><h3>防火墙 rfw</h3>${fw}</div>
+        <div class="card"><h3>版本</h3><div class="mono">${esc(o.version)}</div>${updateInfo(o.update)}</div>
+      </div>
+      <div class="section"><h2>可用镜像</h2>
+        <div>${o.images.length ? o.images.map(i => `<span class="badge">${esc(i.id)} · ${esc(i.name)}</span>`).join(' ') : '<span class="muted">镜像下载中…</span>'}</div>
+      </div>`;
+  } catch (e) { el.textContent = e.message; }
+}
+
+function updateInfo(u) {
+  if (!u) return '';
+  if (!u.release_build) return '<div class="muted">本地构建版本，不会自动更新</div>';
+  const when = u.last_check ? new Date(u.last_check * 1000).toLocaleString() : '尚未检查';
+  return `<div class="muted">${u.auto_update ? '自动更新已开启' : '自动更新已关闭'} · 上次检查 ${esc(when)}</div>`
+    + (u.pending ? '<div><span class="badge warn">有新版本待安装</span></div>' : '')
+    + (u.last_error ? `<div class="muted">${esc(u.last_error)}</div>` : '')
+    + '<button class="btn" id="update-now" style="margin-top:6px">检查并更新</button>';
+}
+$('#tab-settings').addEventListener('change', e => {
+  if (e.target.name === 'traffic_reset_mode') $('#reset-day-field').classList.toggle('hidden', e.target.value === 'creation');
+});
+$('#tab-settings').addEventListener('click', async e => {
+  if (e.target.id !== 'speedtest-run') return;
+  e.target.disabled = true; e.target.textContent = '测速中，最长约 1 分钟…';
+  try { const b = await api('/api/speedtest', { method: 'POST' }); toast(`测速完成：上报 ${b.reported} Mbps`); }
+  catch (err) { toast('测速失败：' + err.message); }
+  loadSettings();
+});
+$('#tab-overview').addEventListener('click', async e => {
+  if (e.target.id !== 'update-now') return;
+  e.target.disabled = true;
+  try {
+    const r = await api('/api/update', { method: 'POST' });
+    toast(r.updated ? '已安装新版本，Agent 正在重启…' : '已是最新版本');
+  } catch (err) { toast('更新失败：' + err.message); }
+  setTimeout(loadOverview, 3000);
+});
+
+// ── instances ──
+function createForm() {
+  if (!node.images.length) return '<p class="muted">镜像下载中，稍后即可新建实例。</p>';
+  return `<div class="card"><h2>新建实例</h2>
+    <form class="row" id="create-form">
+      <label>系统<select name="os_image">${node.images.map(i => `<option value="${esc(i.id)}">${esc(i.name)}</option>`).join('')}</select></label>
+      <label>CPU（核）<input name="cpu" type="number" min="1" value="1" style="width:80px"></label>
+      <label>内存（MB）<input name="ram_mb" type="number" min="128" step="128" value="512" style="width:100px"></label>
+      <label>磁盘（GB）<input name="disk_gb" type="number" min="1" value="10" style="width:90px"></label>
+      <label>带宽（Mbps，0 不限）<input name="bandwidth_mbps" type="number" min="0" value="0" style="width:110px"></label>
+      <label>root 密码（留空生成）<input name="root_password" autocomplete="off" style="width:160px"></label>
+      <button class="btn primary">创建</button>
+    </form></div>`;
+}
+
+function forwardsCell(i) {
+  const rows = (i.forwards || []).map(f => `<div>${esc(f.host_port)}/${esc(f.proto)} → ${esc(f.guest_port)}${
+    standalone() ? ` <button class="btn danger" data-act="fwd-del" data-proto="${esc(f.proto)}" data-port="${esc(f.host_port)}" title="删除">×</button>` : ''}</div>`);
+  if (standalone()) rows.push('<button class="btn" data-act="fwd-add">+ 转发</button>');
+  return rows.join('') || '<span class="muted">-</span>';
+}
+
+async function loadInstances() {
+  const el = $('#tab-instances');
+  try {
+    await refreshNode();
+    const list = await api('/api/instances');
+    const head = standalone() ? createForm()
+      : '<p class="muted">此节点由平台管理：新建、删除、重装和端口转发请在平台上操作。</p>';
+    if (!list.length) { el.innerHTML = head + '<p class="muted section">此节点上还没有实例。</p>'; return; }
+    el.innerHTML = head + `<div class="table-wrap section"><table>
+      <tr><th>实例</th><th>状态</th><th>规格</th><th>地址</th><th>端口转发</th>${node.traffic && node.traffic.mode === 'fixed'
+        ? `<th title="下次重置：${esc(nextResetText(node.traffic))}">本月流量<div class="muted" style="font-weight:normal">${esc(atOffset(node.traffic.next_reset, node.traffic.timezone).slice(5, 10))} 重置</div></th>`
+        : '<th title="每个实例在自己的创建日重置">本月流量</th>'}<th>操作</th></tr>
+      ${list.map(i => `<tr data-id="${esc(i.id)}">
+        <td><div>${esc(i.hostname || '-')}</div><div class="muted mono">${esc(i.id)}</div><div class="muted">${esc(i.os_image)}</div></td>
+        <td><span class="badge ${esc(i.status)}">${esc({running:'运行中',stopped:'已停止',creating:'创建中',error:'异常'}[i.status] || i.status)}</span>
+            ${i.status === 'running' ? `<div class="muted">CPU ${i.cpu_pct.toFixed(1)}% · ${i.ram_used_mb} MB</div>` : ''}</td>
+        <td>${i.cpu} 核 / ${i.ram_mb} MB<br>${i.disk_gb} GB · ${i.bandwidth_mbps ? i.bandwidth_mbps + ' Mbps' : '不限速'}</td>
+        <td class="mono">${i.ips.map(esc).join('<br>')}${i.dedicated.length ? '<br><span class="badge ok">独立 IP</span><br>' + i.dedicated.map(esc).join('<br>') : ''}</td>
+        <td class="mono">${forwardsCell(i)}</td>
+        <td>↓ ${bytes(i.month_in)}<br>↑ ${bytes(i.month_out)}${node.traffic && node.traffic.mode === 'creation' && i.traffic_next_reset
+          ? `<div class="muted" title="${esc(atOffset(i.traffic_next_reset, node.traffic.timezone))}（UTC${esc(node.traffic.timezone)}）">${esc(atOffset(i.traffic_next_reset, node.traffic.timezone).slice(5, 10))} 重置</div>` : ''}</td>
+        <td><div class="actions">
+          ${i.status === 'running'
+            ? `<button class="btn" data-act="console">终端</button><button class="btn" data-act="restart">重启</button><button class="btn" data-act="stop">关机</button><button class="btn danger" data-act="force_stop">强制关机</button>`
+            : `<button class="btn primary" data-act="start">开机</button>`}
+          <button class="btn" data-act="password">改密码</button><button class="btn" data-act="log">日志</button><button class="btn" data-act="chart">图表</button>
+          ${standalone() ? '<button class="btn" data-act="reinstall">重装</button><button class="btn danger" data-act="delete">删除</button>' : ''}
+        </div></td></tr>`).join('')}
+    </table></div>`;
+  } catch (e) { el.textContent = e.message; }
+}
+
+function credentials(title, r) {
+  dialog(title, `<div class="kv">
+    ${r.id ? `<span class="muted">实例 ID</span><code>${esc(r.id)}</code>` : ''}
+    <span class="muted">root 密码</span><code>${esc(r.root_password)}</code>
+    <span class="muted">SSH</span><code>${esc(sshHint(r.ssh_port))}</code></div>
+    <p class="muted">密码只显示这一次，请妥善保存。</p>`);
+}
+
+$('#tab-instances').addEventListener('submit', async e => {
+  if (e.target.id !== 'create-form') return;
+  e.preventDefault();
+  const f = new FormData(e.target), btn = e.target.querySelector('button');
+  const body = { os_image: f.get('os_image'), cpu: +f.get('cpu'), ram_mb: +f.get('ram_mb'), disk_gb: +f.get('disk_gb'),
+    bandwidth_mbps: +f.get('bandwidth_mbps'), root_password: f.get('root_password') || '' };
+  btn.disabled = true;
+  try { credentials('实例已创建', await api('/api/instances', { method: 'POST', body })); e.target.reset(); }
+  catch (err) { toast('创建失败：' + err.message); }
+  btn.disabled = false;
+  loadInstances();
+});
+
+$('#tab-instances').addEventListener('click', async e => {
+  const b = e.target.closest('button[data-act]'); if (!b) return;
+  const id = b.closest('tr').dataset.id, act = b.dataset.act;
+  if (act === 'console') return openConsole(id);
+  if (act === 'log') return openLog(id);
+  if (act === 'chart') return showCharts(id);
+  try {
+    if (act === 'password') {
+      const pw = prompt('新的 root 密码'); if (!pw) return;
+      await api(`/api/instances/${id}/password`, { method: 'POST', body: { password: pw } }); toast('root 密码已更新');
+    } else if (act === 'reinstall') {
+      const os = prompt(`重装为哪个系统？（${node.images.map(i => i.id).join(' / ')}）\n磁盘上的数据将全部清除。`, node.images[0]?.id || '');
+      if (!os) return;
+      b.disabled = true;
+      credentials('重装完成', await api(`/api/instances/${id}/reinstall`, { method: 'POST', body: { os_image: os.trim() } }));
+    } else if (act === 'delete') {
+      if (prompt('删除后数据无法恢复。输入 delete 确认：') !== 'delete') return;
+      b.disabled = true;
+      await api(`/api/instances/${id}`, { method: 'DELETE' }); toast('实例已删除');
+    } else if (act === 'fwd-add') {
+      const guest = prompt('转发到实例的哪个端口？'); if (!guest) return;
+      const proto = (prompt('协议（tcp / udp）', 'tcp') || 'tcp').trim();
+      const host = prompt('宿主机端口（留空自动分配）', '') || '0';
+      const r = await api(`/api/instances/${id}/forwards`, { method: 'POST', body: { proto, host_port: +host, guest_port: +guest } });
+      toast(`已添加：${node.entry}:${r.host_port} → ${guest}/${proto}`);
+    } else if (act === 'fwd-del') {
+      if (!confirm(`删除端口转发 ${b.dataset.port}/${b.dataset.proto}？`)) return;
+      await api(`/api/instances/${id}/forwards/${b.dataset.proto}/${b.dataset.port}`, { method: 'DELETE' }); toast('已删除');
+    } else {
+      const names = { start: '开机', stop: '关机', force_stop: '强制关机', restart: '重启' };
+      if (act !== 'start' && !confirm(`确定要${names[act]}该实例？`)) return;
+      b.disabled = true;
+      await api(`/api/instances/${id}/power`, { method: 'POST', body: { action: act } }); toast(names[act] + '完成');
+    }
+  } catch (err) { toast('失败：' + err.message); }
+  loadInstances();
+});
+
+// ── monitoring ──
+const bits = n => { n = Number(n) || 0; const u = ['bit/s', 'Kbit/s', 'Mbit/s', 'Gbit/s']; let i = 0; while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; } return n.toFixed(i ? 1 : 0) + ' ' + u[i]; };
+const count = n => { n = Number(n) || 0; return n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : n.toFixed(n < 10 ? 1 : 0); };
+// Connections and addresses come in whole numbers, even when averaged.
+const whole = n => { n = Number(n) || 0; return n >= 1e3 ? count(n) : String(Math.round(n)); };
+let monitorWindow = 3600, monitorSort = 'cpu';
+// Sort keys and how a row's value is read.
+const MONITOR_COLS = {
+  cpu: r => r.usage ? r.usage.cpu : -1,
+  mem: r => r.usage ? r.usage.mem / (r.ram_mb * 1048576) : -1,
+  disk: r => r.usage ? r.usage.disk / (r.disk_gb * 1073741824) : -1,
+  io: r => r.usage ? r.usage.rd + r.usage.wr : -1,
+  net: r => r.usage ? r.usage.rx + r.usage.tx : -1,
+  pps: r => r.usage ? r.usage.rxp + r.usage.txp : -1,
+  conns: r => r.usage ? (r.usage.tcp ?? -1) + (r.usage.udp ?? 0) : -1,
+};
+
+async function loadMonitor() {
+  const el = $('#tab-monitor');
+  try {
+    const rows = await api('/api/monitor?window=' + monitorWindow);
+    rows.sort((a, b) => MONITOR_COLS[monitorSort](b) - MONITOR_COLS[monitorSort](a));
+    const th = (key, label) => `<th class="sortable${monitorSort === key ? ' sorted' : ''}" data-sort="${key}">${label}${monitorSort === key ? ' ↓' : ''}</th>`;
+    const cls = (v, warm, hot) => v >= hot ? 'hot' : v >= warm ? 'warm' : '';
+    el.innerHTML = `
+      <div class="row">
+        <label>统计区间<select id="monitor-window">${[[300, '最近 5 分钟'], [3600, '最近 1 小时'], [86400, '最近 24 小时']]
+          .map(([v, n]) => `<option value="${v}"${v === monitorWindow ? ' selected' : ''}>${n}</option>`).join('')}</select></label>
+        <span class="muted">每分钟采样一次，表中是区间内的平均值；连接数是已建立的 TCP 连接加 UDP 流，含实例主动发起的连接，不含实例内部回环；点表头排序，点「图表」看历史（最长 30 天）。持续高 CPU、高包速或上行跑满带宽的实例会标出颜色。</span>
+      </div>
+      <div class="table-wrap section"><table>
+        <tr><th>实例</th>${th('cpu', 'CPU')}${th('mem', '内存')}${th('disk', '磁盘')}${th('io', '磁盘读 / 写')}${th('net', '网络入 / 出')}${th('pps', '包速 入 / 出')}${th('conns', '连接数')}<th></th></tr>
+        ${rows.map(r => {
+          const u = r.usage;
+          if (!u) return `<tr data-id="${esc(r.id)}"><td><div>${esc(r.hostname)}</div><div class="muted mono">${esc(r.id)}</div></td><td colspan="7" class="muted">${r.status === 'running' ? '采样中，约 2 分钟后有数据' : '未运行，区间内没有数据'}</td><td><button class="btn" data-act="chart">图表</button></td></tr>`;
+          const memPct = u.mem / (r.ram_mb * 1048576) * 100, diskPct = u.disk / (r.disk_gb * 1073741824) * 100;
+          const upPct = r.bandwidth_mbps ? u.tx / (r.bandwidth_mbps * 1e6) * 100 : 0;
+          return `<tr data-id="${esc(r.id)}">
+            <td><div>${esc(r.hostname)}</div><div class="muted mono">${esc(r.id)}</div></td>
+            <td class="${cls(u.cpu, 60, 90)}">${u.cpu.toFixed(1)}%<div class="muted">峰值 ${u.cpu_max.toFixed(0)}% · ${r.cpu} 核</div></td>
+            <td class="${cls(memPct, 85, 97)}">${bytes(u.mem)}<div class="muted">${memPct.toFixed(0)}% / ${r.ram_mb} MB</div></td>
+            <td class="${cls(diskPct, 85, 95)}">${bytes(u.disk)}<div class="muted">${diskPct.toFixed(0)}% / ${r.disk_gb} GB</div></td>
+            <td class="${cls(u.rio + u.wio, 500, 2000)}">${rate(u.rd)} / ${rate(u.wr)}<div class="muted">${count(u.rio)} / ${count(u.wio)} IOPS</div></td>
+            <td class="${cls(upPct, 70, 90)}">${bits(u.rx)} / ${bits(u.tx)}${r.bandwidth_mbps ? `<div class="muted">限速 ${r.bandwidth_mbps} Mbps</div>` : ''}</td>
+            <td class="${cls(u.rxp + u.txp, 20000, 100000)}">${count(u.rxp)} / ${count(u.txp)} pps</td>
+            <td>${u.tcp == null ? '<span class="muted">暂无数据</span>' : `${whole(u.tcp + (u.udp ?? 0))}<div class="muted">TCP ${whole(u.tcp)}${u.udp == null ? '' : ` · UDP ${whole(u.udp)}`}</div><div class="muted">峰值 ${whole(u.conns_max)} · 对端 ${whole(u.ips)} 个 IP</div>`}</td>
+            <td><button class="btn" data-act="chart">图表</button></td></tr>`;
+        }).join('') || '<tr><td colspan="9" class="muted">此节点上还没有实例。</td></tr>'}
+      </table></div>`;
+  } catch (e) { el.textContent = e.message; }
+}
+
+$('#tab-monitor').addEventListener('change', e => {
+  if (e.target.id === 'monitor-window') { monitorWindow = +e.target.value; loadMonitor(); }
+});
+$('#tab-monitor').addEventListener('click', e => {
+  const th = e.target.closest('th[data-sort]');
+  if (th) { monitorSort = th.dataset.sort; return loadMonitor(); }
+  const b = e.target.closest('button[data-act="chart"]');
+  if (b) showCharts(b.closest('tr').dataset.id);
+});
+
+// Line chart on a canvas: series of [{ts, v}]. Pointing at it (or tapping)
+// shows the values at that moment; legend entries switch their line on and off.
+function drawChart(canvas, lines, fmt, integer) {
+  const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const g = canvas.getContext('2d'); g.scale(dpr, dpr);
+  const css = getComputedStyle(document.documentElement), color = n => css.getPropertyValue(n).trim();
+  const box = canvas.parentElement, tip = box.querySelector('.chart-tip');
+  const all = lines.flatMap(l => l.points);
+  const t0 = Math.min(...all.map(p => p.ts)), t1 = Math.max(...all.map(p => p.ts));
+  const L = 64, R = 8, T = 8, B = 18, x = t => L + (t1 > t0 ? (t - t0) / (t1 - t0) : 0.5) * (w - L - R);
+  const hidden = new Set();
+  let pointer = null; // x of the pointer in the canvas
+
+  function render() {
+    g.clearRect(0, 0, w, h);
+    g.font = '11px system-ui, sans-serif'; g.fillStyle = color('--muted');
+    const shown = lines.filter(l => !hidden.has(l.name)), pts = shown.flatMap(l => l.points);
+    tip.hidden = true;
+    if (!pts.length) { g.fillText('没有数据', w / 2 - 24, h / 2); return; }
+    const top = Math.max(...pts.map(p => p.v), 1e-9) * 1.1;
+    // Three grid steps: a multiple of three keeps whole-number axes whole.
+    const max = integer ? Math.ceil(top / 3) * 3 : top, y = v => T + (1 - v / max) * (h - T - B);
+    g.strokeStyle = color('--line'); g.lineWidth = 1;
+    for (let i = 0; i <= 3; i++) {
+      const v = max * i / 3, yy = Math.round(y(v)) + 0.5;
+      g.beginPath(); g.moveTo(L, yy); g.lineTo(w - R, yy); g.stroke();
+      g.fillText(fmt(v), 4, yy + 4);
+    }
+    const span = t1 - t0, label = t => { const d = new Date(t * 1000); return span > 2 * 86400 ? `${d.getMonth() + 1}-${d.getDate()}` : `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+    g.fillText(label(t0), L, h - 4); const lt = label(t1); g.fillText(lt, w - R - g.measureText(lt).width, h - 4);
+    for (const l of shown) {
+      g.strokeStyle = color(l.color); g.lineWidth = 1.5; g.beginPath();
+      let prev = null;
+      for (const p of l.points) {
+        // Break the line across gaps (instance stopped).
+        if (prev && p.ts - prev.ts > l.gap) g.moveTo(x(p.ts), y(p.v)); else if (prev) g.lineTo(x(p.ts), y(p.v)); else g.moveTo(x(p.ts), y(p.v));
+        prev = p;
+      }
+      g.stroke();
+    }
+    if (pointer === null) return;
+    // The sample nearest the pointer, and each line's value at that moment.
+    const near = pts.reduce((a, b) => Math.abs(x(b.ts) - pointer) < Math.abs(x(a.ts) - pointer) ? b : a);
+    const at = shown.flatMap(l => { const p = l.points.find(p => p.ts === near.ts); return p ? [{ l, p }] : []; });
+    const px = Math.round(x(near.ts)) + 0.5;
+    g.strokeStyle = color('--muted'); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(px, T); g.lineTo(px, h - B); g.stroke();
+    for (const { l, p } of at) { g.fillStyle = color(l.color); g.beginPath(); g.arc(x(p.ts), y(p.v), 3, 0, 2 * Math.PI); g.fill(); }
+    tip.innerHTML = `<div class="muted">${esc(new Date(near.ts * 1000).toLocaleString())}</div>` +
+      at.map(({ l, p }) => `<div><i style="background:var(${l.color})"></i>${esc(l.name)} ${esc(fmt(p.v))}</div>`).join('');
+    tip.hidden = false;
+    const left = canvas.offsetLeft + px;
+    tip.style.left = (px > w / 2 ? left - tip.offsetWidth - 10 : left + 10) + 'px';
+    tip.style.top = canvas.offsetTop + T + 'px';
+  }
+
+  canvas.onpointermove = canvas.onpointerdown = e => { pointer = e.offsetX; render(); };
+  // On a touch screen the values stay after the finger lifts.
+  canvas.onpointerleave = e => { if (e.pointerType === 'mouse') { pointer = null; render(); } };
+  box.querySelector('.legend').onclick = e => {
+    const b = e.target.closest('button[data-line]'); if (!b) return;
+    const name = b.dataset.line;
+    if (!hidden.delete(name)) hidden.add(name);
+    b.classList.toggle('off', hidden.has(name));
+    render();
+  };
+  render();
+}
+
+const CHART_RANGES = [[3600, '1 小时'], [6 * 3600, '6 小时'], [86400, '24 小时'], [7 * 86400, '7 天'], [30 * 86400, '30 天']];
+async function showCharts(id, range = 3600) {
+  dialog('资源历史 · ' + id.slice(0, 8), `
+    <div class="row">${CHART_RANGES.map(([v, n]) => `<button class="btn${v === range ? ' primary' : ''}" data-range="${v}">${n}</button>`).join('')}</div>
+    <div class="charts section" id="charts"><p class="muted">加载中…</p></div>`);
+  $('#dlg-body').onclick = e => { const b = e.target.closest('button[data-range]'); if (b) showCharts(id, +b.dataset.range); };
+  try {
+    const { points } = await api(`/api/monitor/${id}?range=${range}`);
+    const bucket = Math.max(60, range / 360), gap = bucket * 2.5;
+    const s = key => points.filter(p => p[key] != null).map(p => ({ ts: p.ts, v: p[key] }));
+    const charts = [
+      ['CPU（占分配核数）', [{ name: '平均', color: '--accent', points: s('cpu') }, { name: '峰值', color: '--warn', points: s('cpu_max') }], v => v.toFixed(0) + '%'],
+      ['内存', [{ name: '已用', color: '--accent', points: s('mem') }], bytes],
+      ['磁盘已用', [{ name: '已用', color: '--accent', points: s('disk') }], bytes],
+      ['磁盘读写', [{ name: '读', color: '--ok', points: s('rd') }, { name: '写', color: '--warn', points: s('wr') }], v => rate(v)],
+      ['磁盘 IOPS', [{ name: '读', color: '--ok', points: s('rio') }, { name: '写', color: '--warn', points: s('wio') }], count],
+      ['网络', [{ name: '入', color: '--ok', points: s('rx') }, { name: '出', color: '--accent', points: s('tx') }], bits],
+      ['包速', [{ name: '入', color: '--ok', points: s('rxp') }, { name: '出', color: '--accent', points: s('txp') }], v => count(v) + ' pps'],
+      ['连接数', [{ name: 'TCP', color: '--accent', points: s('tcp') }, { name: 'UDP', color: '--ok', points: s('udp') }, { name: '峰值', color: '--warn', points: s('conns_max') }], whole, true],
+      ['对端 IP 数', [{ name: '平均', color: '--accent', points: s('ips') }], whole, true],
+    ];
+    const box = $('#charts'); if (!box) return;
+    box.innerHTML = charts.map(([title, lines], i) => `<div class="chart card"><h4>${title}<span class="legend">${lines.map(l => `<button data-line="${l.name}" title="点击隐藏或显示"><i style="background:var(${l.color})"></i>${l.name}</button>`).join('')}</span></h4><canvas id="chart-${i}"></canvas><div class="chart-tip" hidden></div></div>`).join('');
+    charts.forEach(([, lines, fmt, integer], i) => drawChart($('#chart-' + i), lines.map(l => ({ ...l, gap })), fmt, integer));
+  } catch (err) { const box = $('#charts'); if (box) box.innerHTML = `<p class="muted">${esc(err.message)}</p>`; }
+}
+
+// ── images ──
+const EXAMPLE_SCRIPT = `# 以 root 运行，可联网；任一命令失败即构建失败。示例：
+apt-get update
+apt-get install -y nginx
+systemctl enable nginx`;
+let imageFormDraft = null;
+
+async function loadImages() {
+  const el = $('#tab-images');
+  if (el.querySelector('#build-form') && el.contains(document.activeElement)) return; // do not wipe a form being edited
+  try {
+    const [images, builds] = await Promise.all([api('/api/images'), api('/api/images/builds')]);
+    const draft = imageFormDraft || {};
+    el.innerHTML = `
+      <p class="muted">已启用的镜像按此顺序上报平台并供新实例选择；停用后不能再用它新建或重装实例，已有实例不受影响。</p>
+      <div class="table-wrap"><table>
+        <tr><th>顺序</th><th>镜像</th><th>ID</th><th>版本</th><th>来源</th><th>使用中</th><th>状态</th><th></th></tr>
+        ${images.map((i, n) => `<tr data-id="${esc(i.id)}">
+          <td><div class="actions"><button class="btn" data-act="up"${n ? '' : ' disabled'}>↑</button><button class="btn" data-act="down"${n < images.length - 1 ? '' : ' disabled'}>↓</button></div></td>
+          <td>${esc(i.name)}</td><td class="mono">${esc(i.id)}</td><td class="mono">${esc(i.serial)}</td>
+          <td>${i.custom ? `自定义（基于 <code>${esc(i.base)}</code>）` : '官方'}</td><td>${i.in_use} 个实例</td>
+          <td>${i.enabled ? '<span class="badge ok">启用</span>' : '<span class="badge muted">停用</span>'}</td>
+          <td><div class="actions">
+            <button class="btn" data-act="toggle">${i.enabled ? '停用' : '启用'}</button>
+            ${i.custom ? '<button class="btn" data-act="edit">编辑重建</button><button class="btn danger" data-act="delete">删除</button>' : ''}
+            <button class="btn" data-act="base">以此为基础</button></div></td></tr>`).join('')}
+      </table></div>
+      <div class="card section"><h2>构建自定义镜像</h2>
+        <form id="build-form">
+          <div class="row">
+            <label>镜像 ID（小写字母、数字、-）<input name="image_id" required pattern="[a-z0-9][a-z0-9-]{0,39}" value="${esc(draft.image_id || '')}"></label>
+            <label>名称<input name="name" required maxlength="64" value="${esc(draft.name || '')}" style="width:220px"></label>
+            <label>基础镜像<select name="base">${images.map(i => `<option value="${esc(i.id)}"${i.id === draft.base ? ' selected' : ''}>${esc(i.name)}</option>`).join('')}</select></label>
+          </div>
+          <p class="muted">构建会用基础镜像启动一台临时实例（2 核 / 2 GB / 20 GB，可联网），以 root 执行下面的脚本，成功后保存为新镜像。同一 ID 重新构建会生成新版本，已有实例不受影响。</p>
+          <textarea name="script" rows="12" style="width:100%;font-family:monospace" required placeholder="${esc(EXAMPLE_SCRIPT)}">${esc(draft.script || '')}</textarea>
+          <p><button class="btn primary">开始构建</button></p>
+        </form></div>
+      <div class="section"><h2>构建记录</h2>
+        <div class="table-wrap"><table>
+          <tr><th>镜像</th><th>基础</th><th>状态</th><th>开始</th><th></th></tr>
+          ${builds.map(b => `<tr data-build="${esc(b.id)}">
+            <td>${esc(b.name)} <span class="muted mono">${esc(b.image_id)}</span></td><td class="mono">${esc(b.base)}</td>
+            <td><span class="badge ${b.state === 'succeeded' ? 'ok' : b.state === 'failed' ? 'bad' : 'warn'}">${{running: '构建中', succeeded: '成功', failed: '失败'}[b.state] || esc(b.state)}</span>
+              ${b.error ? `<div class="muted">${esc(b.error)}</div>` : ''}</td>
+            <td>${new Date(b.started * 1000).toLocaleString()}</td>
+            <td><button class="btn" data-act="log">日志</button></td></tr>`).join('') || '<tr><td colspan="5" class="muted">暂无</td></tr>'}
+        </table></div></div>`;
+    imageFormDraft = null;
+  } catch (e) { el.textContent = e.message; }
+}
+
+function captureDraft() {
+  const f = $('#build-form'); if (!f) return;
+  const d = new FormData(f);
+  imageFormDraft = { image_id: d.get('image_id'), name: d.get('name'), base: d.get('base'), script: d.get('script') };
+}
+
+async function showBuildLog(id) {
+  dialog('构建日志', '<pre class="log" id="build-log">加载中…</pre>', () => clearInterval(logTimer));
+  let logTimer = null;
+  const refresh = async () => {
+    try {
+      const r = await fetch(`/api/images/builds/${id}/log`, { credentials: 'same-origin' });
+      const pre = $('#build-log'); if (!pre) return clearInterval(logTimer);
+      const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
+      pre.textContent = (await r.text()).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '') || '（空）';
+      if (atBottom) pre.scrollTop = pre.scrollHeight;
+      const b = (await api('/api/images/builds')).find(x => x.id === id);
+      if (!b || b.state !== 'running') clearInterval(logTimer);
+    } catch { clearInterval(logTimer); }
+  };
+  await refresh();
+  logTimer = setInterval(refresh, 2000);
+}
+
+$('#tab-images').addEventListener('submit', async e => {
+  if (e.target.id !== 'build-form') return;
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const body = { image_id: f.get('image_id'), name: f.get('name'), base: f.get('base'), script: f.get('script') };
+  try {
+    const r = await api('/api/images/builds', { method: 'POST', body });
+    toast('构建已开始');
+    document.activeElement.blur();
+    await loadImages();
+    showBuildLog(r.build_id);
+  } catch (err) { toast('无法开始构建：' + err.message); }
+});
+
+$('#tab-images').addEventListener('click', async e => {
+  const b = e.target.closest('button[data-act]'); if (!b) return;
+  const row = b.closest('tr');
+  if (b.dataset.act === 'log') return showBuildLog(row.dataset.build);
+  const id = row.dataset.id;
+  try {
+    if (b.dataset.act === 'delete') {
+      if (!confirm(`删除自定义镜像 ${id}？使用它的实例不受影响，新实例将不能再选择它。`)) return;
+      await api('/api/images/' + encodeURIComponent(id), { method: 'DELETE' }); toast('已删除');
+      return loadImages();
+    }
+    const images = await api('/api/images');
+    const img = images.find(i => i.id === id);
+    if (['up', 'down', 'toggle'].includes(b.dataset.act)) {
+      const order = images.map(i => i.id), n = order.indexOf(id), m = n + (b.dataset.act === 'up' ? -1 : 1);
+      if (b.dataset.act !== 'toggle' && order[m]) [order[n], order[m]] = [order[m], order[n]];
+      const disabled = images.filter(i => i.id === id && b.dataset.act === 'toggle' ? i.enabled : !i.enabled).map(i => i.id);
+      await api('/api/images/settings', { method: 'PUT', body: { order, disabled } });
+      if (b.dataset.act === 'toggle') toast(img.enabled ? '已停用' : '已启用');
+      return loadImages();
+    }
+    imageFormDraft = b.dataset.act === 'edit'
+      ? { image_id: img.id, name: img.name, base: img.base, script: img.script }
+      : { image_id: '', name: '', base: img.id, script: '' };
+    document.activeElement.blur();
+    await loadImages();
+    $('#build-form').scrollIntoView({ behavior: 'smooth' });
+  } catch (err) { toast('失败：' + err.message); }
+});
+$('#tab-images').addEventListener('input', captureDraft);
+
+// ── dedicated IPs ──
+async function loadWg() {
+  const el = $('#tab-wg');
+  try {
+    await refreshNode();
+    if (!standalone()) {
+      el.innerHTML = '<p class="muted">此节点由平台管理：独立 IP 的绑定由平台下发，已生效的地址显示在「实例」页。</p>';
+      return;
+    }
+    const [wg, list] = await Promise.all([api('/api/wg'), api('/api/instances')]);
+    const host = id => (list.find(i => i.id === id) || {}).hostname || id;
+    el.innerHTML = `
+      <p class="muted">通过 WireGuard 把独立公网 IPv4/IPv6 绑定到实例：地址直接配在实例网卡上，出站、入站、监听都使用它。</p>
+      <div class="table-wrap"><table>
+        <tr><th>独立 IP</th><th>实例</th><th>网关</th><th></th></tr>
+        ${wg.bindings.map(b => `<tr><td class="mono">${esc(b.address)}</td><td>${esc(host(b.vm_id))}</td><td class="mono">${esc(b.endpoint)}</td>
+          <td><button class="btn danger" data-del="${esc(b.resource_id)}">解绑</button></td></tr>`).join('') || '<tr><td colspan="4" class="muted">尚未绑定</td></tr>'}
+      </table></div>
+      <div class="card section"><h2>绑定独立 IP</h2>
+        ${list.length ? `<form id="wg-form">
+          <label class="muted">实例 <select name="vm_id">${list.map(i => `<option value="${esc(i.id)}">${esc(i.hostname)} (${esc(i.ips[0] || '')})</option>`).join('')}</select></label>
+          <p class="muted">粘贴 WireGuard 配置（wg-quick 格式，包含 [Interface] 的 PrivateKey、Address 和 [Peer] 的 PublicKey、Endpoint）：</p>
+          <textarea name="config" rows="10" style="width:100%;font-family:monospace" required></textarea>
+          <p><button class="btn primary">绑定</button></p></form>` : '<p class="muted">先创建实例。</p>'}
+      </div>`;
+  } catch (e) { el.textContent = e.message; }
+}
+$('#tab-wg').addEventListener('submit', async e => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  try { await api('/api/wg', { method: 'POST', body: { vm_id: f.get('vm_id'), config: f.get('config') } }); toast('已绑定，地址将在几秒内生效'); }
+  catch (err) { toast('绑定失败：' + err.message); }
+  loadWg();
+});
+$('#tab-wg').addEventListener('click', async e => {
+  const b = e.target.closest('button[data-del]'); if (!b) return;
+  if (!confirm('解绑这个独立 IP？')) return;
+  try { await api('/api/wg/' + encodeURIComponent(b.dataset.del), { method: 'DELETE' }); toast('已解绑'); }
+  catch (err) { toast('失败：' + err.message); }
+  loadWg();
+});
+
+function dialog(title, html, onClose) {
+  $('#dlg-title').textContent = title; $('#dlg-body').innerHTML = html;
+  const d = $('#dlg'); d._onClose = onClose; d.showModal();
+}
+$('#dlg-close').addEventListener('click', () => $('#dlg').close());
+$('#dlg').addEventListener('close', () => { const d = $('#dlg'); if (d._onClose) d._onClose(); d._onClose = null; $('#dlg-body').innerHTML = ''; });
+
+async function openLog(id) {
+  try {
+    const r = await fetch(`/api/instances/${id}/console-log`, { credentials: 'same-origin' });
+    const text = (await r.text()).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+    dialog('控制台日志', `<pre class="log">${esc(text || '（空）')}</pre>`);
+    const pre = $('#dlg-body pre'); pre.scrollTop = pre.scrollHeight;
+  } catch (e) { toast(e.message); }
+}
+
+let xtermLoaded = null;
+function loadXterm() {
+  if (window.Terminal) return Promise.resolve();
+  return xtermLoaded ||= Promise.all([
+    'https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js',
+    'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js',
+  ].map(src => new Promise((ok, fail) => { const s = document.createElement('script'); s.src = src; s.onload = ok; s.onerror = () => fail(new Error('无法加载终端组件（需要访问 cdn.jsdelivr.net）')); document.head.appendChild(s); })));
+}
+
+async function openConsole(id) {
+  try { await loadXterm(); } catch (e) { return toast(e.message); }
+  let ws;
+  dialog('终端', '<div id="term"></div>', () => ws && ws.close());
+  const term = new Terminal({ cursorBlink: true, fontSize: 13 });
+  const fit = new FitAddon.FitAddon(); term.loadAddon(fit);
+  term.open($('#term')); fit.fit();
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/api/instances/${id}/tty?cols=${term.cols}&rows=${term.rows}`);
+  ws.binaryType = 'arraybuffer';
+  const enc = new TextEncoder();
+  ws.onmessage = ev => term.write(new Uint8Array(ev.data));
+  ws.onclose = () => term.write('\r\n\x1b[90m[会话已结束]\x1b[0m\r\n');
+  term.onData(d => ws.readyState === 1 && ws.send(enc.encode(d)));
+  term.onResize(({ cols, rows }) => ws.readyState === 1 && ws.send(JSON.stringify({ cols, rows })));
+  new ResizeObserver(() => fit.fit()).observe($('#term'));
+  term.focus();
+}
+
+// ── firewall ──
+async function loadFirewall() {
+  const el = $('#tab-firewall');
+  const st = await api('/api/rfw/status').catch(() => null);
+  if (!st || !st.api) {
+    el.innerHTML = `<p>rfw 防火墙${st && st.service === 'active' ? ' API 无响应' : '未运行'}（服务状态：<code>${esc(st ? st.service || '未安装' : '未知')}</code>）。</p>`;
+    return;
+  }
+  let rules = [];
+  try { rules = await api('/rfw/api/rules'); } catch (e) { toast(e.message); }
+  const ipText = r => r.ip_type === 'geoip' ? 'GeoIP ' + (r.countries || []).join(',') : r.ip_type === 'cidr' ? r.ip : '任意';
+  el.innerHTML = `
+    <div class="card"><h2>匹配规则</h2>
+      <ul class="muted" style="margin:0;padding-left:18px">
+        <li>网卡 <code>${esc(st.api.iface)}</code>；启用的规则按<strong>优先级数字从大到小</strong>逐条比对，<strong>第一条命中的规则生效</strong>（拦截或放行），后面的不再检查。</li>
+        <li>优先级相同时，先创建的规则先比对；都没有命中则<strong>放行</strong>。</li>
+        <li>最多 64 条启用中的规则生效。例：想对某个地址放行、其余拦截，给「放行」规则更大的优先级。</li>
+        <li>只过滤 <strong>IPv4</strong>：IPv6 流量不经过 rfw。经 WireGuard 独立 IP 进出的流量在隧道内加密，rfw 也看不到。</li>
+      </ul></div>
+    <div class="section"></div>
+    <div class="table-wrap"><table>
+      <tr><th>优先级</th><th>方向</th><th>协议</th><th>端口</th><th>来源/目标</th><th>动作</th><th>状态</th><th></th></tr>
+      ${rules.map(r => `<tr>
+        <td>${esc(r.priority)}</td><td>${r.direction === 'in' ? '入站' : '出站'}</td><td>${esc(r.protocol)}</td>
+        <td>${r.port_start ? esc(r.port_start) + (r.port_end && r.port_end !== r.port_start ? '-' + esc(r.port_end) : '') : '全部'}</td>
+        <td class="mono">${esc(ipText(r))}</td>
+        <td><span class="badge ${r.action === 'block' ? 'bad' : 'ok'}">${r.action === 'block' ? '拦截' : '放行'}</span></td>
+        <td>${r.enabled ? '启用' : '<span class="muted">停用</span>'}</td>
+        <td><button class="btn danger" data-del="${esc(r.id)}">删除</button></td></tr>`).join('') || '<tr><td colspan="8" class="muted">没有规则</td></tr>'}
+    </table></div>
+    <div class="section card"><h2>新增规则</h2>
+      <form class="row" id="rule-form">
+        <label>优先级<input name="priority" type="number" value="100" min="0" style="width:90px"></label>
+        <label>方向<select name="direction"><option value="in">入站</option><option value="out">出站</option></select></label>
+        <label>协议<select name="protocol">${['tcp','udp','all','http','tls','socks5','ssh','fet','wireguard','openvpn'].map(p => `<option>${p}</option>`).join('')}</select></label>
+        <label>起始端口<input name="port_start" type="number" value="0" min="0" max="65535" style="width:100px"></label>
+        <label>结束端口<input name="port_end" type="number" min="0" max="65535" style="width:100px" placeholder="同起始"></label>
+        <label>匹配<select name="ip_type"><option value="any">任意地址</option><option value="cidr">CIDR</option><option value="geoip">GeoIP 国家</option></select></label>
+        <label>CIDR / 国家代码<input name="target" placeholder="1.2.3.0/24 或 CN,RU"></label>
+        <label>动作<select name="action"><option value="block">拦截</option><option value="pass">放行</option></select></label>
+        <button class="btn primary">添加</button>
+      </form>
+      <p class="muted">端口 0 表示全部端口。应用层协议（http/tls/socks5 等）仅对入站生效。</p>
+    </div>`;
+}
+
+$('#tab-firewall').addEventListener('click', async e => {
+  const b = e.target.closest('button[data-del]'); if (!b) return;
+  if (!confirm('删除这条规则？')) return;
+  try { await api('/rfw/api/rules/' + encodeURIComponent(b.dataset.del), { method: 'DELETE' }); toast('已删除'); loadFirewall(); }
+  catch (err) { toast('失败：' + err.message); }
+});
+$('#tab-firewall').addEventListener('submit', async e => {
+  if (e.target.id !== 'rule-form') return;
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const body = { priority: +f.get('priority'), enabled: true, direction: f.get('direction'), protocol: f.get('protocol'),
+    port_start: +f.get('port_start'), action: f.get('action'), ip_type: f.get('ip_type') };
+  if (f.get('port_end')) body.port_end = +f.get('port_end');
+  const target = String(f.get('target') || '').trim();
+  if (body.ip_type === 'cidr') body.ip = target;
+  if (body.ip_type === 'geoip') body.countries = target.split(/[,\s]+/).filter(Boolean).map(c => c.toUpperCase());
+  try { await api('/rfw/api/rules', { method: 'POST', body }); toast('规则已添加'); loadFirewall(); }
+  catch (err) { toast('失败：' + err.message); }
+});
+
+// ── settings ──
+async function loadSettings() {
+  const el = $('#tab-settings');
+  try {
+    const s = await api('/api/settings');
+    el.innerHTML = `
+      <div class="card"><h2>平台对接</h2>
+        <div class="kv"><span class="muted">平台地址</span><code>${esc(s.platform_url)}</code>
+          <span class="muted">当前模式</span><span>${s.token_hint ? `平台模式（Token <code>${esc(s.token_hint)}</code>）` : '独立模式（不连接平台）'}</span></div>
+        <form class="row section" id="token-form">
+          <label>平台下发的 Token<input name="token" style="width:360px" autocomplete="off" required></label>
+          <button class="btn primary">接入平台</button>
+          ${s.token_hint ? '<button class="btn danger" type="button" id="token-clear">断开平台（独立模式）</button>' : ''}
+        </form>
+        <p class="muted">Token 由平台生成。接入后实例的新建、删除、端口转发和独立 IP 由平台管理；清除 Token 后节点独立运行。</p>
+      </div>
+      <div class="card section"><h2>节点信息</h2>
+        <form class="row" id="settings-form">
+          <label>入口地址（留空自动检测）<input name="host" value="${esc(s.host)}" placeholder="IP 或域名"></label>
+          <button class="btn primary">保存</button>
+        </form>
+      </div>
+      <div class="card section"><h2>节点带宽</h2>${bandwidthCard(s.bandwidth)}</div>
+      <div class="card section"><h2>端口转发</h2>
+        <form class="row" id="forwards-form">
+          <label>每个实例最多（TCP 与 UDP 合计，0 = 不限制）<input name="max_forwards" type="number" min="0" max="65535" required value="${esc(s.max_forwards)}" style="width:110px"></label>
+          <button class="btn primary">保存</button>
+        </form>
+        <p class="muted">包括新建实例时自动分配的 SSH 端口。平台下发和本面板添加的转发都受此限制；调低后已有的转发保留，只拒绝新增。</p>
+      </div>
+      <div class="card section"><h2>流量统计</h2>
+        <form class="row" id="traffic-form">
+          <label>重置方式<select name="traffic_reset_mode">
+            <option value="fixed"${s.traffic.mode === 'fixed' ? ' selected' : ''}>统一重置日（所有实例同一天）</option>
+            <option value="creation"${s.traffic.mode === 'creation' ? ' selected' : ''}>按创建日（每个实例在自己的创建日重置）</option>
+          </select></label>
+          <label${s.traffic.mode === 'creation' ? ' class="hidden"' : ''} id="reset-day-field">每月重置日<select name="traffic_reset_day">${Array.from({ length: 28 }, (_, i) => i + 1).map(d => `<option value="${d}"${d === s.traffic.reset_day ? ' selected' : ''}>${d} 号</option>`).join('')}</select></label>
+          <label>时区<select name="traffic_timezone">${(TIMEZONES.some(([z]) => z === s.traffic.timezone) ? TIMEZONES : [[s.traffic.timezone, '当前配置'], ...TIMEZONES])
+            .map(([z, n]) => `<option value="${z}"${z === s.traffic.timezone ? ' selected' : ''}>UTC${z} ${esc(n)}</option>`).join('')}</select></label>
+          <button class="btn primary">保存</button>
+        </form>
+        ${s.traffic.mode === 'fixed'
+          ? `<div class="kv section"><span class="muted">下次重置</span><span>${esc(nextResetText(s.traffic))}</span></div>`
+          : '<p class="section">每个实例的下次重置时间显示在「实例」列表的「本月流量」一栏。</p>'}
+        <p class="muted"><strong>统一重置日</strong>：所有实例的「本月流量」在每月同一天的 00:00（所选时区）归零，最多可选 28 号，保证每个月都有这一天。<br>
+          <strong>按创建日</strong>：每个实例在每月与创建时相同的日期和时刻归零，比如 10 月 15 日 09:30 创建的实例，在 11 月 15 日 09:30、12 月 15 日 09:30……重置；
+          29–31 号创建的实例在没有这一天的月份改为月末重置。重装系统不会改变创建时间，也不会清空已用流量。<br>
+          累计流量不受影响。平台按本月入站 + 出站之和判断是否超出套餐流量。修改设置不会清空当前周期已用的流量，它们会在新的重置时间到来时归零。</p>
+      </div>
+      <div class="card section"><h2>面板密码</h2>
+        <form class="row" id="password-form">
+          <label>当前密码<input name="old_password" type="password" autocomplete="current-password" required></label>
+          <label>新密码（至少 8 位）<input name="new_password" type="password" autocomplete="new-password" minlength="8" required></label>
+          <button class="btn">修改密码</button>
+        </form>
+        <p class="muted">用户名：<code>${esc(s.web_user)}</code>。忘记密码时在节点上执行 <code>runman-agent set-password</code>。</p>
+      </div>`;
+  } catch (e) { el.textContent = e.message; }
+}
+
+$('#tab-settings').addEventListener('click', async e => {
+  if (e.target.id !== 'token-clear') return;
+  if (!confirm('断开平台后，节点不再向平台上报，实例改由本面板管理。继续？')) return;
+  try { await api('/api/settings/token', { method: 'POST', body: { token: '' } }); toast('已切换为独立模式'); }
+  catch (err) { toast('失败：' + err.message); }
+  loadSettings();
+});
+
+$('#tab-settings').addEventListener('submit', async e => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  try {
+    if (e.target.id === 'token-form') {
+      const token = String(f.get('token')).trim();
+      try { await api('/api/settings/token', { method: 'POST', body: { token } }); }
+      catch (err) {
+        if (err.status !== 409) throw err;
+        if (!confirm(err.message + '\n\n平台会删除它不认识的本地实例，确定接入？')) return;
+        await api('/api/settings/token', { method: 'POST', body: { token, confirm: true } });
+      }
+      toast('已接入平台，正在连接…');
+    } else if (e.target.id === 'settings-form') {
+      await api('/api/settings', { method: 'PUT', body: { host: f.get('host').trim() } });
+      toast('已保存');
+    } else if (e.target.id === 'bandwidth-form') {
+      await api('/api/settings', { method: 'PUT', body: { bandwidth_mbps: +f.get('bandwidth_mbps') } });
+      toast('带宽已保存');
+    } else if (e.target.id === 'forwards-form') {
+      await api('/api/settings', { method: 'PUT', body: { max_forwards: +f.get('max_forwards') } });
+      toast('端口转发上限已保存');
+    } else if (e.target.id === 'traffic-form') {
+      await api('/api/settings', { method: 'PUT', body: { traffic_reset_mode: f.get('traffic_reset_mode'), traffic_reset_day: +f.get('traffic_reset_day'), traffic_timezone: f.get('traffic_timezone') } });
+      toast('流量重置设置已保存');
+    } else if (e.target.id === 'password-form') {
+      await api('/api/settings/password', { method: 'POST', body: { old_password: f.get('old_password'), new_password: f.get('new_password') } });
+      toast('密码已修改，其他会话已退出'); e.target.reset();
+    }
+    loadSettings();
+  } catch (err) { toast('失败：' + err.message); }
+});
+
+api('/api/overview').then(showApp, () => showLogin());
+</script>
+</body>
+</html>

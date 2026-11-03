@@ -1,0 +1,98 @@
+# Builds static binaries and publishes them with a checksum list.
+#
+# - Rust changes on main -> pre-release "continuous-rs"
+# - tag rust-v*    -> stable Rust release
+name: Rust v2 Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["rust-v*"]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "config.example.toml"
+      - "proto/agent.proto"
+      - "src/**"
+      - "scripts/**"
+      - "images/**"
+      - "install-rust-v2.sh"
+      - "README-RUST-V2.md"
+      - "DESIGN.md"
+      - "MIGRATION_GO_TO_RUST_V2.md"
+      - ".github/workflows/release-rust-v2.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-rust-v2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cargo-zigbuild
+        run: pip3 install --break-system-packages ziglang cargo-zigbuild
+      - name: Build
+        env:
+          RUNMAN_BUILD_ID: ${{ github.ref_type == 'tag' && github.ref_name || format('rs-{0}', github.sha) }}
+        run: |
+          RUNMAN_BUILD_ID="${RUNMAN_BUILD_ID:0:12}"
+          export RUNMAN_BUILD_ID
+          cargo zigbuild --release --locked --target ${{ matrix.target }} --bin runman-agent
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/runman-agent dist/runman-agent-linux-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runman-agent-linux-${{ matrix.arch }}
+          path: dist/runman-agent-linux-${{ matrix.arch }}
+          retention-days: 3
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cp install-rust-v2.sh dist/install.sh
+          cp scripts/migrate-go-state.py dist/
+          cd dist
+          chmod 755 runman-agent-linux-* install.sh migrate-go-state.py
+          sha256sum runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh migrate-go-state.py > SHA256SUMS
+          ls -l
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          files=(runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh migrate-go-state.py SHA256SUMS)
+          if [ "${{ github.ref_type }}" = tag ]; then
+            gh release create "${{ github.ref_name }}" "${files[@]}" --title "${{ github.ref_name }}" --generate-notes
+          else
+            gh release delete continuous-rs --yes --cleanup-tag 2>/dev/null || true
+            gh release create continuous-rs "${files[@]}" --prerelease --target "${{ github.sha }}" \
+              --title "Runman Agent Rust v2 continuous build" --notes "Latest Rust v2 on main: ${{ github.sha }}"
+          fi
