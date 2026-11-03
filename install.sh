@@ -996,7 +996,7 @@ show_rust_menu() {
         if [ "$set_token_supported" = 1 ]; then
             printf '  7) %s\n' "$(t "Set platform-issued Rust Token" "设置平台签发的 Rust Token")"
         else
-            printf '  7) %s\n' "$(t "Set Rust Token (requires newer CLI and a platform-issued token)" "设置 Rust Token（需要较新 CLI 和平台签发的 Token）")"
+            printf '  7) %s\n' "$(t "Set Rust Token (updates Rust v2 if needed; platform token required)" "设置 Rust Token（必要时先更新 Rust v2；需平台签发的 Token）")"
         fi
         printf '  8) %s\n' "$(t "Detect IPv6 using the Rust agent" "使用 Rust Agent 探测 IPv6")"
         printf '  9) %s\n' "$(t "Run Rust uplink speed test" "运行 Rust 上行带宽测速")"
@@ -1033,7 +1033,19 @@ show_rust_menu() {
                 RUST_ACTION="show-token"; return 0 ;;
             7)
                 if ! rust_installation_present; then log "Rust v2 is not installed."; continue; fi
-                if [ "$set_token_supported" != 1 ]; then log "Update Rust v2 to a release with set-token --stdin support first."; continue; fi
+                if [ "$set_token_supported" != 1 ]; then
+                    log "Updating Rust v2 to enable safe set-token --stdin support..."
+                    if ! run_rust_v2_installer; then
+                        log "Rust v2 update failed; the platform token was not changed."
+                        continue
+                    fi
+                    if ! rust_set_token_supported; then
+                        log "The installed Rust CLI still lacks set-token --stdin; the platform token was not changed."
+                        continue
+                    fi
+                    set_token_supported=1
+                    rust_show_token_supported && show_token_supported=1
+                fi
                 RUST_ACTION="set-token"; return 0 ;;
             8)
                 if ! rust_installation_present; then log "Rust v2 is not installed."; continue; fi
