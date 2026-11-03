@@ -64,7 +64,11 @@ for row in rows:
     if not isinstance(row, dict):
         continue
     name = str(row.get("name") or "")
-    if row.get("was_running") is True and re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
+    if (
+        row.get("was_running") is True
+        or row.get("rebuild_fallback") is True
+        or row.get("was_error_state") is True
+    ) and re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
         print(name)
 PY
 )
@@ -117,6 +121,13 @@ if [ "${#instance_names[@]}" -gt 0 ]; then
             printf '%s\n' "$info" | awk -F': ' '$1 == "Name" || $1 == "Status" || $1 == "Type" || $1 == "Architecture" || $1 == "Processes" { print }'
         else
             printf '%s\n' "$info" | tail -n 8
+        fi
+        power_state=$(incus config get "$name" volatile.last_state.power 2>&1)
+        power_state_rc=$?
+        if [ "$power_state_rc" -eq 0 ]; then
+            printf 'volatile.last_state.power=%s\n' "${power_state:-unset}"
+        else
+            printf 'volatile.last_state.power unavailable: %s\n' "$(printf '%s\n' "$power_state" | tail -n 2)"
         fi
         printf '%s\n' "--- $name: instance log (last 40 lines) ---"
         instance_log=$(incus info --show-log "$name" 2>&1)

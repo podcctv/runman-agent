@@ -77,6 +77,125 @@ migration_restore_file() {
     fi
 }
 
+migration_choose_error_states() {
+    local rows_file name fallback_status fallback_pid last_power answer selected found=0
+    [ "$MIGRATION_BACKEND" = incus ] || return 0
+
+    rows_file="$MIGRATION_DIR/incus-error-instances.tsv"
+    if ! python3 - "$MIGRATION_DIR/legacy-state.json" > "$rows_file" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    rows = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    print(f"cannot read Incus ERROR instances: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+    print("legacy state is not a list of objects", file=sys.stderr)
+    raise SystemExit(1)
+for row in rows:
+    if (
+        row.get("rebuild_fallback") is True or row.get("was_error_state") is True
+    ) and row.get("run_state_confirmed") is not True:
+        name = str(row.get("name") or "")
+        status = str(row.get("fallback_status") or "ERROR")
+        pid = str(row.get("fallback_init_pid") or "missing")
+        power = str(row.get("last_state_power") or "unset")
+        print(f"{name}\t{status}\t{pid}\t{power}")
+PY
+    then
+        die "could not read Incus ERROR instance state choices"
+    fi
+
+    while IFS=$'\t' read -r name fallback_status fallback_pid last_power; do
+        [ -n "$name" ] || continue
+        found=1
+        [ -n "$last_power" ] || last_power=unset
+        printf '\nIncus reports %s as %s with init PID %s; its guest filesystem will be rebuilt.\n' \
+            "$name" "${fallback_status^^}" "$fallback_pid"
+        printf 'Incus volatile.last_state.power is %s and may be stale.\n' "${last_power^^}"
+        while true; do
+            read -r -p "Should the replacement guest start after migration? Enter RUNNING or STOPPED: " answer \
+                || die "could not read the replacement run state for $name"
+            case "${answer^^}" in
+                RUNNING|R) selected=running; break ;;
+                STOPPED|S) selected=stopped; break ;;
+                *) warn "enter RUNNING or STOPPED" ;;
+            esac
+        done
+        python3 - "$MIGRATION_DIR/error-state-overrides.json" "$name" "$selected" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    choices = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    print(f"cannot read prior run-state choices: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(choices, dict):
+    print("run-state choices are not an object", file=sys.stderr)
+    raise SystemExit(1)
+choices[sys.argv[2]] = sys.argv[3] == "running"
+tmp = path.with_name(path.name + ".tmp")
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as stream:
+    json.dump(choices, stream, separators=(",", ":"))
+    stream.write("\n")
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+        printf 'Replacement for %s will be %s after migration.\n' "$name" "${selected^^}"
+    done < "$rows_file"
+    rm -f -- "$rows_file"
+
+    if [ "$found" = 1 ]; then
+        "$MIGRATION_HELPER" export --config "$1" --output "$MIGRATION_DIR" \
+            --error-state-overrides "$MIGRATION_DIR/error-state-overrides.json" \
+            || die "could not save the selected Incus replacement states"
+        if ! python3 - "$MIGRATION_DIR/legacy-state.json" \
+            "$MIGRATION_DIR/error-state-overrides.json" <<'PY'
+import json
+import pathlib
+import sys
+
+rows = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+choices = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+    print("invalid legacy state", file=sys.stderr)
+    raise SystemExit(2)
+if not isinstance(choices, dict):
+    print("invalid replacement run-state choices", file=sys.stderr)
+    raise SystemExit(2)
+fallbacks = {
+    str(row.get("name") or "")
+    for row in rows
+    if row.get("rebuild_fallback") is True
+}
+pending = [
+    str(row.get("name") or "")
+    for row in rows
+    if row.get("rebuild_fallback") is True
+    and row.get("run_state_confirmed") is not True
+]
+if pending:
+    print("new unusable Incus state needs a run-state choice: " + ", ".join(pending), file=sys.stderr)
+    raise SystemExit(1)
+stale_choices = sorted(set(choices) - fallbacks)
+if stale_choices:
+    print("Incus state changed while choosing replacement states: " + ", ".join(stale_choices), file=sys.stderr)
+    raise SystemExit(1)
+PY
+        then
+            die "Incus state changed while selecting replacement states; retry migration to review it"
+        fi
+    fi
+}
+
 migration_rollback() {
     local failed=0 record id
     printf '\nMigration did not commit; restoring the Go service and containers. Snapshot: %s\n' "$MIGRATION_DIR" >&2
@@ -152,7 +271,7 @@ migration_rollback() {
                 "$MIGRATION_DIR/diagnose-go-rust-migration.sh" "$MIGRATION_DIR" >&2
         fi
     else
-        printf 'Go service state and pre-existing containers were restored.\n' >&2
+        printf 'Go service state and recoverable pre-existing containers were restored.\n' >&2
     fi
 }
 
@@ -704,6 +823,8 @@ prepare_go_migration() {
     install -d -m 700 /var/backups
     MIGRATION_DIR=$(mktemp -d /var/backups/runman-go-to-rust-v2.XXXXXXXX)
     chmod 700 "$MIGRATION_DIR"
+    printf '{}\n' > "$MIGRATION_DIR/error-state-overrides.json"
+    chmod 600 "$MIGRATION_DIR/error-state-overrides.json"
     install -m 700 "$WORK/release/$diagnostic_asset" "$MIGRATION_DIR/$diagnostic_asset"
     cp -a "$go_config" "$MIGRATION_DIR/go-config.json"
     cp -a "$go_binary" "$MIGRATION_DIR/go-agent"
@@ -724,13 +845,15 @@ prepare_go_migration() {
     if systemctl is-active --quiet lxcfs.service; then MIGRATION_LXCFS_WAS_ACTIVE=1; fi
     if systemctl is-enabled --quiet lxcfs.service; then MIGRATION_LXCFS_WAS_ENABLED=1; fi
 
-    if ! "$MIGRATION_HELPER" export --config "$go_config" --output "$MIGRATION_DIR"; then
+    if ! "$MIGRATION_HELPER" export --config "$go_config" --output "$MIGRATION_DIR" \
+        --error-state-overrides "$MIGRATION_DIR/error-state-overrides.json"; then
         printf 'Go migration preflight failed; Go remains active. Snapshot: %s\n' "$MIGRATION_DIR" >&2
         printf 'Read-only diagnostic: bash %q %q\n' \
             "$MIGRATION_DIR/$diagnostic_asset" "$MIGRATION_DIR" >&2
         exit 1
     fi
     MIGRATION_BACKEND=$(cat "$MIGRATION_DIR/source-backend")
+    migration_choose_error_states "$go_config"
     WEB_LISTEN=$(cat "$MIGRATION_DIR/web-listen")
     migration_ipv4=$(sed -n 's/^ipv4_subnet = "\([^"]*\)"$/\1/p' "$MIGRATION_DIR/config.toml")
     migration_ipv6_mode=$(sed -n 's/^ipv6_mode = "\([^"]*\)"$/\1/p' "$MIGRATION_DIR/config.toml")
@@ -757,8 +880,43 @@ prepare_go_migration() {
     # export is a preflight; this final export closes the window in which the
     # Go panel could change instances or forwards while the user confirmed.
     cp -a "$go_config" "$MIGRATION_DIR/go-config.json"
+    cp -a "$MIGRATION_DIR/legacy-state.json" "$MIGRATION_DIR/pre-confirm-legacy-state.json"
     "$MIGRATION_HELPER" export --config "$go_config" --output "$MIGRATION_DIR" \
+        --error-state-overrides "$MIGRATION_DIR/error-state-overrides.json" \
         || die "final Go snapshot failed; the old guests remain intact and rollback will restart Go"
+    if [ "$MIGRATION_BACKEND" = incus ]; then
+        if ! python3 - "$MIGRATION_DIR/pre-confirm-legacy-state.json" "$MIGRATION_DIR/legacy-state.json" <<'PY'
+import json
+import pathlib
+import sys
+
+def fallback_names(path):
+    rows = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ValueError("legacy state is not a list of objects")
+    return {
+        str(row.get("name") or "")
+        for row in rows
+        if row.get("rebuild_fallback") is True or row.get("was_error_state") is True
+    }
+
+try:
+    changed = fallback_names(sys.argv[2]) ^ fallback_names(sys.argv[1])
+except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+    print(f"cannot compare Incus error-state preflight: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+if changed:
+    print(
+        "unusable Incus instance set changed after confirmation; retry after reviewing: "
+        + ", ".join(sorted(changed)),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+        then
+            die "unusable Incus instance set changed after confirmation; no legacy guest has been deleted"
+        fi
+    fi
     MIGRATION_BACKEND=$(cat "$MIGRATION_DIR/source-backend")
     WEB_LISTEN=$(cat "$MIGRATION_DIR/web-listen")
     migration_ipv4=$(sed -n 's/^ipv4_subnet = "\([^"]*\)"$/\1/p' "$MIGRATION_DIR/config.toml")
