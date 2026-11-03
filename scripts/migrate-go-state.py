@@ -97,6 +97,29 @@ def incus_instance_state(name):
     return rows[0][1].strip().lower(), rows[0][2].strip()
 
 
+def incus_instance_exists(name):
+    if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
+        fail(f"unsupported legacy container name {name!r}")
+    try:
+        result = subprocess.run(
+            ["incus", "list", "--format", "csv,noheader", "--columns", "n", name],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=45,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"cannot verify whether Incus instance {name} still exists: {exc}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[-300:]
+        fail(f"cannot verify whether Incus instance {name} still exists: {detail}")
+    try:
+        names = [row[0] for row in csv.reader(io.StringIO(result.stdout)) if row]
+    except csv.Error as exc:
+        fail(f"Incus returned invalid instance inventory while checking {name}: {exc}")
+    return name in names
+
+
 def incus_state_needs_rebuild(status, init_pid):
     if status == "error":
         return True
@@ -540,7 +563,7 @@ def export(args):
             f"volatile.last_state.power="
             f"{last_power_state.upper() or 'unset'}, replacement state {state}); "
             "leave it untouched during staging, rebuild it as a clean Rust guest, "
-            "and force-delete the old guest only after Rust health checks pass"
+            "and delete it after health checks unless low-space recovery is explicitly confirmed"
         )
 
 
@@ -598,7 +621,7 @@ def mark_rebuild_fallback(row, name, status, init_pid, state_path, rows):
     else:
         print(
             f"{name}: preserving the pre-existing unusable Incus instance during staging; "
-            "it will be force-deleted only after Rust health checks pass",
+            "it will be deleted after health checks unless low-space recovery is explicitly confirmed",
             flush=True,
         )
 
@@ -688,7 +711,12 @@ def lifecycle(args):
                 try:
                     if backend == "incus":
                         if not rollback_should_start(row):
-                            if row.get("rebuild_fallback") is True:
+                            if row.get("predeleted_for_space") is True:
+                                progress(
+                                    f"rollback: not restoring instance {name}; its ERROR guest files "
+                                    "were deleted after the migration snapshot to recover disk space"
+                                )
+                            elif row.get("rebuild_fallback") is True:
                                 progress(f"rollback: leaving unusable instance {name} untouched; Rust replacement is not committed")
                             continue
                         progress(f"rollback: checking whether to restart {name}")
@@ -742,7 +770,12 @@ def lifecycle(args):
             try:
                 if backend == "incus":
                     if not rollback_should_start(row):
-                        if row.get("rebuild_fallback") is True:
+                        if row.get("predeleted_for_space") is True:
+                            progress(
+                                f"rollback: not restoring instance {name}; its ERROR guest files "
+                                "were deleted after the migration snapshot to recover disk space"
+                            )
+                        elif row.get("rebuild_fallback") is True:
                             progress(f"rollback: leaving unusable instance {name} untouched")
                         continue
                     progress(f"rollback: checking instance {name} ({index}/{total})")
@@ -775,17 +808,113 @@ def lifecycle(args):
                 + ", ".join(skipped_error_instances)
             )
         return
+    if args.action == "purge-fallbacks":
+        if backend != "incus":
+            fail("low-space fallback deletion is supported only for Incus ERROR instances")
+        if args.confirmed_state is None:
+            fail("low-space deletion requires the pre-confirmation state snapshot")
+        confirmed_rows = state_file(args.confirmed_state)
+        confirmed_names = {
+            str(row.get("name") or "")
+            for row in confirmed_rows
+            if row.get("rebuild_fallback") is True
+            and row.get("run_state_confirmed") is True
+        }
+        if any(not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name) for name in confirmed_names):
+            fail("pre-confirmation snapshot contains an invalid Incus instance name")
+        current_fallbacks = {
+            str(row.get("name") or "")
+            for row in rows
+            if row.get("rebuild_fallback") is True
+        }
+        missing_confirmed = confirmed_names - current_fallbacks
+        if missing_confirmed:
+            fail(
+                "pre-confirmed Incus ERROR state changed before deletion: "
+                + ", ".join(sorted(missing_confirmed))
+            )
+        candidates = [
+            row
+            for row in rows
+            if row.get("rebuild_fallback") is True
+            and str(row.get("name") or "") in confirmed_names
+        ]
+        if not candidates:
+            print("no pre-confirmed Incus ERROR instance requires low-space deletion")
+            return
+        errors = []
+        total = len(candidates)
+        print(
+            f"deleting {total} confirmed ERROR Incus guest(s) after the migration snapshot "
+            "to reclaim storage",
+            flush=True,
+        )
+        for index, row in enumerate(candidates, start=1):
+            name = str(row.get("name") or "")
+            if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
+                errors.append(f"invalid saved name {name!r}")
+                continue
+            if row.get("predeleted_for_space") is True:
+                progress(f"instance {name} was already recorded as deleted for disk recovery")
+                continue
+            try:
+                if not incus_instance_exists(name):
+                    row["predeleted_for_space"] = True
+                    write_state_file(args.state, rows)
+                    progress(f"instance {name} is already absent; recorded as deleted for disk recovery")
+                    continue
+                progress(f"force-deleting ERROR instance {name} ({index}/{total})")
+                result = subprocess.run(
+                    ["incus", "delete", name, "--force"],
+                    check=False,
+                    text=True,
+                    capture_output=True,
+                    timeout=120,
+                )
+                still_exists = incus_instance_exists(name)
+                if still_exists:
+                    detail = (result.stderr or result.stdout or "Incus still lists the instance").strip()[-300:]
+                    errors.append(f"{name}: {detail}")
+                    continue
+                row["predeleted_for_space"] = True
+                write_state_file(args.state, rows)
+                progress(f"ERROR instance {name} deleted; migration parameters remain in the snapshot")
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                try:
+                    still_exists = incus_instance_exists(name)
+                except SystemExit as check_error:
+                    errors.append(f"{name}: {exc}; follow-up inventory failed: {check_error}")
+                    continue
+                if still_exists:
+                    errors.append(f"{name}: force-delete failed or timed out: {exc}")
+                    continue
+                row["predeleted_for_space"] = True
+                write_state_file(args.state, rows)
+                progress(f"ERROR instance {name} disappeared during force-delete; recorded as removed")
+            except SystemExit as exc:
+                errors.append(f"{name}: {exc}")
+        if errors:
+            fail("low-space ERROR guest deletion incomplete: " + "; ".join(errors))
+        print(f"deleted or confirmed absent: {total} ERROR Incus guest(s)", flush=True)
+        return
     if args.action == "purge":
         errors = []
         total = len(rows)
+        pending = sum(row.get("predeleted_for_space") is not True for row in rows)
         print(
-            f"removing {total} legacy {backend} instance(s) after Rust health checks passed",
+            f"removing {pending} remaining legacy {backend} instance(s) after Rust health checks passed",
             flush=True,
         )
         for index, row in enumerate(rows, start=1):
             name = str(row.get("name") or "")
             if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
                 errors.append(f"invalid saved name {name!r}")
+                continue
+            if row.get("predeleted_for_space") is True:
+                progress(f"skipping {name}; it was already deleted to recover disk space")
+                continue
+            if backend == "incus" and not incus_instance_exists(name):
+                progress(f"skipping {name}; the legacy Incus instance is already absent")
                 continue
             command = ["podman", "rm", "--force", name] if backend == "podman" else ["incus", "delete", name, "--force"]
             progress(f"removing legacy instance {name} ({index}/{total})")
@@ -809,9 +938,10 @@ def main():
     export_parser.add_argument("--error-state-overrides", type=Path)
     export_parser.set_defaults(func=export)
     life = sub.add_parser("lifecycle")
-    life.add_argument("action", choices=["stop", "start", "purge"])
+    life.add_argument("action", choices=["stop", "start", "purge", "purge-fallbacks"])
     life.add_argument("--backend", required=True, choices=["podman", "incus"])
     life.add_argument("--state", type=Path, required=True)
+    life.add_argument("--confirmed-state", type=Path)
     life.set_defaults(func=lifecycle)
     args = parser.parse_args()
     args.func(args)
