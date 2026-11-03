@@ -1,7 +1,6 @@
 # Builds static binaries and publishes them with a checksum list.
 #
-# - push to rust-v2 -> pre-release "continuous-rs" (Rust major line only)
-# - tag rust-v*    -> stable Rust release
+# Legacy rust-v2 validation workflow. Release assets are published only by main.
 name: Release
 
 on:
@@ -11,7 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -53,6 +52,8 @@ jobs:
           retention-days: 3
 
   publish:
+    # The fork's main workflow is the sole publisher of Rust release assets.
+    if: github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-24.04
     steps:
