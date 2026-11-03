@@ -33,6 +33,8 @@ UNINSTALL=0
 PURGE=0
 MIGRATE_GO=0
 CLEANUP_ONLY=0
+CLEANUP_RUNTIMES=0
+MIGRATION_CLEANUP_RUNTIMES=0
 MIGRATION_DIR=""
 MIGRATION_HELPER=""
 MIGRATION_BACKEND=""
@@ -285,6 +287,231 @@ EOF
     return "$failed"
 }
 
+podman_rootless_state_present() {
+    local username home users
+    command -v getent >/dev/null 2>&1 || return 0
+    users=$(getent passwd) || return 0
+    if [ -f /etc/containers/storage.conf ] \
+        && grep -Eq '^[[:space:]]*rootless_storage_path[[:space:]]*=' /etc/containers/storage.conf; then
+        log "custom rootless Podman storage path is configured; keeping Podman and its data"
+        return 0
+    fi
+    while IFS=: read -r username _ _ _ _ home _; do
+        [ -n "$home" ] && [ "$home" != /nonexistent ] || continue
+        if [ -d "$home/.local/share/containers/storage" ] \
+            || [ -f "$home/.config/containers/storage.conf" ]; then
+            log "Podman rootless storage/config exists for $username; keeping Podman and its data"
+            return 0
+        fi
+    done <<< "$users"
+    return 1
+}
+
+purge_runtime_packages() {
+    local label="$1" package_names="$2" unit_names="$3" work package status unit
+    local -a candidates installed units active_units enabled_units
+    read -r -a candidates <<< "$package_names"
+    read -r -a units <<< "$unit_names"
+    installed=()
+    active_units=()
+    enabled_units=()
+    for package in "${candidates[@]}"; do
+        status=$(dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null || true)
+        if [[ "$status" == ii* ]]; then installed+=("$package"); fi
+    done
+    [ "${#installed[@]}" -gt 0 ] || { log "$label runtime packages are already absent"; return 0; }
+
+    work=$(mktemp -d)
+    if ! LC_ALL=C apt-get -o DPkg::Lock::Timeout=600 -s purge "${installed[@]}" >"$work/plan" 2>&1; then
+        warn "could not simulate $label package removal; leaving packages and services in place"
+        rm -rf -- "$work"
+        return 0
+    fi
+    if grep -E '^(Remv|Purg)[[:space:]]+(docker[^[:space:]]*|moby[^[:space:]]*|containerd[^[:space:]]*|runc|podman-docker)([[:space:]]|$)' "$work/plan" >/dev/null; then
+        warn "$label removal would change Docker/containerd-related packages; keeping all packages and services"
+        rm -rf -- "$work"
+        return 0
+    fi
+
+    for unit in "${units[@]}"; do
+        if systemctl is-active --quiet "$unit"; then active_units+=("$unit"); fi
+        if systemctl is-enabled --quiet "$unit"; then enabled_units+=("$unit"); fi
+    done
+    for unit in "${units[@]}"; do
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    done
+    if ! DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 -y -q purge "${installed[@]}" >"$work/apply" 2>&1; then
+        for unit in "${active_units[@]}"; do systemctl start "$unit" >/dev/null 2>&1 || true; done
+        for unit in "${enabled_units[@]}"; do systemctl enable "$unit" >/dev/null 2>&1 || true; done
+        warn "$label package removal failed; restored previously active/enabled services where possible"
+        tail -n 12 "$work/apply" >&2 || true
+        rm -rf -- "$work"
+        return 0
+    fi
+    systemctl daemon-reload || warn "systemd daemon-reload reported an error after $label package removal"
+    log "removed unused $label runtime packages: ${installed[*]} (Docker/containerd packages were not selected; autoremove was not run)"
+    rm -rf -- "$work"
+}
+
+cleanup_unused_podman() {
+    local work
+    command -v podman >/dev/null 2>&1 || return 0
+    if command -v snap >/dev/null 2>&1 && snap list podman >/dev/null 2>&1; then
+        warn "Podman is Snap-managed; leaving it in place because this cleanup only purges apt-owned packages"
+        return 0
+    fi
+    work=$(mktemp -d)
+    if ! podman ps --all --quiet >"$work/containers" 2>&1; then
+        warn "could not inventory Podman containers; keeping Podman"
+        rm -rf -- "$work"
+        return 0
+    fi
+    if [ -s "$work/containers" ]; then
+        log "Podman still has containers; keeping its runtime and data"
+        rm -rf -- "$work"
+        return 0
+    fi
+    if ! podman pod ps --all --quiet >"$work/pods" 2>&1; then
+        warn "could not inventory Podman pods; keeping Podman"
+        rm -rf -- "$work"
+        return 0
+    fi
+    if [ -s "$work/pods" ]; then
+        log "Podman still has pods; keeping its runtime and data"
+        rm -rf -- "$work"
+        return 0
+    fi
+    if ! podman volume ls --quiet >"$work/volumes" 2>&1; then
+        warn "could not inventory Podman volumes; keeping Podman"
+        rm -rf -- "$work"
+        return 0
+    fi
+    if [ -s "$work/volumes" ]; then
+        log "Podman still has named volumes; keeping its runtime and data"
+        rm -rf -- "$work"
+        return 0
+    fi
+    if podman_rootless_state_present; then
+        rm -rf -- "$work"
+        return 0
+    fi
+    if ! podman system prune --all --force >"$work/prune" 2>&1; then
+        warn "Podman could not safely prune its unused image/cache data; keeping Podman packages"
+        tail -n 8 "$work/prune" >&2 || true
+        rm -rf -- "$work"
+        return 0
+    fi
+    purge_runtime_packages "Podman" \
+        "podman podman-compose aardvark-dns netavark" \
+        "podman.socket podman-auto-update.timer podman-restart.service"
+    rm -rf -- "$work"
+}
+
+cleanup_unused_incus() {
+    local work pool count=0 fingerprint project volume_type
+    command -v incus >/dev/null 2>&1 || return 0
+    if command -v snap >/dev/null 2>&1 && snap list incus >/dev/null 2>&1; then
+        warn "Incus is Snap-managed; leaving it in place because this cleanup only purges apt-owned packages"
+        return 0
+    fi
+    command -v python3 >/dev/null 2>&1 || { warn "python3 unavailable; keeping Incus because its inventory cannot be checked"; return 0; }
+    work=$(mktemp -d)
+    if ! incus list local: --all-projects -c n --format csv,noheader >"$work/instances" 2>&1; then
+        warn "could not inventory Incus instances across projects; keeping Incus"
+        rm -rf -- "$work"
+        return 0
+    fi
+    if [ -s "$work/instances" ]; then
+        log "Incus still has instances in at least one project; keeping its runtime and data"
+        rm -rf -- "$work"
+        return 0
+    fi
+    if ! incus storage list local: -c n --format csv,noheader >"$work/pools" 2>&1; then
+        warn "could not inventory Incus storage pools; keeping Incus"
+        rm -rf -- "$work"
+        return 0
+    fi
+    : > "$work/remaining-volumes"
+    while IFS= read -r pool; do
+        [ -n "$pool" ] || continue
+        for volume_type in custom container virtual-machine; do
+            count=$((count + 1))
+            if ! incus storage volume list local: "$pool" "type=$volume_type" \
+                --all-projects -c t,n --format csv,noheader >"$work/volumes-$count" 2>&1; then
+                warn "could not inventory Incus $volume_type volumes in pool $pool; keeping Incus"
+                rm -rf -- "$work"
+                return 0
+            fi
+            if [ -s "$work/volumes-$count" ]; then
+                cat "$work/volumes-$count" >> "$work/remaining-volumes"
+            fi
+        done
+    done < "$work/pools"
+    if [ -s "$work/remaining-volumes" ]; then
+        log "Incus still has custom or orphaned instance storage volumes; keeping its runtime and data"
+        rm -rf -- "$work"
+        return 0
+    fi
+    if ! incus image list local: --all-projects -c F,e --format csv,noheader >"$work/images.csv" 2>&1; then
+        warn "could not inventory Incus images; keeping Incus"
+        rm -rf -- "$work"
+        return 0
+    fi
+    if ! python3 - "$work/images.csv" > "$work/images.tsv" <<'PY'
+import csv
+import re
+import sys
+
+try:
+    with open(sys.argv[1], newline="", encoding="utf-8") as stream:
+        for row in csv.reader(stream):
+            if not row:
+                continue
+            if len(row) < 2:
+                raise ValueError("Incus image project column is missing")
+            fingerprint, project = row[0].strip(), row[1].strip()
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", fingerprint):
+                raise ValueError("Incus returned a non-full image fingerprint")
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", project):
+                raise ValueError("Incus returned an invalid project name")
+            print(f"{fingerprint}\t{project}")
+except Exception as exc:
+    print(f"image inventory could not be parsed: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+    then
+        warn "could not safely parse Incus images across projects; keeping Incus"
+        rm -rf -- "$work"
+        return 0
+    fi
+    while IFS=$'\t' read -r fingerprint project; do
+        [ -n "$fingerprint" ] || continue
+        if ! incus image delete "local:$fingerprint" --project "$project" >/dev/null 2>&1; then
+            warn "could not remove every unused Incus image; keeping Incus packages"
+            rm -rf -- "$work"
+            return 0
+        fi
+    done < "$work/images.tsv"
+    purge_runtime_packages "Incus" \
+        "incus incus-base incus-client incus-ui-canonical incus-extra incus-tools" \
+        "incus.service incus.socket incus-user.service incus-user.socket"
+    rm -rf -- "$work"
+}
+
+cleanup_unused_container_runtimes() {
+    # Rust v2 runs guests with its own namespace supervisor, not Incus or
+    # Podman. Keep lxcfs: Rust guests use its per-instance /proc views.
+    if [ -f /opt/narwhal-agent/config.json ] || [ -f /opt/narwhal-agent/agent.db ] \
+        || [ -f /var/lib/narwhal-agent/agent.db ] \
+        || systemctl is-active --quiet narwhal-agent.service; then
+        log "Go v1 is still installed or active and may need its container backend; keeping Podman/Incus"
+        return 0
+    fi
+    cleanup_unused_podman
+    cleanup_unused_incus
+    log "lxcfs was retained for Rust guests; Docker was not changed"
+}
+
 usage() {
     cat <<'EOF'
 Usage: install.sh [options]
@@ -310,6 +537,7 @@ Usage: install.sh [options]
   --migrate-go            Lossy clean-rebuild migration from a supported Go Podman/Incus node;
                           keeps a rollback snapshot until Rust health and port checks pass
   --cleanup-only          Apply 7-day log retention and prune dangling/unused images, without installing
+  --cleanup-runtimes      With --cleanup-only: remove empty Podman/Incus packages after inventory checks
   --uninstall             Remove the agent; refuses while instances exist
   --purge                 With --uninstall: also delete every instance and all data
   -h, --help              Show this help
@@ -331,6 +559,7 @@ while [ $# -gt 0 ]; do
         --from-dir) FROM_DIR="${2:?--from-dir needs a value}"; shift 2 ;;
         --migrate-go) MIGRATE_GO=1; WITH_RFW=0; shift ;;
         --cleanup-only) CLEANUP_ONLY=1; shift ;;
+        --cleanup-runtimes) CLEANUP_RUNTIMES=1; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
         --purge) PURGE=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -367,6 +596,9 @@ fi
 if [ "$CLEANUP_ONLY" = 1 ] && { [ "$MIGRATE_GO" = 1 ] || [ "$UNINSTALL" = 1 ] \
     || [ "$PURGE" = 1 ] || [ -n "$TOKEN" ] || [ -n "$FROM_DIR" ]; }; then
     die "--cleanup-only cannot be combined with migration, uninstall, token, or local asset options"
+fi
+if [ "$CLEANUP_RUNTIMES" = 1 ] && [ "$CLEANUP_ONLY" != 1 ]; then
+    die "--cleanup-runtimes requires --cleanup-only"
 fi
 
 case "$(uname -m)" in
@@ -592,6 +824,7 @@ kernel=$(uname -r | cut -d- -f1)
 
 if [ "$CLEANUP_ONLY" = 1 ]; then
     maintenance_cleanup || die "maintenance cleanup was incomplete; see warnings above"
+    if [ "$CLEANUP_RUNTIMES" = 1 ]; then cleanup_unused_container_runtimes; fi
     exit 0
 fi
 
@@ -916,6 +1149,7 @@ PY
         [ ! -f /opt/narwhal-agent/narwhal-agent ] || mv /opt/narwhal-agent/narwhal-agent "$MIGRATION_DIR/legacy-agent-original" \
             || warn "could not move the old Go binary"
         log "legacy guest cleanup completed; original config/DB snapshots remain at $MIGRATION_DIR"
+        MIGRATION_CLEANUP_RUNTIMES=1
     else
         warn "Rust migration succeeded, but some old guests could not be removed. The Go service stays disabled and cleanup is pending; inspect $MIGRATION_DIR"
     fi
@@ -923,6 +1157,9 @@ fi
 
 # Keep host and guest logs bounded after the new agent has passed health checks.
 maintenance_cleanup || warn "installation succeeded, but some maintenance cleanup steps failed"
+if [ "$MIGRATION_CLEANUP_RUNTIMES" = 1 ]; then
+    cleanup_unused_container_runtimes
+fi
 
 public_ip=$(curl -4 -fsS --max-time 8 https://api-ipv4.ip.sb/ip 2>/dev/null || echo '<this-host>')
 echo

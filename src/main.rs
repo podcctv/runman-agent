@@ -37,14 +37,18 @@ enum Command {
     SetPassword,
     /// Set the token issued by the platform (restart the agent afterwards).
     SetToken {
-        /// Token from the platform.
-        #[arg(required_unless_present = "clear")]
+        /// Token from the platform (prefer --stdin to avoid exposing it in the process list).
         token: Option<String>,
         /// Remove the token: the agent stops talking to the platform and the
         /// panel manages the node on its own.
-        #[arg(long, conflicts_with = "token")]
+        #[arg(long, conflicts_with_all = ["token", "stdin"])]
         clear: bool,
+        /// Read one token line from stdin.
+        #[arg(long, conflicts_with_all = ["token", "clear"])]
+        stdin: bool,
     },
+    /// Print the configured platform token.
+    ShowToken,
     /// Probe the host and print suggested IPv6 settings for `[network]`.
     DetectIpv6,
     /// Measure the uplink bandwidth now and save it (restart the agent to
@@ -140,12 +144,32 @@ async fn agent_main() -> Result<()> {
             #[cfg(not(target_os = "linux"))]
             anyhow::bail!("Go migration is supported only on Linux");
         }
-        Some(Command::SetToken { token, clear }) => {
+        Some(Command::ShowToken) => {
+            println!("{}", cfg.token);
+            return Ok(());
+        }
+        Some(Command::SetToken { token, clear, stdin }) => {
             let token = if clear {
                 String::new()
+            } else if stdin {
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                let value = line.trim_end_matches(['\r', '\n']).to_owned();
+                anyhow::ensure!(
+                    !value.is_empty(),
+                    "token input was empty; use --clear to remove it"
+                );
+                value
             } else {
-                token.unwrap_or_default()
+                token.ok_or_else(|| anyhow::anyhow!("provide a token, --stdin, or --clear"))?
             };
+            if !clear {
+                anyhow::ensure!(
+                    (16..=512).contains(&token.len())
+                        && token.bytes().all(|byte| (b'!'..=b'~').contains(&byte)),
+                    "token must be 16-512 printable ASCII characters"
+                );
+            }
             store.update(|c| c.token = token.clone())?;
             println!(
                 "{}",
