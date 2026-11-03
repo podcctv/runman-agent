@@ -525,11 +525,7 @@ impl Runtime {
             } else {
                 None
             };
-            let summary = self.summary(
-                &rec,
-                running,
-                &schedule.period(rec.created, now),
-            );
+            let summary = self.summary(&rec, running, &schedule.period(rec.created, now));
             let mut ips = vec![rec.addrs.ipv4.to_string()];
             if let Some(ip) = rec.addrs.ipv6 {
                 ips.push(ip.to_string());
@@ -588,25 +584,65 @@ impl Runtime {
     /// Guest files and addresses are not imported; the caller must keep the Go
     /// installation and its guest data intact until every check succeeds.
     pub async fn import_go_manifest(&self, path: &Path, max_forwards: u32) -> Result<usize> {
-        let raw = std::fs::read(path).with_context(|| format!("read migration manifest {}", path.display()))?;
-        anyhow::ensure!(raw.len() <= 16 * 1024 * 1024, "migration manifest is too large");
-        let manifest: GoMigrationManifest = serde_json::from_slice(&raw).context("parse Go migration manifest")?;
-        anyhow::ensure!(manifest.schema == 1, "unsupported Go migration manifest schema");
-        anyhow::ensure!(matches!(manifest.source_backend.as_str(), "podman" | "incus"), "unsupported source backend");
-        anyhow::ensure!(!manifest.instances.is_empty(), "migration manifest contains no instances");
-        anyhow::ensure!(manifest.instances.len() <= 4096, "migration instance count exceeds 4096");
-        anyhow::ensure!(manifest.port_forwards.len() <= 65535, "too many port forwards in migration manifest");
+        let raw = std::fs::read(path)
+            .with_context(|| format!("read migration manifest {}", path.display()))?;
+        anyhow::ensure!(
+            raw.len() <= 16 * 1024 * 1024,
+            "migration manifest is too large"
+        );
+        let manifest: GoMigrationManifest =
+            serde_json::from_slice(&raw).context("parse Go migration manifest")?;
+        anyhow::ensure!(
+            manifest.schema == 1,
+            "unsupported Go migration manifest schema"
+        );
+        anyhow::ensure!(
+            matches!(manifest.source_backend.as_str(), "podman" | "incus"),
+            "unsupported source backend"
+        );
+        anyhow::ensure!(
+            !manifest.instances.is_empty(),
+            "migration manifest contains no instances"
+        );
+        anyhow::ensure!(
+            manifest.instances.len() <= 4096,
+            "migration instance count exceeds 4096"
+        );
+        anyhow::ensure!(
+            manifest.port_forwards.len() <= 65535,
+            "too many port forwards in migration manifest"
+        );
 
         let mut ids = HashSet::new();
         let mut instance_specs = Vec::with_capacity(manifest.instances.len());
         for item in &manifest.instances {
             let id = VmId::parse(&item.vm_id)?;
             anyhow::ensure!(ids.insert(id.to_string()), "duplicate VM ID {}", item.vm_id);
-            anyhow::ensure!(matches!(item.os_image.as_str(), "alpine" | "debian"), "unsupported migration image {:?}", item.os_image);
-            anyhow::ensure!((1..=256).contains(&item.cpu), "CPU count is out of range for {}", item.vm_id);
-            anyhow::ensure!((128..=1_048_576).contains(&item.ram_mb), "memory is out of range for {}", item.vm_id);
-            anyhow::ensure!((1..=65_536).contains(&item.disk_gb), "disk size is out of range for {}", item.vm_id);
-            anyhow::ensure!(item.bandwidth_mbps <= 10_000_000, "bandwidth is out of range for {}", item.vm_id);
+            anyhow::ensure!(
+                matches!(item.os_image.as_str(), "alpine" | "debian"),
+                "unsupported migration image {:?}",
+                item.os_image
+            );
+            anyhow::ensure!(
+                (1..=256).contains(&item.cpu),
+                "CPU count is out of range for {}",
+                item.vm_id
+            );
+            anyhow::ensure!(
+                (128..=1_048_576).contains(&item.ram_mb),
+                "memory is out of range for {}",
+                item.vm_id
+            );
+            anyhow::ensure!(
+                (1..=65_536).contains(&item.disk_gb),
+                "disk size is out of range for {}",
+                item.vm_id
+            );
+            anyhow::ensure!(
+                item.bandwidth_mbps <= 10_000_000,
+                "bandwidth is out of range for {}",
+                item.vm_id
+            );
             crate::model::validate_password(&item.root_password)?;
             instance_specs.push((
                 id,
@@ -627,18 +663,35 @@ impl Runtime {
         let mut forward_counts: HashMap<&str, u32> = HashMap::new();
         let mut forwards = Vec::with_capacity(manifest.port_forwards.len());
         for item in &manifest.port_forwards {
-            anyhow::ensure!(ids.contains(&item.vm_id), "port forward references unknown VM {}", item.vm_id);
-            anyhow::ensure!(item.host_port != 0 && item.guest_port != 0, "port forward has a zero port");
+            anyhow::ensure!(
+                ids.contains(&item.vm_id),
+                "port forward references unknown VM {}",
+                item.vm_id
+            );
+            anyhow::ensure!(
+                item.host_port != 0 && item.guest_port != 0,
+                "port forward has a zero port"
+            );
             let proto = match item.protocol.as_str() {
                 "tcp" => crate::model::L4Proto::Tcp,
                 "udp" => crate::model::L4Proto::Udp,
                 _ => anyhow::bail!("unsupported port-forward protocol {:?}", item.protocol),
             };
-            anyhow::ensure!(host_ports.insert((proto, item.host_port)), "duplicate host port {}/{}", item.host_port, item.protocol);
+            anyhow::ensure!(
+                host_ports.insert((proto, item.host_port)),
+                "duplicate host port {}/{}",
+                item.host_port,
+                item.protocol
+            );
             let count = forward_counts.entry(item.vm_id.as_str()).or_default();
             *count += 1;
             if max_forwards > 0 {
-                anyhow::ensure!(*count <= max_forwards, "VM {} exceeds the preserved port-forward limit {}", item.vm_id, max_forwards);
+                anyhow::ensure!(
+                    *count <= max_forwards,
+                    "VM {} exceeds the preserved port-forward limit {}",
+                    item.vm_id,
+                    max_forwards
+                );
             }
             forwards.push(crate::model::PortForward {
                 vm_id: VmId::parse(&item.vm_id)?,
@@ -650,13 +703,19 @@ impl Runtime {
         }
 
         for (id, spec, was_running) in instance_specs {
-            crate::backend::Instances::create(self, &spec).await.with_context(|| format!("rebuild Go VM {id}"))?;
+            crate::backend::Instances::create(self, &spec)
+                .await
+                .with_context(|| format!("rebuild Go VM {id}"))?;
             if !was_running {
-                crate::backend::Instances::stop(self, &id, true).await.with_context(|| format!("restore stopped state for {id}"))?;
+                crate::backend::Instances::stop(self, &id, true)
+                    .await
+                    .with_context(|| format!("restore stopped state for {id}"))?;
             }
         }
         for forward in forwards {
-            crate::backend::PortForwards::add(self, forward).await.context("restore port forward")?;
+            crate::backend::PortForwards::add(self, forward)
+                .await
+                .context("restore port forward")?;
         }
         Ok(ids.len())
     }

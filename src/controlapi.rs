@@ -128,7 +128,9 @@ where
     if request.method == "GET" && path == "/v1/inventory" {
         return match inventory().await {
             Ok(report) => respond_json(&mut stream, 200, &report).await,
-            Err(e) => respond_error(&mut stream, 503, &format!("inventory unavailable: {e:#}")).await,
+            Err(e) => {
+                respond_error(&mut stream, 503, &format!("inventory unavailable: {e:#}")).await
+            }
         };
     }
     if request.method == "GET" && path == "/v1/connlimit/target" {
@@ -169,7 +171,11 @@ where
                 let item = report
                     .get("items")
                     .and_then(Value::as_array)
-                    .and_then(|items| items.iter().find(|item| item.get("id").and_then(Value::as_str) == Some(id.as_str())));
+                    .and_then(|items| {
+                        items.iter().find(|item| {
+                            item.get("id").and_then(Value::as_str) == Some(id.as_str())
+                        })
+                    });
                 let metrics = item
                     .and_then(|item| item.get("connection_metrics"))
                     .cloned()
@@ -352,9 +358,7 @@ async fn handle_firewall(
         // The Watcher capability probe intentionally GETs this known path:
         // Go's ServeMux returns 405 for the existing POST route, while 404
         // means the Runman firewall control API is not installed.
-        ("GET", "/v1/firewall/policy") => {
-            respond_error(&mut stream, 405, "POST required").await
-        }
+        ("GET", "/v1/firewall/policy") => respond_error(&mut stream, 405, "POST required").await,
         ("POST", "/v1/firewall/policy") => {
             if request.body.len() > MAX_BODY {
                 return respond_error(&mut stream, 400, "invalid or oversized policy request")

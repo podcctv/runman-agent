@@ -123,7 +123,10 @@ async fn agent_main() -> Result<()> {
         Some(Command::ImportGoManifest { manifest }) => {
             #[cfg(target_os = "linux")]
             {
-                anyhow::ensure!(cfg.backend == BackendKind::Container, "Go migration requires the container backend");
+                anyhow::ensure!(
+                    cfg.backend == BackendKind::Container,
+                    "Go migration requires the container backend"
+                );
                 let runtime = Runtime::new(Options::from_config(&cfg))?.with_config(store.clone());
                 runtime.init().await?;
                 runtime.refresh_images().await;
@@ -284,13 +287,17 @@ async fn agent_main() -> Result<()> {
         let target_runtime = runtime.clone();
         let inventory_runtime = runtime.clone();
         tokio::spawn(async move {
-            if let Err(e) = runman_agent::controlapi::serve_connlimit(connlimit, move |id| {
-                let runtime = target_runtime.clone();
-                async move { runtime.connlimit_target(&id).await }
-            }, move || {
-                let runtime = inventory_runtime.clone();
-                async move { runtime.watcher_inventory().await }
-            })
+            if let Err(e) = runman_agent::controlapi::serve_connlimit(
+                connlimit,
+                move |id| {
+                    let runtime = target_runtime.clone();
+                    async move { runtime.connlimit_target(&id).await }
+                },
+                move || {
+                    let runtime = inventory_runtime.clone();
+                    async move { runtime.watcher_inventory().await }
+                },
+            )
             .await
             {
                 tracing::error!("connection-limit control socket: {e:#}");
