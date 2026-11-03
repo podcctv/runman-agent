@@ -104,7 +104,10 @@ def live_state(backend, name):
         fail(f"Incus did not return one unambiguous instance state for {name}")
     status = rows[0][1].strip().lower()
     if status not in {"running", "stopped"}:
-        fail(f"unsupported Incus status {status!r} for {name}")
+        fail(
+            f"Incus instance {name} is in {status.upper()} state; "
+            "migration supports only Running or Stopped instances"
+        )
     if status == "stopped":
         return False
     try:
