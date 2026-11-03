@@ -44,6 +44,10 @@ MIGRATION_GO_WAS_ACTIVE=0
 MIGRATION_GO_WAS_ENABLED=0
 MIGRATION_LXCFS_WAS_ACTIVE=0
 MIGRATION_LXCFS_WAS_ENABLED=0
+MIGRATION_MODULES_CONFIG_TOUCHED=0
+MIGRATION_SYSCTL_CONFIG_TOUCHED=0
+MIGRATION_LXCFS_CONFIG_TOUCHED=0
+MIGRATION_LXCFS_STATE_TOUCHED=0
 WORK=""
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -91,22 +95,43 @@ migration_rollback() {
     rm -rf -- "$CONFIG_DIR" "$DATA_DIR" /run/runman-agent
     rm -f /run/narwhal-agent/connlimit.sock /run/narwhal-agent/firewall.sock
     rmdir /run/narwhal-agent >/dev/null 2>&1 || true
-    migration_restore_file /etc/modules-load.d/runman.conf || failed=1
-    migration_restore_file /etc/sysctl.d/90-runman.conf || failed=1
-    migration_restore_file /etc/systemd/system/lxcfs.service.d/runman.conf || failed=1
-    systemctl daemon-reload >/dev/null 2>&1 || failed=1
-    sysctl --system >/dev/null 2>&1 || true
-    # Restore lxcfs before restarting the old guests so they mount its views
-    # with the original service configuration.
-    if [ "$MIGRATION_LXCFS_WAS_ACTIVE" = 1 ]; then
-        systemctl restart lxcfs.service >/dev/null 2>&1 || failed=1
-    else
-        systemctl stop lxcfs.service >/dev/null 2>&1 || true
+    if [ "$MIGRATION_MODULES_CONFIG_TOUCHED" = 1 ]; then
+        migration_restore_file /etc/modules-load.d/runman.conf || failed=1
     fi
-    if [ "$MIGRATION_LXCFS_WAS_ENABLED" = 1 ]; then
-        systemctl enable lxcfs.service >/dev/null 2>&1 || failed=1
-    else
-        systemctl disable lxcfs.service >/dev/null 2>&1 || true
+    if [ "$MIGRATION_SYSCTL_CONFIG_TOUCHED" = 1 ]; then
+        migration_restore_file /etc/sysctl.d/90-runman.conf || failed=1
+    fi
+    if [ "$MIGRATION_LXCFS_CONFIG_TOUCHED" = 1 ]; then
+        migration_restore_file /etc/systemd/system/lxcfs.service.d/runman.conf || failed=1
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || failed=1
+    if [ "$MIGRATION_SYSCTL_CONFIG_TOUCHED" = 1 ]; then
+        sysctl --system >/dev/null 2>&1 || true
+    fi
+
+    if [ "$MIGRATION_LXCFS_CONFIG_TOUCHED" = 1 ] || [ "$MIGRATION_LXCFS_STATE_TOUCHED" = 1 ]; then
+        local lxcfs_active_now=0 lxcfs_enabled_now=0
+        if systemctl is-active --quiet lxcfs.service; then lxcfs_active_now=1; fi
+        if systemctl is-enabled --quiet lxcfs.service; then lxcfs_enabled_now=1; fi
+
+        # Restore lxcfs configuration only when this installer changed it.
+        # If the service was already in its original state, avoid restarting
+        # it during an early rollback (which detaches its /proc views).
+        if [ "$MIGRATION_LXCFS_WAS_ACTIVE" = 1 ]; then
+            if [ "$lxcfs_active_now" = 0 ]; then
+                systemctl start lxcfs.service >/dev/null 2>&1 || failed=1
+            elif [ "$MIGRATION_LXCFS_CONFIG_TOUCHED" = 1 ]; then
+                systemctl restart lxcfs.service >/dev/null 2>&1 || failed=1
+            fi
+        elif [ "$lxcfs_active_now" = 1 ]; then
+            systemctl stop lxcfs.service >/dev/null 2>&1 || failed=1
+        fi
+
+        if [ "$MIGRATION_LXCFS_WAS_ENABLED" = 1 ]; then
+            [ "$lxcfs_enabled_now" = 1 ] || systemctl enable lxcfs.service >/dev/null 2>&1 || failed=1
+        elif [ "$lxcfs_enabled_now" = 1 ]; then
+            systemctl disable lxcfs.service >/dev/null 2>&1 || failed=1
+        fi
     fi
     if [ -x "$MIGRATION_HELPER" ] && [ -f "$MIGRATION_DIR/legacy-state.json" ]; then
         "$MIGRATION_HELPER" lifecycle start --backend "$MIGRATION_BACKEND" \
@@ -879,18 +904,21 @@ log "installing packages"
 # Wait for other apt/dpkg runs (e.g. unattended-upgrades) instead of killing them.
 apt_get() { LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 -y -q "$@"; }
 apt_get update >/dev/null
+if [ "$MIGRATION_ACTIVE" = 1 ]; then MIGRATION_LXCFS_STATE_TOUCHED=1; fi
 apt_get install --no-install-recommends \
     ca-certificates curl iproute2 iptables nftables wireguard-tools e2fsprogs tar gzip zstd util-linux kmod lxcfs >/dev/null
 
 for mod in wireguard ifb sch_cake tcp_bbr; do
     modprobe "$mod" 2>/dev/null || warn "kernel module $mod is unavailable; related features will fail"
 done
+if [ "$MIGRATION_ACTIVE" = 1 ]; then MIGRATION_MODULES_CONFIG_TOUCHED=1; fi
 printf '%s\n' wireguard ifb sch_cake tcp_bbr > /etc/modules-load.d/runman.conf
 
 log "tuning kernel limits"
 # Each instance runs a full init. Their inotify instances, keys and neighbour
 # entries add up on the host (inotify instances of all instances count against
 # one host user: the default of 128 runs out after a handful of instances).
+if [ "$MIGRATION_ACTIVE" = 1 ]; then MIGRATION_SYSCTL_CONFIG_TOUCHED=1; fi
 cat > /etc/sysctl.d/90-runman.conf <<'SYSCTL'
 # Written by the runman installer.
 fs.inotify.max_user_instances = 65536
@@ -912,6 +940,7 @@ sysctl -q -p /etc/sysctl.d/90-runman.conf || warn "some kernel settings could no
 lxcfs_dropin=/etc/systemd/system/lxcfs.service.d/runman.conf
 lxcfs_conf=$(printf '[Service]\nExecStart=\nExecStart=/usr/bin/lxcfs --enable-cfs -l /var/lib/lxcfs')
 if [ "$(cat "$lxcfs_dropin" 2>/dev/null)" != "$lxcfs_conf" ]; then
+    if [ "$MIGRATION_ACTIVE" = 1 ]; then MIGRATION_LXCFS_CONFIG_TOUCHED=1; fi
     install -d /etc/systemd/system/lxcfs.service.d
     printf '%s\n' "$lxcfs_conf" > "$lxcfs_dropin"
     systemctl daemon-reload
