@@ -148,7 +148,11 @@ async fn agent_main() -> Result<()> {
             println!("{}", cfg.token);
             return Ok(());
         }
-        Some(Command::SetToken { token, clear, stdin }) => {
+        Some(Command::SetToken {
+            token,
+            clear,
+            stdin,
+        }) => {
             let token = if clear {
                 String::new()
             } else if stdin {
