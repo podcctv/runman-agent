@@ -112,7 +112,7 @@ PY
     while IFS=$'\t' read -r name fallback_status fallback_pid last_power; do
         [ -n "$name" ] || continue
         found=1
-        [ -n "$last_power" ] || last_power=unset
+        [ -n "$last_power" ] || last_power='unset'
         printf '\nIncus reports %s as %s with init PID %s; its guest filesystem will be rebuilt.\n' \
             "$name" "${fallback_status^^}" "$fallback_pid"
         printf 'Incus volatile.last_state.power is %s and may be stale.\n' "${last_power^^}"
