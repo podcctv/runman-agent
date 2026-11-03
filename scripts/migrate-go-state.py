@@ -2,6 +2,8 @@
 """Export and manage the deliberately limited Go -> Rust clean-rebuild migration."""
 
 import argparse
+import csv
+import io
 import ipaddress
 import itertools
 import json
@@ -91,14 +93,27 @@ def live_state(backend, name):
         if result not in {"true", "false"}:
             fail(f"Podman returned an unrecognized state for {name}")
         return result == "true"
-    result = checked_run(["incus", "info", name])
-    match = re.search(r"(?m)^Status:\s*(\S+)", result)
-    if not match:
-        fail(f"Incus did not report an instance status for {name}")
-    status = match.group(1).lower()
+    result = checked_run(
+        ["incus", "list", "--format", "csv,noheader", "--columns", "n,s,p", name]
+    )
+    try:
+        rows = list(csv.reader(io.StringIO(result)))
+    except csv.Error as exc:
+        fail(f"Incus returned invalid state data for {name}: {exc}")
+    if len(rows) != 1 or len(rows[0]) != 3 or rows[0][0] != name:
+        fail(f"Incus did not return one unambiguous instance state for {name}")
+    status = rows[0][1].strip().lower()
     if status not in {"running", "stopped"}:
         fail(f"unsupported Incus status {status!r} for {name}")
-    return status == "running"
+    if status == "stopped":
+        return False
+    try:
+        init_pid = int(rows[0][2])
+    except ValueError:
+        fail(f"Incus reports {name} as Running but returned an invalid init PID")
+    if init_pid <= 1:
+        fail(f"Incus reports {name} as Running with invalid init PID {init_pid}")
+    return True
 
 
 def backend_inventory(backend):

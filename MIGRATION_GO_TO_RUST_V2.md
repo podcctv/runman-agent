@@ -15,6 +15,9 @@ After confirmation it stops Go, takes a final config/database/live-state
 snapshot, then gracefully stops the old guests. Incus gets up to 120 seconds
 per guest to shut down cleanly; the installer never force-stops a guest after a
 timeout.
+Before each Incus stop, the helper also checks the reported state and init PID.
+If Incus reports `Running` with an invalid PID, migration aborts and keeps the
+old guests for manual inspection.
 
 The verified, read-only migration diagnostic is also saved in the root-only
 snapshot. If rollback cannot confirm every guest, the installer prints the
