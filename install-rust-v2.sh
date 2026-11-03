@@ -297,7 +297,9 @@ podman_rootless_state_present() {
         return 0
     fi
     while IFS=: read -r username _ _ _ _ home _; do
-        [ -n "$home" ] && [ "$home" != /nonexistent ] || continue
+        if [ -z "$home" ] || [ "$home" = /nonexistent ]; then
+            continue
+        fi
         if [ -d "$home/.local/share/containers/storage" ] \
             || [ -f "$home/.config/containers/storage.conf" ]; then
             log "Podman rootless storage/config exists for $username; keeping Podman and its data"
