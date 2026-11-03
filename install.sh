@@ -14,6 +14,9 @@ AGENT_CONFIG_DIR="/opt/narwhal-agent"
 AGENT_CONFIG_FILE="$AGENT_CONFIG_DIR/config.json"
 AGENT_DB="$AGENT_CONFIG_DIR/agent.db"
 AGENT_WEB_PORT="8792"
+RUST_AGENT_BINARY="/usr/local/bin/runman-agent"
+RUST_AGENT_CONFIG_FILE="/etc/runman-agent/config.toml"
+RUST_AGENT_SERVICE="runman-agent"
 RFW_BIN_DIR="$AGENT_BIN_DIR"   # rfw 与 agent 放在同一目录，匹配面板 rfwBinaryPath()
 RFW_API_ADDR="127.0.0.1:7734"  # rfw 仅监听本地，由 agent 面板反代
 PODMAN_NETWORK="narwhal-net"
@@ -410,8 +413,14 @@ VIRT_TYPE_REQUESTED="${VIRT_TYPE_REQUESTED:-}"
 NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
 ORIGINAL_ARGC=$#
 FORCE_MENU=0
+MENU_VERSION="main"
 UPDATE_ONLY=0
 RUST_V2_MIGRATION=0
+RUST_ACTION=""
+RUST_PURGE_CONFIRMED=0
+RUST_CLEANUP_RUNTIMES=0
+GO_RUNTIME_CLEANUP=0
+RUST_NONACTION_ARGS=0
 UPDATE_NETWORK_REQUESTED=0
 GUIDED_INSTALL=0
 PURGE_INCUS="${PURGE_INCUS:-0}"
@@ -433,9 +442,26 @@ show_help() {
 Runman Agent installer
 
   bash install.sh                         Guided menu
+  bash install.sh --go-menu               Open the Go v1 menu directly
+  bash install.sh --rust-menu             Open the Rust v2 menu directly
+  bash install.sh --cleanup               Run host log and unused-image cleanup (7-day retention)
+  bash install.sh --cleanup --cleanup-runtimes
+                                          Also remove empty Podman/Incus packages
   bash install.sh --virt incus            Install/update Incus backend
   bash install.sh --update-only           Back up and update Agent only; require an existing installation
   bash install.sh --migrate-rust-v2       Lossy clean rebuild from Go Podman/Incus to Rust v2
+  bash install.sh --rust-update           Install/update Rust v2
+  bash install.sh --rust-status           Show Rust v2 service/version status
+  bash install.sh --rust-restart-agent    Restart Rust Agent and installed RFW
+  bash install.sh --rust-reset-panel-password
+                                          Reset the Rust panel password interactively
+  bash install.sh --rust-show-token       Print the Rust platform token
+  bash install.sh --rust-set-token        Set a platform-issued Rust token securely
+  bash install.sh --rust-detect-ipv6      Use Rust CLI to detect IPv6 settings
+  bash install.sh --rust-speedtest        Measure Rust host uplink bandwidth
+  bash install.sh --rust-cleanup          Run Rust 7-day host/image cleanup, when supported
+  bash install.sh --rust-uninstall        Remove Rust agent while preserving instance data
+  bash install.sh --rust-purge            Remove Rust agent and all Rust instance data
   bash install.sh --detect-ipv6            Detect native/tunnel IPv6 and routed prefix
   bash install.sh --validate-ipv6 ...      Validate manually supplied IPv6 values
   bash install.sh --show-token             Print current integration Token
@@ -625,9 +651,203 @@ reset_panel_password() (
     log "$(t "Panel password reset; Agent restarted." "面板密码已重置，Agent 已重启。")"
 )
 
-run_rust_v2_migration() (
+go_installation_present() {
+    [ -x "$AGENT_BINARY" ] && [ -f "$AGENT_CONFIG_FILE" ]
+}
+
+rust_installation_present() {
+    [ -x "$RUST_AGENT_BINARY" ] && [ -f "$RUST_AGENT_CONFIG_FILE" ]
+}
+
+detected_agent_version() {
+    local go=0 rust=0 go_active=0 rust_active=0
+    go_installation_present && go=1
+    rust_installation_present && rust=1
+    systemctl is-active --quiet "$RUST_AGENT_SERVICE" 2>/dev/null && rust_active=1
+    systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null && go_active=1
+    if [ "$go" = 1 ] && [ "$rust" = 1 ]; then
+        if [ "$go_active" = 1 ] && [ "$rust_active" = 1 ]; then
+            printf '%s' "Go v1 + Rust v2 (both active)"
+        elif [ "$go_active" = 1 ]; then
+            printf '%s' "Go v1 active + Rust v2 stopped"
+        elif [ "$rust_active" = 1 ]; then
+            printf '%s' "Go v1 stopped + Rust v2 active"
+        else
+            printf '%s' "Go v1 + Rust v2 (both stopped)"
+        fi
+    elif [ "$rust_active" = 1 ]; then
+        printf '%s' "Rust v2 (active)"
+    elif [ "$go_active" = 1 ]; then
+        printf '%s' "Go v1 (active)"
+    elif [ "$rust" = 1 ]; then
+        printf '%s' "Rust v2 (stopped)"
+    elif [ "$go" = 1 ]; then
+        printf '%s' "Go v1 (stopped)"
+    else
+        printf '%s' "none"
+    fi
+}
+
+require_rust_agent() {
+    rust_installation_present || die "Rust v2 is not installed; use the Rust v2 menu to install or migrate first."
+}
+
+set_rust_action() {
+    [ -z "$RUST_ACTION" ] || die "Choose only one Rust action per installer invocation."
+    RUST_ACTION="$1"
+}
+
+rust_command_supported() {
+    rust_installation_present && "$RUST_AGENT_BINARY" "$1" --help >/dev/null 2>&1
+}
+
+require_rust_command() {
+    rust_command_supported "$1" \
+        || die "Installed Rust Agent does not support '$1'; update Rust v2 first."
+}
+
+rust_show_token_supported() {
+    rust_command_supported show-token
+}
+
+rust_set_token_supported() {
+    rust_installation_present \
+        && "$RUST_AGENT_BINARY" set-token --help 2>&1 | grep -q -- '--stdin'
+}
+
+show_rust_status() {
+    local state version web_listen rfw_state
+    state=$(systemctl is-active "$RUST_AGENT_SERVICE" 2>/dev/null || echo inactive)
+    rfw_state=$(systemctl is-active rfw.service 2>/dev/null || echo not-installed)
+    if rust_installation_present; then
+        version=$("$RUST_AGENT_BINARY" --version 2>/dev/null || echo unknown)
+        web_listen=$(sed -n 's/^[[:space:]]*web_listen[[:space:]]*=[[:space:]]*//p' "$RUST_AGENT_CONFIG_FILE" | head -n1)
+        printf '%s\n' \
+            "AGENT_VERSION=Rust v2" \
+            "AGENT_BINARY=$version" \
+            "AGENT_SERVICE=$state" \
+            "RFW_SERVICE=$rfw_state" \
+            "PANEL_LISTEN=${web_listen:-<disabled or unspecified>}"
+    else
+        printf '%s\n' \
+            "AGENT_VERSION=Rust v2 (not installed)" \
+            "AGENT_SERVICE=$state" \
+            "RFW_SERVICE=$rfw_state"
+    fi
+}
+
+restart_rust_agent() {
+    require_rust_agent
+    systemctl restart "$RUST_AGENT_SERVICE.service" \
+        || die "Rust Agent restart failed; inspect: journalctl -u $RUST_AGENT_SERVICE"
+    if [ -x /usr/local/bin/rfw ] && systemctl cat rfw.service >/dev/null 2>&1; then
+        systemctl restart rfw.service \
+            || die "Rust Agent restarted, but RFW restart failed; inspect: journalctl -u rfw"
+    fi
+    log "Rust Agent services restarted."
+    show_rust_status
+}
+
+reset_rust_panel_password() (
+    require_rust_agent
+    require_rust_command set-password
+    [ "$NON_INTERACTIVE" != "1" ] \
+        || die "Rust panel password reset requires an interactive terminal."
+    local panel_tty panel_tty_state first second
+    if ! { exec {panel_tty}<>/dev/tty; } 2>/dev/null; then
+        die "Rust panel password reset requires an interactive terminal."
+    fi
+    panel_tty_state=$(stty -g <&"$panel_tty") \
+        || die "Cannot read terminal settings; password unchanged."
+    stty -echo <&"$panel_tty" \
+        || die "Cannot disable terminal echo; password unchanged."
+    trap 'stty "$panel_tty_state" <&"$panel_tty" 2>/dev/null || true; exec {panel_tty}>&-; unset first second' EXIT HUP INT TERM
+    while true; do
+        read_panel_secret first "$(t "New Rust panel password (at least 8 characters; Ctrl+C cancels): " "新的 Rust 面板密码（至少 8 个字符；Ctrl+C 取消）: ")"
+        if [ "${#first}" -lt 8 ]; then
+            log "Password must contain at least 8 characters. Please try again."
+            continue
+        fi
+        while true; do
+            read_panel_secret second "$(t "Confirm new password: " "再次输入新密码: ")"
+            [ -n "$second" ] && break
+            log "Confirmation is empty. Please enter the password again."
+        done
+        if [ "$first" != "$second" ]; then
+            log "Passwords do not match. Please enter both passwords again."
+            continue
+        fi
+        break
+    done
+    if ! printf '%s\n' "$first" | "$RUST_AGENT_BINARY" --config "$RUST_AGENT_CONFIG_FILE" set-password >/dev/null; then
+        unset first second
+        die "Failed to save the Rust panel password; Agent was not restarted."
+    fi
+    unset first second
+    systemctl restart "$RUST_AGENT_SERVICE.service" \
+        || die "Password saved, but Rust Agent restart failed."
+    log "Rust panel password reset; Rust Agent restarted."
+)
+
+show_rust_token() {
+    require_rust_agent
+    rust_show_token_supported \
+        || die "Installed Rust Agent lacks safe token display; update it to a release with show-token support first."
+    "$RUST_AGENT_BINARY" --config "$RUST_AGENT_CONFIG_FILE" show-token
+}
+
+set_rust_token() (
+    require_rust_agent
+    rust_set_token_supported \
+        || die "Installed Rust Agent lacks safe set-token --stdin support; update Rust v2 first."
+    [ "$NON_INTERACTIVE" != "1" ] \
+        || die "Setting the Rust platform token requires an interactive terminal."
+    local panel_tty panel_tty_state first second
+    if ! { exec {panel_tty}<>/dev/tty; } 2>/dev/null; then
+        die "Setting the Rust platform token requires an interactive terminal."
+    fi
+    panel_tty_state=$(stty -g <&"$panel_tty") \
+        || die "Cannot read terminal settings; token unchanged."
+    stty -echo <&"$panel_tty" \
+        || die "Cannot disable terminal echo; token unchanged."
+    trap 'stty "$panel_tty_state" <&"$panel_tty" 2>/dev/null || true; exec {panel_tty}>&-; unset first second' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' HUP TERM
+    while true; do
+        read_panel_secret first "$(t "Paste the token issued by the platform (input hidden): " "粘贴平台签发的 Token（输入隐藏）: ")"
+        [ -n "$first" ] || { log "Token is empty; please try again."; continue; }
+        read_panel_secret second "$(t "Confirm platform token: " "再次输入平台 Token: ")"
+        if [ "$first" = "$second" ]; then break; fi
+        log "Tokens do not match; please enter both values again."
+    done
+    if ! printf '%s\n' "$first" | "$RUST_AGENT_BINARY" --config "$RUST_AGENT_CONFIG_FILE" set-token --stdin >/dev/null; then
+        unset first second
+        die "Rust platform token was not changed."
+    fi
+    unset first second
+    systemctl restart "$RUST_AGENT_SERVICE.service" \
+        || die "Platform token was saved, but Rust Agent restart failed."
+    log "Platform-issued Rust token saved; Agent restarted."
+)
+run_rust_speedtest() {
+    require_rust_agent
+    require_rust_command speedtest
+    "$RUST_AGENT_BINARY" --config "$RUST_AGENT_CONFIG_FILE" speedtest
+    if [ "$NON_INTERACTIVE" != "1" ] && [ -t 0 ]; then
+        local answer
+        read -rp "Restart Rust Agent now to report the measured bandwidth? [y/N] " answer
+        case "${answer,,}" in
+            y|yes) systemctl restart "$RUST_AGENT_SERVICE.service" ;;
+            *) log "Measurement saved; restart Rust Agent later to report it." ;;
+        esac
+    else
+        log "Measurement saved; restart Rust Agent later to report it."
+    fi
+}
+
+run_rust_v2_installer() (
     set -euo pipefail
-    local release work
+    local release work arg
     release="${RUNMAN_RUST_V2_RELEASE_URL:-https://github.com/podcctv/runman-agent/releases/download/continuous-rs}"
     work=$(mktemp -d)
     trap 'rm -rf -- "$work"' EXIT
@@ -635,50 +855,244 @@ run_rust_v2_migration() (
     curl -fsSL --retry 3 --connect-timeout 20 -o "$work/install.sh" "$release/install.sh"
     [ "$(grep -Ec '  \*?install\.sh$' "$work/SHA256SUMS")" = 1 ] || die "Rust release checksum list is invalid"
     (cd "$work" && grep -E '  \*?install\.sh$' SHA256SUMS | sha256sum -c --quiet -) || die "Rust installer checksum mismatch"
-    bash "$work/install.sh" --migrate-go
+    for arg in "$@"; do
+        if [ "$arg" = "--cleanup-only" ] && ! grep -q -- '--cleanup-only' "$work/install.sh"; then
+            die "This Rust v2 release does not yet provide cleanup-only; update the Rust installer release first."
+        fi
+        if [ "$arg" = "--cleanup-runtimes" ] && ! grep -q -- '--cleanup-runtimes' "$work/install.sh"; then
+            die "This Rust v2 release does not yet provide safe empty-runtime cleanup; update the Rust installer release first."
+        fi
+    done
+    bash "$work/install.sh" "$@"
 )
 
+run_go_runtime_cleanup() (
+    set -euo pipefail
+    local release work answer go_present=0
+    [ "$(id -u)" = "0" ] || die "清理 Podman/Incus 运行时需要 root 权限。"
+    [ "$NON_INTERACTIVE" != "1" ] && [ -t 0 ] \
+        || die "该操作会卸载 Go Agent，必须从交互终端执行。"
+    if go_installation_present; then
+        go_present=1
+        rust_installation_present \
+            && die "Go 与 Rust v2 同时安装时不自动卸载 Go，以免影响共享网络配置。"
+    elif [ -e "$AGENT_CONFIG_FILE" ] || [ -x "$AGENT_BINARY" ] \
+        || systemctl is-active --quiet "$AGENT_SERVICE.service"; then
+        die "检测到不完整或仍运行的 Go 安装；请先修复或单独卸载 Agent。"
+    fi
+
+    # Verify the remote cleanup capability before uninstalling Go, so an older
+    # Rust release cannot leave the user with Go removed but no cleanup action.
+    release="${RUNMAN_RUST_V2_RELEASE_URL:-https://github.com/podcctv/runman-agent/releases/download/continuous-rs}"
+    work=$(mktemp -d)
+    trap 'rm -rf -- "$work"' EXIT
+    curl -fsSL --retry 3 --connect-timeout 20 -o "$work/SHA256SUMS" "$release/SHA256SUMS"
+    curl -fsSL --retry 3 --connect-timeout 20 -o "$work/install.sh" "$release/install.sh"
+    [ "$(grep -Ec '  \*?install\.sh$' "$work/SHA256SUMS")" = 1 ] \
+        || die "Rust 清理脚本校验清单无效。"
+    (cd "$work" && grep -E '  \*?install\.sh$' SHA256SUMS | sha256sum -c --quiet -) \
+        || die "Rust 清理脚本校验失败。"
+    grep -q -- '--cleanup-only' "$work/install.sh" \
+        && grep -q -- '--cleanup-runtimes' "$work/install.sh" \
+        || die "Rust 发布版尚不支持安全的 Podman/Incus 清理；Go Agent 未卸载。"
+
+    if [ "$go_present" = "1" ]; then
+        printf '\n此操作会卸载 Go Agent；不会主动删除容器。只有确认没有容器、Pod、数据卷及 rootless 数据时才移除 Podman/Incus 服务。Docker 不会修改。\n'
+    else
+        printf '\n未检测到 Go Agent；仅在确认没有容器、Pod、数据卷及 rootless 数据时移除 Podman/Incus 服务。Docker 不会修改。\n'
+    fi
+    read -r -p '输入“确认卸载 Go 并清理空运行时”继续: ' answer
+    [ "$answer" = "确认卸载 Go 并清理空运行时" ] \
+        || die "已取消；未卸载 Go Agent。"
+    if [ "$go_present" = "1" ]; then
+        do_uninstall
+    fi
+    bash "$work/install.sh" --cleanup-only --cleanup-runtimes
+)
+
+run_rust_v2_migration() { run_rust_v2_installer --migrate-go; }
+
+go_menu_require_agent() {
+    if ! go_installation_present; then
+        log "Go v1 is not installed; use the Rust v2 menu or install Go first."
+        return 1
+    fi
+    if rust_installation_present; then
+        log "Both versions are configured. Go host-changing actions are blocked to avoid changing Rust networking."
+        return 1
+    fi
+    return 0
+}
+
+show_go_menu() {
+    local choice
+    while true; do
+        printf '\n%s\n' "$(t "Go v1 operations" "Go v1 功能")"
+        printf '  1) %s\n' "$(t "Install/update Go Agent (guided network setup)" "安装/更新 Go Agent（网络引导配置）")"
+        printf '  2) %s\n' "$(t "Show Go installation/service status" "查看 Go 安装/服务状态")"
+        printf '  3) %s\n' "$(t "Repair Go networking and restart Agent/RFW" "修复 Go 网络并重启 Agent/RFW")"
+        printf '  4) %s\n' "$(t "Reset Go Web panel password" "重置 Go Web 面板密码")"
+        printf '  5) %s\n' "$(t "Detect IPv6" "探测 IPv6")"
+        printf '  6) %s\n' "$(t "Validate a manual IPv6 /64" "验证手工 IPv6 /64")"
+        printf '  7) %s\n' "$(t "Show Go integration Token" "显示 Go 对接 Token")"
+        printf '  8) %s\n' "$(t "Rotate Go integration Token" "轮换 Go 对接 Token")"
+        printf '  9) %s\n' "$(t "Back up Go IPv6 configuration" "备份 Go IPv6 配置")"
+        printf ' 10) %s\n' "$(t "Roll back Go IPv6 configuration" "回滚 Go IPv6 配置")"
+        printf ' 11) %s\n' "$(t "Uninstall Go Agent (keep containers/images)" "卸载 Go Agent（保留容器/镜像）")"
+        printf ' 12) %s\n' "$(t "Full Incus cleanup and Go uninstall" "清理 Incus 制品并卸载 Go Agent")"
+        printf ' 13) %s\n' "$(t "Configure/refresh Go container images" "配置/刷新 Go 容器镜像")"
+        printf ' 14) %s\n' "$(t "Go Agent-only upgrade / migrate from upstream" "仅升级 Go Agent / 从原版迁移")"
+        printf ' 15) %s\n' "$(t "Clean host logs and unused images (7-day retention)" "清理主机日志和未使用镜像（保留 7 天）")"
+        printf ' 16) %s\n' "$(t "Uninstall Go and remove empty Podman/Incus services" "卸载 Go Agent 并清理空的 Podman/Incus 服务")"
+        printf '  0) %s\n' "$(t "Back to version selection" "返回版本选择")"
+        read -rp '> ' choice || return 1
+        case "${choice}" in
+            1)
+                if rust_installation_present; then
+                    log "Rust v2 is already installed; use its menu or choose Go-to-Rust migration."
+                    continue
+                fi
+                GUIDED_INSTALL=1; return 0 ;;
+            2)
+                if go_installation_present; then SYSTEM_ACTION="status"; return 0; fi
+                log "Go v1 is not installed."
+                ;;
+            3) go_menu_require_agent || continue; SYSTEM_ACTION="restart"; return 0 ;;
+            4) go_menu_require_agent || continue; SYSTEM_ACTION="reset-password"; return 0 ;;
+            5) IPV6_ONESHOT_MODE="detect"; return 0 ;;
+            6) IPV6_ONESHOT_MODE="validate"; return 0 ;;
+            7) go_menu_require_agent || continue; TOKEN_ACTION="show"; return 0 ;;
+            8) go_menu_require_agent || continue; TOKEN_ACTION="rotate"; return 0 ;;
+            9) go_menu_require_agent || continue; IPV6_ONESHOT_MODE="backup"; return 0 ;;
+            10) go_menu_require_agent || continue; IPV6_ONESHOT_MODE="rollback"; return 0 ;;
+            11) go_menu_require_agent || continue; UNINSTALL=1; return 0 ;;
+            12) go_menu_require_agent || continue; UNINSTALL=1; PURGE_INCUS=1; return 0 ;;
+            13) go_menu_require_agent || continue; GUIDED_INSTALL=1; FORCE_IMAGE_REFRESH=1; IMAGE_MENU=1; return 0 ;;
+            14) go_menu_require_agent || continue; UPDATE_ONLY=1; return 0 ;;
+            15)
+                read -rp "$(t "Apply 7-day host log retention and clean old rotated/dangling images? [y/N] " "应用主机日志 7 天保留并清理旧轮转日志/悬空镜像？[y/N] ")" _go_cleanup_answer
+                case "${_go_cleanup_answer,,}" in y|yes) RUST_ACTION="cleanup"; return 0 ;; esac
+                ;;
+            16) GO_RUNTIME_CLEANUP=1; return 0 ;;
+            0) return 1 ;;
+            *) log "$(t "Invalid menu selection." "无效的菜单选项。")" ;;
+        esac
+    done
+}
+
+show_rust_menu() {
+    local choice show_token_supported=0 set_token_supported=0
+    rust_show_token_supported && show_token_supported=1
+    rust_set_token_supported && set_token_supported=1
+    while true; do
+        printf '\n%s (%s)\n' "$(t "Rust v2 operations" "Rust v2 功能")" "$(detected_agent_version)"
+        printf '  1) %s\n' "$(t "Install/update Rust v2" "安装/更新 Rust v2")"
+        printf '  2) %s\n' "$(t "Migrate Go containers to Rust v2 (lossy rebuild)" "将 Go 容器迁移到 Rust v2（有损重建）")"
+        printf '  3) %s\n' "$(t "Show Rust v2 service/version status" "查看 Rust v2 服务/版本状态")"
+        printf '  4) %s\n' "$(t "Restart Rust Agent and installed RFW" "重启 Rust Agent 和已安装的 RFW")"
+        printf '  5) %s\n' "$(t "Reset Rust panel password" "重置 Rust 面板密码")"
+        if [ "$show_token_supported" = 1 ]; then
+            printf '  6) %s\n' "$(t "Show Rust integration Token" "显示 Rust 对接 Token")"
+        else
+            printf '  6) %s\n' "$(t "Show Rust Token (requires newer Rust CLI)" "显示 Rust Token（需要较新的 Rust CLI）")"
+        fi
+        if [ "$set_token_supported" = 1 ]; then
+            printf '  7) %s\n' "$(t "Set platform-issued Rust Token" "设置平台签发的 Rust Token")"
+        else
+            printf '  7) %s\n' "$(t "Set Rust Token (requires newer CLI and a platform-issued token)" "设置 Rust Token（需要较新 CLI 和平台签发的 Token）")"
+        fi
+        printf '  8) %s\n' "$(t "Detect IPv6 using the Rust agent" "使用 Rust Agent 探测 IPv6")"
+        printf '  9) %s\n' "$(t "Run Rust uplink speed test" "运行 Rust 上行带宽测速")"
+        printf ' 10) %s\n' "$(t "Uninstall Rust Agent (keeps data; requires no instances)" "卸载 Rust Agent（保留数据；需无实例）")"
+        printf ' 11) %s\n' "$(t "Purge Rust Agent, instances, images and data" "彻底删除 Rust Agent、实例、镜像和数据")"
+        printf ' 12) %s\n' "$(t "Clean host logs/images and optionally empty old runtimes" "清理主机日志/镜像，可选卸载空的旧运行时")"
+        printf '     %s\n' "$(t "Manage Rust images/custom images in the Rust web panel." "Rust 镜像和自定义镜像请在 Rust 面板管理。")"
+        printf '  0) %s\n' "$(t "Back to version selection" "返回版本选择")"
+        read -rp '> ' choice || return 1
+        case "${choice}" in
+            1)
+                if go_installation_present; then
+                    log "Go v1 is installed; choose the explicit Go-to-Rust migration instead of installing alongside it."
+                    continue
+                fi
+                RUST_ACTION="update"; return 0 ;;
+            2)
+                if ! go_installation_present; then
+                    log "Go v1 is not installed; there is no Go state to migrate."
+                    continue
+                fi
+                RUST_V2_MIGRATION=1; return 0 ;;
+            3) RUST_ACTION="status"; return 0 ;;
+            4)
+                if ! rust_installation_present; then log "Rust v2 is not installed."; continue; fi
+                RUST_ACTION="restart"; return 0 ;;
+            5)
+                if ! rust_installation_present; then log "Rust v2 is not installed."; continue; fi
+                if ! rust_command_supported set-password; then log "Update Rust v2 to a release with set-password support first."; continue; fi
+                RUST_ACTION="reset-password"; return 0 ;;
+            6)
+                if ! rust_installation_present; then log "Rust v2 is not installed."; continue; fi
+                if [ "$show_token_supported" != 1 ]; then log "Update Rust v2 to a release with show-token support first."; continue; fi
+                RUST_ACTION="show-token"; return 0 ;;
+            7)
+                if ! rust_installation_present; then log "Rust v2 is not installed."; continue; fi
+                if [ "$set_token_supported" != 1 ]; then log "Update Rust v2 to a release with set-token --stdin support first."; continue; fi
+                RUST_ACTION="set-token"; return 0 ;;
+            8)
+                if ! rust_installation_present; then log "Rust v2 is not installed."; continue; fi
+                if ! rust_command_supported detect-ipv6; then log "Update Rust v2 to a release with detect-ipv6 support first."; continue; fi
+                RUST_ACTION="detect-ipv6"; return 0 ;;
+            9)
+                if ! rust_installation_present; then log "Rust v2 is not installed."; continue; fi
+                if ! rust_command_supported speedtest; then log "Update Rust v2 to a release with speedtest support first."; continue; fi
+                RUST_ACTION="speedtest"; return 0 ;;
+            10)
+                if ! rust_installation_present; then log "Rust v2 is not installed."; continue; fi
+                RUST_ACTION="uninstall"; return 0 ;;
+            11)
+                if ! rust_installation_present; then log "Rust v2 is not installed."; continue; fi
+                read -rp "Type PURGE RUST V2 to delete every Rust instance and all Rust data: " _purge_answer
+                if [ "$_purge_answer" != "PURGE RUST V2" ]; then log "Rust purge cancelled."; continue; fi
+                RUST_PURGE_CONFIRMED=1; RUST_ACTION="purge"; return 0 ;;
+            12)
+                read -rp "$(t "Apply host log/image cleanup? [y/N] " "执行主机日志/镜像清理？[y/N] ")" _rust_cleanup_answer
+                case "${_rust_cleanup_answer,,}" in
+                    y|yes)
+                        read -rp "$(t "Also remove empty Podman/Incus services when safe? Docker is untouched. [y/N] " "同时安全卸载空的 Podman/Incus 服务？不会修改 Docker。[y/N] ")" _rust_runtime_answer
+                        case "${_rust_runtime_answer,,}" in y|yes) RUST_CLEANUP_RUNTIMES=1 ;; esac
+                        RUST_ACTION="cleanup"; return 0 ;;
+                esac
+                ;;
+            0) return 1 ;;
+            *) log "$(t "Invalid menu selection." "无效的菜单选项。")" ;;
+        esac
+    done
+}
+
 show_main_menu() {
-    printf '\n%s\n' "$(t "Runman Agent guided operations" "Runman Agent 菜单引导")"
-    printf '  1) %s\n' "$(t "Install/update (guided network setup)" "安装/更新（网络引导配置）")"
-    printf '  2) %s\n' "$(t "Show installation/service status" "查看安装/服务状态")"
-    printf '  3) %s\n' "$(t "Repair network and restart Agent/firewall" "修复网络并重启 Agent/防火墙")"
-    printf '  4) %s\n' "$(t "Reset Web panel password" "重置 Web 面板密码")"
-    printf '  5) %s\n' "$(t "Detect IPv6 only" "仅探测 IPv6")"
-    printf '  6) %s\n' "$(t "Validate a manual IPv6 /64" "验证手工 IPv6 /64")"
-    printf '  7) %s\n' "$(t "Show integration Token" "显示对接 Token")"
-    printf '  8) %s\n' "$(t "Rotate integration Token" "轮换对接 Token")"
-    printf '  9) %s\n' "$(t "Back up IPv6 configuration" "备份 IPv6 配置")"
-    printf ' 10) %s\n' "$(t "Roll back IPv6 configuration" "回滚 IPv6 配置")"
-    printf ' 11) %s\n' "$(t "Uninstall Agent (keep containers/images)" "卸载 Agent（保留容器/镜像）")"
-    printf ' 12) %s\n' "$(t "Full Incus cleanup and uninstall" "清理 Incus 制品并完整卸载")"
-    printf ' 13) %s\n' "$(t "Configure/refresh container images" "配置/刷新容器镜像")"
-    printf ' 14) %s\n' "$(t "Agent-only upgrade / migrate from upstream (keep networking)" "仅升级 Agent / 从原版迁移（保留网络）")"
-    printf ' 15) %s\n' "$(t "Lossy clean rebuild migration to Rust v2" "有损重建迁移到 Rust v2（清空旧容器数据）")"
-    printf '  0) %s\n' "$(t "Exit" "退出")"
-    read -rp '> ' _menu_choice
-    case "${_menu_choice}" in
-        1) GUIDED_INSTALL=1 ;;
-        2) SYSTEM_ACTION="status" ;;
-        3) SYSTEM_ACTION="restart" ;;
-        4) SYSTEM_ACTION="reset-password" ;;
-        5) IPV6_ONESHOT_MODE="detect" ;;
-        6) IPV6_ONESHOT_MODE="validate" ;;
-        7) TOKEN_ACTION="show" ;;
-        8) TOKEN_ACTION="rotate" ;;
-        9) IPV6_ONESHOT_MODE="backup" ;;
-        10) IPV6_ONESHOT_MODE="rollback" ;;
-        11) UNINSTALL=1 ;;
-        12) UNINSTALL=1; PURGE_INCUS=1 ;;
-        13) GUIDED_INSTALL=1; FORCE_IMAGE_REFRESH=1; IMAGE_MENU=1 ;;
-        14) UPDATE_ONLY=1 ;;
-        15) RUST_V2_MIGRATION=1 ;;
-        0) exit 0 ;;
-        *) die "$(t "Invalid menu selection." "无效的菜单选项。")" ;;
-    esac
+    local choice detected
+    while true; do
+        detected=$(detected_agent_version)
+        printf '\n%s\n' "$(t "Runman Agent menu" "Runman Agent 菜单引导")"
+        printf '  %s %s\n' "$(t "Detected installation:" "检测到的安装版本:")" "$detected"
+        printf '  1) %s\n' "$(t "Go v1 operations" "Go v1 功能")"
+        printf '  2) %s\n' "$(t "Rust v2 operations" "Rust v2 功能")"
+        printf '  0) %s\n' "$(t "Exit" "退出")"
+        read -rp '> ' choice || exit 0
+        case "${choice}" in
+            1) if show_go_menu; then return 0; fi ;;
+            2) if show_rust_menu; then return 0; fi ;;
+            0) exit 0 ;;
+            *) log "$(t "Invalid menu selection." "无效的菜单选项。")" ;;
+        esac
+    done
 }
 
 while [[ $# -gt 0 ]]; do
+    case "$1" in
+        zh|en|--rust-*|--menu|--go-menu|--rust-menu|--migrate-rust-v2|--cleanup|--cleanup-runtimes) ;;
+        *) RUST_NONACTION_ARGS=$((RUST_NONACTION_ARGS + 1)) ;;
+    esac
     case "$1" in
         zh) LANG_CODE="zh"; shift ;;
         en) LANG_CODE="en"; shift ;;
@@ -705,9 +1119,24 @@ while [[ $# -gt 0 ]]; do
         --token) [ $# -ge 2 ] || die "--token requires a value"; INITIAL_TOKEN="$2"; TOKEN_VALUE="$2"; shift 2 ;;
         --generate-token) GENERATE_TOKEN=1; shift ;;
         -y|--yes|--non-interactive) NON_INTERACTIVE=1; shift ;;
-        --menu) FORCE_MENU=1; shift ;;
+        --menu) FORCE_MENU=1; MENU_VERSION="main"; shift ;;
+        --go-menu) FORCE_MENU=1; MENU_VERSION="go"; shift ;;
+        --rust-menu) FORCE_MENU=1; MENU_VERSION="rust"; shift ;;
         --update-only) UPDATE_ONLY=1; shift ;;
         --migrate-rust-v2) RUST_V2_MIGRATION=1; shift ;;
+        --cleanup) set_rust_action "cleanup"; shift ;;
+        --cleanup-runtimes) RUST_CLEANUP_RUNTIMES=1; shift ;;
+        --rust-update) set_rust_action "update"; shift ;;
+        --rust-status) set_rust_action "status"; shift ;;
+        --rust-restart-agent) set_rust_action "restart"; shift ;;
+        --rust-reset-panel-password) set_rust_action "reset-password"; shift ;;
+        --rust-show-token) set_rust_action "show-token"; shift ;;
+        --rust-set-token) set_rust_action "set-token"; shift ;;
+        --rust-detect-ipv6) set_rust_action "detect-ipv6"; shift ;;
+        --rust-speedtest) set_rust_action "speedtest"; shift ;;
+        --rust-cleanup) set_rust_action "cleanup"; shift ;;
+        --rust-uninstall) set_rust_action "uninstall"; shift ;;
+        --rust-purge) set_rust_action "purge"; shift ;;
         --detect-ipv6) IPV6_ONESHOT_MODE="detect"; shift ;;
         --validate-ipv6) IPV6_ONESHOT_MODE="validate"; shift ;;
         --backup-ipv6) IPV6_ONESHOT_MODE="backup"; shift ;;
@@ -738,35 +1167,92 @@ esac
 [ "$INCUS_IPV6_ALLOC" -ge 1 ] && [ "$INCUS_IPV6_ALLOC" -le 15 ] \
     || die "--ipv6-alloc must be an integer from 1 to 15"
 
-# One-shot operations and explicit non-interactive installs must never pause for
-# a language selection. Guided/menu installs keep the bilingual prompt.
-if [ -z "$LANG_CODE" ] && { [ -n "$SYSTEM_ACTION" ] || [ -n "$TOKEN_ACTION" ] \
-    || [ -n "$IPV6_ONESHOT_MODE" ] || [ "$UNINSTALL" = "1" ] \
-    || [ "$NON_INTERACTIVE" = "1" ]; }; then
-    LANG_CODE="en"
-fi
-if [ -z "$LANG_CODE" ]; then
-    printf "Select language / 选择语言:\n  1) English (default)\n  2) 中文\n"
-    if [ -t 0 ]; then
-        read -t 10 -rp "> " _lang_choice || _lang_choice=1
-    else
-        _lang_choice=1
-    fi
-    case "${_lang_choice}" in
-        2) LANG_CODE="zh" ;;
-        *) LANG_CODE="en" ;;
+# Use Chinese by default; retain the explicit `en` argument for compatibility.
+LANG_CODE="${LANG_CODE:-zh}"
+
+# 无参数且有终端时默认打开版本选择；--menu / --go-menu / --rust-menu 可显式打开。
+if [ "$FORCE_MENU" = "1" ] || { [ "$ORIGINAL_ARGC" -eq 0 ] && [ -t 0 ]; }; then
+    [ -z "$RUST_ACTION" ] || die "Do not combine a Rust action with an interactive menu."
+    case "$MENU_VERSION" in
+        go) if show_go_menu; then :; else show_main_menu; fi ;;
+        rust) if show_rust_menu; then :; else show_main_menu; fi ;;
+        *) show_main_menu ;;
     esac
 fi
 
-# 无参数且有终端时默认打开总菜单；--menu 可显式打开。
-if [ "$FORCE_MENU" = "1" ] || { [ "$ORIGINAL_ARGC" -eq 0 ] && [ -t 0 ]; }; then
-    show_main_menu
+if [ "$GO_RUNTIME_CLEANUP" = "1" ]; then
+    [ -z "$RUST_ACTION" ] && [ "$UPDATE_ONLY" = "0" ] \
+        && [ -z "$SYSTEM_ACTION" ] && [ -z "$TOKEN_ACTION" ] \
+        && [ -z "$IPV6_ONESHOT_MODE" ] && [ "$UNINSTALL" != "1" ] \
+        && [ "$GUIDED_INSTALL" = "0" ] && [ "$GENERATE_TOKEN" = "0" ] \
+        && [ "$RUST_V2_MIGRATION" = "0" ] \
+        || die "Go runtime cleanup cannot be combined with other actions."
+    run_go_runtime_cleanup
+    exit 0
+fi
+
+[ "$RUST_CLEANUP_RUNTIMES" != "1" ] || [ "$RUST_ACTION" = "cleanup" ] \
+    || die "--cleanup-runtimes can only be combined with --cleanup."
+
+if [ -n "$RUST_ACTION" ]; then
+    [ "$RUST_NONACTION_ARGS" = "0" ] \
+        && [ "$UPDATE_ONLY" = "0" ] && [ -z "$SYSTEM_ACTION" ] && [ -z "$TOKEN_ACTION" ] \
+        && [ -z "$IPV6_ONESHOT_MODE" ] && [ "$UNINSTALL" != "1" ] \
+        && [ "$GUIDED_INSTALL" = "0" ] && [ "$GENERATE_TOKEN" = "0" ] \
+        && [ "$RUST_V2_MIGRATION" = "0" ] \
+        && [ -z "$VIRT_TYPE_REQUESTED" ] \
+        || die "Rust actions cannot be combined with Go installation or management actions."
+    case "$RUST_ACTION" in
+        update)
+            go_installation_present && die "Go v1 is installed; use --migrate-rust-v2 instead of installing Rust alongside it."
+            run_rust_v2_installer
+            exit 0
+            ;;
+        status) show_rust_status; exit 0 ;;
+        restart) restart_rust_agent; exit 0 ;;
+        reset-password) reset_rust_panel_password; exit 0 ;;
+        show-token) show_rust_token; exit 0 ;;
+        set-token) set_rust_token; exit 0 ;;
+        detect-ipv6)
+            require_rust_agent
+            require_rust_command detect-ipv6
+            "$RUST_AGENT_BINARY" detect-ipv6
+            exit 0
+            ;;
+        speedtest) run_rust_speedtest; exit 0 ;;
+        cleanup)
+            if [ "$RUST_CLEANUP_RUNTIMES" = "1" ]; then
+                run_rust_v2_installer --cleanup-only --cleanup-runtimes
+            else
+                run_rust_v2_installer --cleanup-only
+            fi
+            exit 0
+            ;;
+        uninstall)
+            require_rust_agent
+            run_rust_v2_installer --uninstall
+            exit 0
+            ;;
+        purge)
+            require_rust_agent
+            [ "$NON_INTERACTIVE" != "1" ] && [ -t 0 ] \
+                || die "Rust purge requires an interactive typed confirmation."
+            if [ "$RUST_PURGE_CONFIRMED" != "1" ]; then
+                read -rp "Type PURGE RUST V2 to delete every Rust instance and all Rust data: " _purge_answer
+                [ "$_purge_answer" = "PURGE RUST V2" ] || { log "Rust purge cancelled."; exit 0; }
+            fi
+            run_rust_v2_installer --uninstall --purge
+            exit 0
+            ;;
+        *) die "Unknown Rust action: $RUST_ACTION" ;;
+    esac
 fi
 
 # Route migration before any standalone management action (including uninstall)
 # can run. Conflicting options must fail closed without changing host state.
 if [ "$RUST_V2_MIGRATION" = "1" ]; then
-    [ "$UPDATE_ONLY" = "0" ] && [ -z "$SYSTEM_ACTION" ] && [ -z "$TOKEN_ACTION" ] \
+    [ "$RUST_NONACTION_ARGS" = "0" ] \
+        && [ "$UPDATE_ONLY" = "0" ] && [ -z "$SYSTEM_ACTION" ] && [ -z "$TOKEN_ACTION" ] \
         && [ -z "$IPV6_ONESHOT_MODE" ] && [ "$UNINSTALL" != "1" ] \
         && [ "$GENERATE_TOKEN" = "0" ] \
         || die "Rust v2 migration cannot be combined with other management actions"

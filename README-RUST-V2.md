@@ -67,7 +67,7 @@ Rust v2 源码现已合入 `main`。Rust 代码更新会发布到独立的 `cont
 
 节点从 fork 的 GitHub Release 下载，只安装与 `SHA256SUMS` 校验和匹配、能正常运行的版本，发现新版后随机延迟 0–6 小时再应用，以免整批节点同时重启（面板里可立即更新）。本地编译的版本不会自动更新。
 
-常规 Rust 安装不会接管 Go 配置、数据库或 Podman/Incus 实例。Go 一键安装器的菜单 **15** 可启动有损的 clean-rebuild 迁移：保留受支持的主机/面板设置、实例 UUID/资源/运行状态和端口转发，在健康核验后删除旧容器根文件系统。它不保留客体文件、应用、IP、WireGuard 和挂载卷关联；删除阶段开始后无法承诺完整回滚。开始前先读 [Go 到 Rust v2 迁移计划](MIGRATION_GO_TO_RUST_V2.md) 并备份关键数据。此迁移会复用现有平台主机标识和 Token，且先停用 Go agent，避免两个 agent 同时协调同一节点。
+常规 Rust 安装不会接管 Go 配置、数据库或 Podman/Incus 实例。Go fork 安装器的 Rust v2 子菜单 **2** 可启动有损的 clean-rebuild 迁移：保留受支持的主机/面板设置、实例 UUID/资源/运行状态和端口转发，在健康核验后删除旧容器根文件系统。它不保留客体文件、应用、IP、WireGuard 和挂载卷关联；删除阶段开始后无法承诺完整回滚。开始前先读 [Go 到 Rust v2 迁移计划](MIGRATION_GO_TO_RUST_V2.md) 并备份关键数据。此迁移会复用现有平台主机标识和 Token，且先停用 Go agent，避免两个 agent 同时协调同一节点。迁移成功并确认旧实例删除后，会自动执行 7 天日志/缓存清理；只有盘点确认没有其他容器、数据卷或 rootless Podman 数据时，才尝试清除旧 Podman/Incus 服务。Docker 不会被选中、不运行 `autoremove`；Rust 实例所需的 `lxcfs` 会保留。
 
 
 ## 实例镜像

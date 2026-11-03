@@ -101,7 +101,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/podcctv/runman-agent/main/in
 ### Rust v2
 
 Rust v2 源码已并入本仓库，并通过独立的 `continuous-rs` 通道发布，不覆盖 Go 版的
-`continuous`。上面的命令仍是 Go 安装器，菜单 **15** 可启动有损的 Go→Rust 迁移。
+`continuous`。上面的命令启动 fork 的统一安装器：先选择 **Go v1** 或 **Rust v2**，
+再进入对应的功能菜单。Rust 菜单 **2** 可启动有损的 Go→Rust 迁移；旧参数
+`--migrate-rust-v2` 仍保留兼容。
 Rust v2 安装说明和迁移边界见
 [`README-RUST-V2.md`](README-RUST-V2.md) 和
 [`MIGRATION_GO_TO_RUST_V2.md`](MIGRATION_GO_TO_RUST_V2.md)。
@@ -126,13 +128,37 @@ bash <(curl -fsSL https://raw.githubusercontent.com/podcctv/runman-agent/main/in
 | IPv6 上行网卡 | 仅手工 IPv6 | `eth0` / `ens3` / `he-ipv6` | 用 `ip -6 route show default` 查看；不要照抄示例 |
 | IPv6 地址和 CIDR | 仅手工 `/64` | `2001:db8:100::1`、`2001:db8:100::/64` | 必须使用供应商真实分配；`2001:db8::/32` 仅文档示例，不能上网 |
 | 前缀类型 | 仅手工 `/64` | 路由/隧道 或 原生二层 | HE/WireGuard/供应商静态路由选“路由/隧道”；同一二层网段选“原生/NDP” |
-| 对接 Token | 首装或轮换 | `<平台生成的Token>` | 留空自动生成；安装结束会打印，配置文件权限为 `0600` |
+| Go 对接 Token | Go 首装或轮换 | `<平台生成的Token>` | Go 安装可生成本地 Token；Rust v2 必须使用平台签发的 Token |
 | rfw 网卡 | 选择安装 rfw 时 | `ens3` | 选择拥有公网 IPv4 的物理/虚拟上行网卡，不选 `docker0`、`podman*`、`incusbr0` |
 | 登录横幅 | Incus 可选 | 项目名称、支持地址 | 不需要就选“无”；不要写密码、Token、私钥 |
 
-### 总菜单说明
+### 版本菜单说明
 
-无参数执行时进入数字选择菜单。常见运维不需要记命令：
+无参数执行时默认使用中文菜单。第一级只选择 **Go v1** 或 **Rust v2**；旧版 Go 操作集中在 Go 子菜单，Rust 操作集中在 Rust 子菜单。检测到双版本并存时会显示两者状态，并阻止 Go 子菜单执行可能改动 Rust 网络状态的操作。
+
+Go 子菜单 **15** 和 Rust 子菜单 **12** 提供独立的主机清理：设置 journald 的 7 天保留策略、清理超过 7 天的轮转日志，删除悬空 Podman 镜像和超过 7 天且未使用的 Incus 缓存镜像。Go 子菜单 **16** 可卸载 Go Agent，并尝试移除空的 Podman/Incus 服务；如果仍有实例、Pod、数据卷、rootless Podman 数据，或无法完成盘点，就保留运行时和数据。Snap 管理的运行时不自动卸载。执行前会模拟 apt 移除计划，若涉及 Docker/containerd 包就中止；不会运行 `autoremove`、不会删除 Docker 数据，也会保留 Rust 实例需要的 `lxcfs`。该项要求键入 `确认卸载 Go 并清理空运行时`；Go 与 Rust 同时安装时不会自动卸载 Go。
+
+如需通过命令行清理日志和镜像，可运行 `--cleanup`；显式加 `--cleanup-runtimes` 会尝试移除空的 Podman/Incus 包。
+
+Go→Rust 迁移成功且旧容器删除确认后，会自动运行 7 天日志/镜像清理，并按同样的安全盘点移除空的旧 Podman/Incus 服务；
+只要仍有实例、数据卷或盘点不确定，就保留对应运行时。Rust v2 的实例由自身 namespace supervisor 管理，不依赖 Incus 或 Podman。
+
+Rust 菜单会按安装状态和 CLI 能力启用操作：
+
+| Rust 菜单 | 操作 | 可用条件 |
+|---:|---|---|
+| 1–2 | 安装/更新；将 Go 实例有损迁移到 Rust | Go 已安装时禁止并列安装，需选择迁移 |
+| 3–5 | 查看状态、重启、重置面板密码 | 状态始终可查看；其余需已安装 Rust，密码重置还要求 CLI 支持 `set-password` |
+| 6–7 | 显示 Token；设置平台签发的 Token | 分别检测 `show-token` 和安全的 `set-token --stdin`；安装器不会自行生成 Rust Token |
+| 8–9 | IPv6 探测、上行测速 | 需已安装 Rust 且 CLI 分别支持 `detect-ipv6` / `speedtest`；测速后可选择重启以便上报 |
+| 10–11 | 卸载或彻底清理 Rust | 卸载要求没有实例；彻底清理要求键入确认短语 |
+| 12 | 主机日志/镜像清理，可选卸载空的旧容器运行时 | 需要 Rust 发布版提供 `--cleanup-only`；卸载运行时还需 `--cleanup-runtimes` |
+
+Rust 自定义镜像在 Rust 面板中管理；Go 专属的 Incus 镜像、IPv6 备份/回滚功能仍留在 Go 子菜单。
+
+#### Go v1 子菜单
+
+Go 子菜单的原有运维编号如下：
 
 | 菜单 | 操作 | 是否修改系统 |
 |---:|---|---|
@@ -147,11 +173,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/podcctv/runman-agent/main/in
 | 12 | Incus 完整清理：删除受管实例、ready 镜像、`incusbr0` 和镜像 remote | **破坏性，菜单要求确认** |
 | 13 | 配置/刷新镜像：Incus URL/离线目录/基础镜像；Podman registry mirror/基础镜像 | 是 |
 | 14 | 仅升级 Agent / 从原版就地迁移，先备份，保留网络和后端 | 是，运行中的 Agent 短暂重启 |
-| 15 | 有损重建迁移到 Rust v2 | **破坏性，必须逐字确认** |
+| 15 | 清理主机日志和未使用镜像，按 7 天保留 | 是 |
+| 16 | 卸载 Go Agent，并在确认后端为空时清理 Podman/Incus 服务 | 需要键入确认短语；有容器或数据时保留运行时 |
 
 #### 一键有损迁移到 Rust v2
 
-仅适用于标准安装路径下的 Go Podman/Incus 容器后端。菜单 `15` 会先检查 Go 配置、SQLite 数据库、容器状态和支持的镜像；输入 `MIGRATE TO RUST` 后停止 Go Agent，再做一次最终快照，随后用 Rust v2 重建容器。
+仅适用于标准安装路径下的 Go Podman/Incus 容器后端。进入 Rust v2 子菜单并选择 `2` 后，安装器先检查 Go 配置、SQLite 数据库、容器状态和支持的镜像；输入 `MIGRATE TO RUST` 后停止 Go Agent，再做一次最终快照，随后用 Rust v2 重建容器。
 
 它保留平台 Token/主机标识、面板登录配置、容器 UUID、CPU/内存/磁盘/带宽限制、Alpine/Debian 系统类型、运行状态和支持的 TCP/UDP 端口转发。新容器的 root 密码保存在 `/var/backups/runman-go-to-rust-v2.*/root-passwords.txt`，仅 root 可读。
 
@@ -165,7 +192,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/podcctv/runman-agent/main/in
 
 #### 重置面板密码
 
-菜单 `4` 和 `--reset-panel-password` 都从当前终端隐藏读取密码。至少 8 个字符、最多 72 个 UTF-8 字节（bcrypt 限制）；`!`、`*`、反斜杠及前后空格会按原样保留。粘贴带来的空行、输入过短或两次不一致会留在脚本中重试；按 `Ctrl+C` 取消，不修改密码。只有密码保存成功才重启 Agent；重启失败会单独提示。
+Go v1 子菜单 `4` 和 `--reset-panel-password` 都从当前终端隐藏读取密码。至少 8 个字符、最多 72 个 UTF-8 字节（bcrypt 限制）；`!`、`*`、反斜杠及前后空格会按原样保留。粘贴带来的空行、输入过短或两次不一致会留在脚本中重试；按 `Ctrl+C` 取消，不修改密码。只有密码保存成功才重启 Agent；重启失败会单独提示。Rust v2 的密码重置在 Rust 子菜单 `5`，密码通过标准输入传递。
 
 单次重置建议先完整下载脚本，避免流式执行提前退出时 `curl` 报写入失败。不要在 Shell 命令行中粘贴真实密码：
 
@@ -284,7 +311,7 @@ Incus 镜像使用 `--image-mirror` / `--local-image-dir`；Podman 是 OCI regis
    `runman-podman-forwarding.service`，仅在 Docker 的 `DOCKER-USER` 链放行
    `10.91.0.0/20` 与 `fd91:cafe:cafe:10::/64` 的转发，不修改已有 Docker 容器。
 
-安装后可通过总菜单 **13 → Podman 镜像管理**刷新内置 Debian/Alpine 镜像、设置镜像加速或
+安装后可通过 Go v1 子菜单 **13 → Podman 镜像管理**刷新内置 Debian/Alpine 镜像、设置镜像加速或
 清除安装器管理的配置。对应文件是
 `/etc/containers/registries.conf.d/99-runman-mirror.conf`。
 
@@ -623,7 +650,7 @@ unset NARWHAL_AGENT_TOKEN
 `/opt/narwhal-agent/narwhal-agent`，配置 `/opt/narwhal-agent/config.json`。
 使用 root 执行：
 
-也可以在总菜单选择 **14：仅升级 Agent / 从原版迁移**，效果与下面命令相同。
+也可以在 Go v1 子菜单选择 **14：仅升级 Agent / 从原版迁移**，效果与下面命令相同。
 
 ```bash
 bash <(curl -fsSL https://github.com/podcctv/runman-agent/releases/download/continuous/install.sh) zh --update-only
@@ -647,7 +674,7 @@ journalctl -u narwhal-agent -n 50 --no-pager
 ### 常规组件更新 / 镜像管理
 
 不加 `--update-only` 的安装/更新菜单仍可更新 Agent、netavark、rfw，并按当前后端处理网络兼容和基础镜像；会涉及系统参数，不等同于上面的最小迁移。
-配置/刷新自制镜像使用菜单 **13**，只影响后续新建实例，不替换已有容器。
+配置/刷新自制镜像使用 Go v1 子菜单 **13**，只影响后续新建实例，不替换已有容器。
 
 ### 自动更新来源与版本
 
@@ -722,7 +749,7 @@ systemctl restart narwhal-agent
 
 ## 安装后验收清单
 
-先执行总菜单 **2（状态）**，确认 `AGENT_SERVICE=active`、后端服务为 `active`，并保存菜单
+先执行 Go v1 子菜单 **2（状态）**，确认 `AGENT_SERVICE=active`、后端服务为 `active`，并保存菜单
 **7** 打印的对接 Token。Token 只交给平台管理方，不要发到公开聊天或日志。
 
 ### Podman：NAT4 + IPv6（SNAT 或真实 `/64`）
@@ -824,7 +851,7 @@ oneshot 服务在开机和更新时应用。
 **Podman 自定义镜像拉取失败**
 
 先用 `podman pull <完整镜像引用>` 查看真实错误。私有源执行 `podman login <registry>`；自签名
-证书应改为受信任证书或安装内部 CA。镜像加速配置可用总菜单 **13** 清除后重试。
+证书应改为受信任证书或安装内部 CA。镜像加速配置可用 Go v1 子菜单 **13** 清除后重试。
 
 **KVM 不可用（cloud-hypervisor 模式）**
 在宿主机管理界面开启嵌套虚拟化，或改用 Podman 模式。
