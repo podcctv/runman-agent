@@ -678,29 +678,49 @@ if [ "$MIGRATE_GO" = 1 ]; then
     log "verifying migrated instance identities, prior run states, and port forwards"
     health_ok=0
     for _ in $(seq 1 30); do
-        if curl --silent --show-error --fail --max-time 3 \
+        inventory_http_status=$(curl --silent --show-error --max-time 3 \
             --unix-socket /run/narwhal-agent/connlimit.sock \
-            http://localhost/v1/inventory -o "$MIGRATION_DIR/live-inventory.json" 2>/dev/null; then
+            http://localhost/v1/inventory -o "$MIGRATION_DIR/live-inventory.json" \
+            -w '%{http_code}' 2>/dev/null || true)
+        if [ "$inventory_http_status" = 200 ]; then
             if python3 - "$MIGRATION_DIR/manifest.json" "$MIGRATION_DIR/legacy-state.json" \
                 "$MIGRATION_DIR/live-inventory.json" "$DATA_DIR/portforwards.json" <<'PY'
 import json, pathlib, sys
 manifest, legacy, inventory, forwards = [json.loads(pathlib.Path(p).read_text()) for p in sys.argv[1:]]
 if inventory.get('schema') != 1 or not isinstance(inventory.get('items'), list):
+    print('invalid Rust inventory schema', file=sys.stderr)
     raise SystemExit(1)
 expected = {item['vm_id']: item['was_running'] for item in manifest['instances']}
 actual = {item.get('id'): item.get('running') is True for item in inventory['items'] if isinstance(item, dict)}
 if set(actual) != set(expected) or actual != expected:
+    print(f'instance identity/state mismatch: expected {len(expected)}, got {len(actual)}', file=sys.stderr)
     raise SystemExit(1)
 forward_path = pathlib.Path(sys.argv[4])
 stored = json.loads(forward_path.read_text()) if forward_path.exists() else []
 normalize = lambda row: (row['vm_id'], row.get('protocol', row.get('proto')), row['host_port'], row['guest_port'])
 if sorted(map(normalize, stored)) != sorted(map(normalize, manifest['port_forwards'])):
+    print(f'port-forward mismatch: expected {len(manifest["port_forwards"])}, got {len(stored)}', file=sys.stderr)
     raise SystemExit(1)
 PY
             then
                 health_ok=1
                 break
             fi
+            break
+        elif [ "$inventory_http_status" != 000 ]; then
+            chmod 600 "$MIGRATION_DIR/live-inventory.json" 2>/dev/null || true
+            inventory_error=$(python3 - "$MIGRATION_DIR/live-inventory.json" <<'PY'
+import json, pathlib, sys
+try:
+    value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+    message = value.get('message', '') if isinstance(value, dict) else ''
+except Exception:
+    message = ''
+print(' '.join(str(message).split())[:240])
+PY
+)
+            warn "Rust local inventory returned HTTP $inventory_http_status${inventory_error:+: $inventory_error}"
+            break
         fi
         sleep 1
     done
