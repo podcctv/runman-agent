@@ -522,18 +522,7 @@ async fn read_request(stream: &mut UnixStream, body_limit: usize) -> Result<Http
     }
     let headers = std::str::from_utf8(&bytes[..header_end])?;
     let mut lines = headers.split("\r\n");
-    let mut request_line = lines.next().unwrap_or_default().split_whitespace();
-    let method = request_line
-        .next()
-        .context("missing HTTP method")?
-        .to_owned();
-    let target = request_line
-        .next()
-        .context("missing HTTP target")?
-        .to_owned();
-    if request_line.next().is_some() {
-        bail!("invalid HTTP request line");
-    }
+    let (method, target) = parse_request_line(lines.next().unwrap_or_default())?;
     let mut length = 0usize;
     let mut saw_length = false;
     for line in lines {
@@ -572,6 +561,41 @@ async fn read_request(stream: &mut UnixStream, body_limit: usize) -> Result<Http
         target,
         body: bytes[header_end..header_end + length].to_vec(),
     })
+}
+
+fn parse_request_line(raw: &str) -> Result<(String, String)> {
+    let mut fields = raw.split_whitespace();
+    let method = fields.next().context("missing HTTP method")?;
+    let target = fields.next().context("missing HTTP target")?;
+    let version = fields.next().context("missing HTTP version")?;
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") || fields.next().is_some() {
+        bail!("invalid HTTP request line");
+    }
+    Ok((method.to_owned(), target.to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_request_line;
+
+    #[test]
+    fn accepts_standard_http_1_request_lines() {
+        assert_eq!(
+            parse_request_line("GET /v1/inventory HTTP/1.1").unwrap(),
+            ("GET".to_owned(), "/v1/inventory".to_owned())
+        );
+        assert_eq!(
+            parse_request_line("POST /v1/firewall/policy HTTP/1.0").unwrap(),
+            ("POST".to_owned(), "/v1/firewall/policy".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_or_unsupported_http_request_lines() {
+        assert!(parse_request_line("GET /v1/inventory").is_err());
+        assert!(parse_request_line("GET /v1/inventory HTTP/2").is_err());
+        assert!(parse_request_line("GET /v1/inventory HTTP/1.1 extra").is_err());
+    }
 }
 
 async fn respond_error(stream: &mut UnixStream, status: u16, message: &str) -> Result<()> {
