@@ -119,7 +119,18 @@ if [ "${#instance_names[@]}" -gt 0 ]; then
             printf '%s\n' "$info" | tail -n 8
         fi
         printf '%s\n' "--- $name: instance log (last 40 lines) ---"
-        incus info --show-log "$name" 2>&1 | tail -n 40
+        instance_log=$(incus info --show-log "$name" 2>&1)
+        instance_log_rc=$?
+        printf '%s\n' "$instance_log" | tail -n 40
+        if [ "$instance_log_rc" -ne 0 ]; then
+            for logfile in lxc.log forkstart.log forkexec.log; do
+                path="/var/log/incus/$name/$logfile"
+                if [ -f "$path" ]; then
+                    printf '%s\n' "--- $name: $logfile (last 40 lines) ---"
+                    tail -n 40 "$path"
+                fi
+            done
+        fi
     done
 fi
 
