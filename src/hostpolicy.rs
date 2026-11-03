@@ -273,7 +273,7 @@ impl Manager {
             observed_at: now(),
             rfw_api_version: api_version,
             capabilities_known: known,
-            supported_protocols: protocols,
+            supported_protocols: protocols.into_iter().collect(),
             policy_revision: state.revision,
             rule_count: rows.len(),
             managed_rule_count: 0,
@@ -405,7 +405,9 @@ impl Manager {
     }
 
     pub async fn summary(&self) -> String {
-        summary(&self.state.lock().await)
+        let guard = self.state.lock().await;
+        let state: &State = &guard;
+        summary(state)
     }
 
     async fn reconcile_rfw(&self, state: &mut State) -> Result<()> {
