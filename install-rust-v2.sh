@@ -227,9 +227,10 @@ prepare_go_migration() {
     if [ ! -f "$go_config" ] || [ ! -x "$go_binary" ]; then
         die "standard Go config/binary not found; no host changes made"
     fi
+    # Go and Rust intentionally share these control API sockets, so their
+    # presence is normal on a running Go node and does not identify Rust v2.
     if [ -e "$CONFIG_DIR" ] || [ -e "$DATA_DIR" ] || [ -e "$BIN" ] \
         || [ -e /etc/systemd/system/runman-agent.service ] || [ -e /run/runman-agent ] \
-        || [ -S /run/narwhal-agent/connlimit.sock ] || [ -S /run/narwhal-agent/firewall.sock ] \
         || systemctl is-active --quiet runman-agent.service 2>/dev/null; then
         die "a Rust v2 installation already exists; migration will not overwrite it"
     fi
