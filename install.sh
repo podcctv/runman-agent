@@ -754,7 +754,7 @@ if grep -qE '^token = ".+"' "$CONFIG"; then
     echo "  mode:    platform (connects to $(sed -n 's/^platform_url = "\(.*\)"$/\1/p' "$CONFIG"))"
 else
     echo "  mode:    standalone (no platform token; manage instances in the panel)"
-    echo "           connect later: read -rsp 'Platform token: ' token; echo; printf '%s\\n' \"\$token\" | runman-agent set-token --stdin && unset token && systemctl restart runman-agent"
+    printf '%s\n' "           connect later: read -rsp 'Platform token: ' token; echo; printf '%s\\n' \"\$token\" | runman-agent set-token --stdin && unset token && systemctl restart runman-agent"
 fi
 echo "  OS images are downloaded in the background on first start (journalctl -fu runman-agent)."
 if [ "$MIGRATE_GO" = 1 ]; then
