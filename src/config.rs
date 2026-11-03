@@ -76,6 +76,8 @@ pub struct NetworkConfig {
     /// Subnet mode: uplink on which the prefix is on-link (answer NDP for
     /// instance addresses). Empty when the prefix is routed to the host.
     pub ipv6_ndp_uplink: String,
+    /// SNAT mode: ULA /64 used by guests. Defaults to fd91:cafe:cafe:10::/64.
+    pub ipv6_snat_prefix: String,
     pub dns: Vec<String>,
     /// Host-side names: veth `<veth_prefix><idx>` (+ `i` for its IFB),
     /// WireGuard `<wg_prefix><n>` with policy table `wg_table_base + n`,
@@ -95,6 +97,7 @@ impl Default for NetworkConfig {
             ipv6_mode: "none".into(),
             ipv6_prefix: String::new(),
             ipv6_ndp_uplink: String::new(),
+            ipv6_snat_prefix: "fd91:cafe:cafe:10::/64".into(),
             dns: vec!["1.1.1.1".into(), "8.8.8.8".into()],
             veth_prefix: "rv".into(),
             wg_prefix: "rw".into(),

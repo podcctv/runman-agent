@@ -2,6 +2,8 @@
 """Export and manage the deliberately limited Go -> Rust clean-rebuild migration."""
 
 import argparse
+import ipaddress
+import itertools
 import json
 import os
 import re
@@ -16,6 +18,7 @@ from pathlib import Path
 DEFAULT_CONFIG = Path("/opt/narwhal-agent/config.json")
 DEFAULT_DB = Path("/opt/narwhal-agent/agent.db")
 MAX_DB_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_SNAT6_PREFIX = "fd91:cafe:cafe:10::/64"
 
 
 def fail(message):
@@ -114,6 +117,113 @@ def write_private(path, content):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as stream:
         stream.write(content)
+
+
+def host_networks(version):
+    family = f"-{version}"
+    networks = set()
+    try:
+        routes = json.loads(checked_run(["ip", "-j", family, "route", "show", "table", "all"]))
+        addresses = json.loads(checked_run(["ip", "-j", family, "address", "show"]))
+    except (json.JSONDecodeError, TypeError) as exc:
+        fail(f"could not inventory host IPv{version} routes: {exc}")
+    if not isinstance(routes, list) or not isinstance(addresses, list):
+        fail(f"host IPv{version} network inventory has an unexpected format")
+
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+        destination = route.get("dst")
+        if not destination or destination == "default":
+            continue
+        try:
+            network = ipaddress.ip_network(destination, strict=False)
+        except ValueError:
+            continue
+        if network.version == version and network.prefixlen > 0:
+            networks.add(network)
+
+    for interface in addresses:
+        if not isinstance(interface, dict):
+            continue
+        for address in interface.get("addr_info", []):
+            if not isinstance(address, dict):
+                continue
+            local = address.get("local")
+            prefixlen = address.get("prefixlen")
+            if not local or not isinstance(prefixlen, int):
+                continue
+            try:
+                network = ipaddress.ip_network(f"{local}/{prefixlen}", strict=False)
+            except ValueError:
+                continue
+            if network.version == version:
+                networks.add(network)
+    return networks
+
+
+def choose_ipv4_subnet(existing):
+    private_ranges = (
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+    )
+    preferred = ipaddress.ip_network("10.91.0.0/20")
+    ten_subnets = tuple(private_ranges[0].subnets(new_prefix=20))
+    preferred_index = ten_subnets.index(preferred)
+    candidates = itertools.chain(
+        (preferred,),
+        ten_subnets[preferred_index + 1 :],
+        ten_subnets[:preferred_index],
+        private_ranges[1].subnets(new_prefix=20),
+        private_ranges[2].subnets(new_prefix=20),
+    )
+    for candidate in candidates:
+        if not any(candidate.overlaps(network) for network in existing):
+            return str(candidate)
+    fail("no unused RFC1918 /20 is available for the migrated Rust guests")
+
+
+def choose_ipv6_snat_prefix(existing):
+    units = itertools.chain((0x10,), range(0x11, 0x10000), range(1, 0x10))
+    for unit in units:
+        candidate = ipaddress.ip_network(f"fd91:cafe:cafe:{unit:x}::/64")
+        if not any(candidate.overlaps(network) for network in existing):
+            return str(candidate)
+    fail("no unused fd91:cafe:cafe::/48 ULA /64 is available for IPv6 SNAT")
+
+
+def migration_network_selection(output, ipv6_mode):
+    plan_path = output / "network-selection.json"
+    ipv4_routes = host_networks(4)
+    ipv6_routes = host_networks(6) if ipv6_mode == "snat" else set()
+    if plan_path.exists():
+        try:
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            ipv4 = ipaddress.ip_network(plan["ipv4_subnet"], strict=False)
+            ipv6 = ipaddress.ip_network(plan["ipv6_snat_prefix"], strict=False)
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            fail(f"saved migration network selection is invalid: {exc}")
+        private_ranges = tuple(map(ipaddress.ip_network, ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")))
+        if ipv4.prefixlen != 20 or ipv4.version != 4 or not any(ipv4.subnet_of(net) for net in private_ranges):
+            fail("saved migration IPv4 subnet is not an RFC1918 /20")
+        if (
+            ipv6.prefixlen != 64
+            or ipv6.version != 6
+            or (ipv6.network_address.packed[0] & 0xFE) != 0xFC
+        ):
+            fail("saved migration IPv6 SNAT network is not a ULA /64")
+        if any(ipv4.overlaps(network) for network in ipv4_routes):
+            fail(f"saved migration IPv4 subnet {ipv4} now overlaps a host route")
+        if ipv6_mode == "snat" and any(ipv6.overlaps(network) for network in ipv6_routes):
+            fail(f"saved migration IPv6 prefix {ipv6} now overlaps a host route")
+        return str(ipv4), str(ipv6)
+
+    ipv4 = choose_ipv4_subnet(ipv4_routes)
+    ipv6 = choose_ipv6_snat_prefix(ipv6_routes) if ipv6_mode == "snat" else DEFAULT_SNAT6_PREFIX
+    plan = {"ipv4_subnet": ipv4, "ipv6_snat_prefix": ipv6}
+    write_private(plan_path, json.dumps(plan, separators=(",", ":")) + "\n")
+    return ipv4, ipv6
 
 
 def export(args):
@@ -249,6 +359,7 @@ def export(args):
     ndp_uplink = str(cfg.get("ndp_iface") or cfg.get("ipv6_iface") or "") if ipv6_mode == "subnet" else ""
     if ndp_uplink and not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", ndp_uplink):
         fail("unsupported Go IPv6 uplink interface name")
+    ipv4_subnet, ipv6_snat_prefix = migration_network_selection(args.output, ipv6_mode)
     rfw_addr = str(cfg.get("rfw_addr") or "127.0.0.1:7734")
     if not re.fullmatch(r"(?:[A-Za-z0-9.-]+|\[[0-9a-fA-F:]+\]):[0-9]{1,5}", rfw_addr):
         fail("unsupported Go RFW API address")
@@ -277,10 +388,11 @@ def export(args):
         "",
         "[network]",
         'bridge = "rmbr0"',
-        'ipv4_subnet = "10.91.0.0/20"',
+        f"ipv4_subnet = {toml_string(ipv4_subnet)}",
         f"ipv6_mode = {toml_string(ipv6_mode)}",
         f"ipv6_prefix = {toml_string(ipv6_prefix)}",
         f"ipv6_ndp_uplink = {toml_string(ndp_uplink)}",
+        f"ipv6_snat_prefix = {toml_string(ipv6_snat_prefix)}",
         'dns = ["1.1.1.1", "8.8.8.8"]',
         'veth_prefix = "rv"',
         'wg_prefix = "rw"',

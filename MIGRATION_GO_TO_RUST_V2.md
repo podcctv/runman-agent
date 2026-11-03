@@ -27,6 +27,19 @@ It rebuilds clean Rust containers and retains:
 - supported TCP/UDP host-to-guest port forwards;
 - the supported host IPv6 mode/prefix and RFW API address.
 
+Rust recreates the guest NICs with its own `rmbr0` bridge and isolated veth
+pairs; it does not reuse the old Podman/Incus bridge or guest addresses. Before
+the Go guests stop, migration inventories all host IPv4 routes and addresses
+and selects an unused RFC1918 `/20`. IPv6 SNAT also receives an unused ULA
+`/64`. The same plan is kept in the root-only migration snapshot and rechecked
+before Rust starts, so a newly occupied subnet aborts safely. After Rust starts,
+the installer verifies that every running guest routes through `eth0`, the host
+routes each guest address through `rmbr0`, and one migrated guest can reach
+the configured DNS servers and IPv4 HTTPS. When IPv6 is enabled, the installer
+also checks each guest's IPv6 routes and probes IPv6 HTTPS. A failed network
+check triggers the existing Go rollback before the old guests are removed. If
+no guest was running, external DNS and egress probes are skipped.
+
 Generated root passwords are written to a root-only file in the migration
 backup directory. The operator must retrieve them there after migration.
 
@@ -52,7 +65,8 @@ and restarts the guests that were running before migration. The snapshot stays
 under `/var/backups/runman-go-to-rust-v2.*` with mode 0700.
 
 The installer marks migration committed only after the Rust service, panel,
-instance UUID/run-state inventory, and port-forward records pass checks. It
+instance UUID/run-state inventory, port-forward records, and guest network
+route/egress checks pass. It
 then removes old guest root filesystems. If that cleanup partially fails, Rust
 remains active and cleanup is reported as pending; deleted Go guests cannot be
 restored automatically. Power loss, hardware faults, and every package change

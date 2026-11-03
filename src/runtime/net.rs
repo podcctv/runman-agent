@@ -27,7 +27,7 @@ use crate::config::NetworkConfig;
 use crate::model::L4Proto;
 
 const GATEWAY6_LL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-const SNAT6_PREFIX: Ipv6Addr = Ipv6Addr::new(0xfd91, 0xcafe, 0xcafe, 0x10, 0, 0, 0, 0);
+const DEFAULT_SNAT6_PREFIX: Ipv6Addr = Ipv6Addr::new(0xfd91, 0xcafe, 0xcafe, 0x10, 0, 0, 0, 0);
 /// Instance IPv6 addresses start this far into the prefix, clear of the
 /// host's own addresses (commonly ::1, ::2 or EUI-64 ones).
 const V6_HOST_OFFSET: u128 = 0x1_0000;
@@ -55,6 +55,7 @@ pub struct Net {
     table: String,
     v4_base: u32,
     v4_len: u8,
+    snat6_prefix: Ipv6Addr,
     pub v6: V6Mode,
     pub dns: Vec<String>,
 }
@@ -91,6 +92,15 @@ impl Net {
         if !valid_ifname(&c.bridge) {
             bail!("invalid bridge name {:?}", c.bridge);
         }
+        let snat6_prefix = if c.ipv6_mode == "snat" {
+            let (prefix, len) = parse_cidr6(&c.ipv6_snat_prefix).context("ipv6_snat_prefix")?;
+            if len != 64 || (prefix.segments()[0] & 0xfe00) != 0xfc00 {
+                bail!("ipv6_snat_prefix must be a unique-local /64");
+            }
+            prefix
+        } else {
+            DEFAULT_SNAT6_PREFIX
+        };
         let v6 = match c.ipv6_mode.as_str() {
             "none" | "" => V6Mode::None,
             "snat" => V6Mode::Snat,
@@ -135,6 +145,7 @@ impl Net {
             table: c.nft_table.clone(),
             v4_base: u32::from(v4) & mask4(v4_len),
             v4_len,
+            snat6_prefix,
             v6,
             dns: c.dns.clone(),
         })
@@ -169,7 +180,7 @@ impl Net {
         let ipv6 = match &self.v6 {
             V6Mode::None => None,
             V6Mode::Snat => Some(Ipv6Addr::from(
-                u128::from(SNAT6_PREFIX) + 2 + u128::from(idx),
+                u128::from(self.snat6_prefix) + 2 + u128::from(idx),
             )),
             V6Mode::Subnet { prefix, len, .. } => {
                 let host = V6_HOST_OFFSET + u128::from(idx);
@@ -194,7 +205,7 @@ impl Net {
         let gw = format!("{}/{}", self.gateway4(), self.v4_len);
         run(Command::new("ip").args(["addr", "replace", &gw, "dev", br])).await?;
         if self.v6 == V6Mode::Snat {
-            let ula = format!("{}/64", Ipv6Addr::from(u128::from(SNAT6_PREFIX) + 1));
+            let ula = format!("{}/64", Ipv6Addr::from(u128::from(self.snat6_prefix) + 1));
             run(Command::new("ip").args(["-6", "addr", "replace", &ula, "dev", br])).await?;
         }
         run(Command::new("ip").args(["link", "set", br, "up"])).await?;
@@ -384,6 +395,7 @@ impl Net {
     pub fn ruleset(&self, instances: &[Port], forwards: &[Forward]) -> String {
         let br = &self.bridge;
         let sub4 = self.subnet4();
+        let sub6 = format!("{}/64", self.snat6_prefix);
         let mut r = String::new();
         // `add` + `delete` + definition in one transaction: atomic replace,
         // and it works whether or not the table exists yet.
@@ -496,7 +508,7 @@ impl Net {
         if self.v6 == V6Mode::Snat {
             let _ = writeln!(
                 r,
-                "    ip6 saddr {SNAT6_PREFIX}/64 ip6 daddr != {SNAT6_PREFIX}/64 masquerade"
+                "    ip6 saddr {sub6} ip6 daddr != {sub6} masquerade"
             );
         }
         let _ = writeln!(r, "  }}");
@@ -716,6 +728,26 @@ mod tests {
             "2001:db8:1:2::1:5".parse::<Ipv6Addr>().unwrap()
         );
         assert!(Net::from_config(&cfg("subnet", "2001:db8::/120")).is_err());
+    }
+
+    #[test]
+    fn snat_uses_a_valid_configured_ula_prefix() {
+        let mut config = cfg("snat", "");
+        config.ipv6_snat_prefix = "fdab:1234:5678:9abc::/64".into();
+        let net = Net::from_config(&config).unwrap();
+        assert_eq!(
+            net.addrs_for(3).unwrap().ipv6.unwrap(),
+            "fdab:1234:5678:9abc::5".parse::<Ipv6Addr>().unwrap()
+        );
+        assert!(
+            net.ruleset(&[], &[])
+                .contains("ip6 saddr fdab:1234:5678:9abc::/64")
+        );
+
+        config.ipv6_snat_prefix = "2001:db8::/64".into();
+        assert!(Net::from_config(&config).is_err());
+        config.ipv6_snat_prefix = "fdab:1234:5678::/60".into();
+        assert!(Net::from_config(&config).is_err());
     }
 
     #[test]

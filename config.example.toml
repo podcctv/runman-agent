@@ -30,6 +30,7 @@ ipv4_subnet = "10.91.0.0/20"
 ipv6_mode = "none"          # none | snat | subnet  (`runman-agent detect-ipv6` suggests one)
 ipv6_prefix = ""            # subnet: prefix instances get addresses from
 ipv6_ndp_uplink = ""        # subnet: uplink where the prefix is on-link (empty = routed)
+ipv6_snat_prefix = "fd91:cafe:cafe:10::/64" # snat: unique-local /64 for guest addresses
 dns = ["1.1.1.1", "8.8.8.8"]
 # Host-side names; change only to run several agents on one host (tests).
 veth_prefix = "rv"

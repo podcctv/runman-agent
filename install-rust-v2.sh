@@ -557,7 +557,7 @@ Usage: install.sh [options]
   --from-dir DIR          Use binaries from DIR (runman-agent-linux-<arch>, SHA256SUMS,
                           optionally rfw-<arch>) instead of downloading them
   --migrate-go            Lossy clean-rebuild migration from a supported Go Podman/Incus node;
-                          keeps a rollback snapshot until Rust health and port checks pass
+                          keeps a rollback snapshot until Rust health, port, and network checks pass
   --cleanup-only          Apply 7-day log retention and prune dangling/unused images, without installing
   --cleanup-runtimes      With --cleanup-only: remove empty Podman/Incus packages after inventory checks
   --uninstall             Remove the agent; refuses while instances exist
@@ -696,6 +696,8 @@ prepare_go_migration() {
         || die "Go migration preflight failed; Go remains active"
     MIGRATION_BACKEND=$(cat "$MIGRATION_DIR/source-backend")
     WEB_LISTEN=$(cat "$MIGRATION_DIR/web-listen")
+    migration_ipv4=$(sed -n 's/^ipv4_subnet = "\([^"]*\)"$/\1/p' "$MIGRATION_DIR/config.toml")
+    migration_ipv6_mode=$(sed -n 's/^ipv6_mode = "\([^"]*\)"$/\1/p' "$MIGRATION_DIR/config.toml")
     cp -a "$MIGRATION_DIR/config.toml" "$MIGRATION_DIR/rust-config.toml"
     printf 'Go -> Rust v2 lossy migration\nCreated: %s\nBackend: %s\n' \
         "$(date -Is)" "$MIGRATION_BACKEND" > "$MIGRATION_DIR/README.txt"
@@ -704,6 +706,8 @@ prepare_go_migration() {
     printf 'VM UUIDs, CPU/RAM/disk/bandwidth settings, running/stopped state, and supported TCP/UDP host-to-guest port forwards are retained.\n'
     printf 'Guest data, mounted volumes, installed software, traffic history, WireGuard bindings, custom images, and guest IP addresses are not migrated.\n'
     printf 'A failed install/import/health check triggers service/config/container rollback before old guests are deleted. Power loss and every host package change cannot be guaranteed reversible.\n'
+    printf 'Rust will create a new rmbr0 bridge on %s (IPv6 mode: %s); old Podman/Incus bridges are not reused.\n' \
+        "${migration_ipv4:-unknown}" "${migration_ipv6_mode:-unknown}"
     printf 'Backup and generated root passwords: %s\n' "$MIGRATION_DIR"
     read -r -p 'Type MIGRATE TO RUST to continue: ' _migration_confirm
     [ "$_migration_confirm" = "MIGRATE TO RUST" ] || die "migration cancelled; Go remains active"
@@ -721,6 +725,8 @@ prepare_go_migration() {
         || die "final Go snapshot failed; the old guests remain intact and rollback will restart Go"
     MIGRATION_BACKEND=$(cat "$MIGRATION_DIR/source-backend")
     WEB_LISTEN=$(cat "$MIGRATION_DIR/web-listen")
+    migration_ipv4=$(sed -n 's/^ipv4_subnet = "\([^"]*\)"$/\1/p' "$MIGRATION_DIR/config.toml")
+    migration_ipv6_mode=$(sed -n 's/^ipv6_mode = "\([^"]*\)"$/\1/p' "$MIGRATION_DIR/config.toml")
     cp -a "$MIGRATION_DIR/config.toml" "$MIGRATION_DIR/rust-config.toml"
     printf 'Go -> Rust v2 lossy migration\nCreated: %s\nBackend: %s\n' \
         "$(date -Is)" "$MIGRATION_BACKEND" > "$MIGRATION_DIR/README.txt"
@@ -1098,6 +1104,7 @@ systemctl is-active --quiet runman-agent.service || die "runman-agent failed to 
 if [ "$MIGRATE_GO" = 1 ]; then
     log "verifying migrated instance identities, prior run states, and port forwards"
     health_ok=0
+    network_targets="$MIGRATION_DIR/network-targets.tsv"
     for _ in $(seq 1 30); do
         inventory_http_status=$(curl --silent --show-error --max-time 3 \
             --unix-socket /run/narwhal-agent/connlimit.sock \
@@ -1105,9 +1112,11 @@ if [ "$MIGRATE_GO" = 1 ]; then
             -w '%{http_code}' 2>/dev/null || true)
         if [ "$inventory_http_status" = 200 ]; then
             if python3 - "$MIGRATION_DIR/manifest.json" "$MIGRATION_DIR/legacy-state.json" \
-                "$MIGRATION_DIR/live-inventory.json" "$DATA_DIR/portforwards.json" <<'PY'
-import json, pathlib, sys
+                "$MIGRATION_DIR/live-inventory.json" "$DATA_DIR/portforwards.json" "$network_targets" \
+                "$migration_ipv6_mode" <<'PY'
+import ipaddress, json, pathlib, sys
 manifest, legacy, inventory = [json.loads(pathlib.Path(p).read_text()) for p in sys.argv[1:4]]
+ipv6_mode = sys.argv[6]
 if inventory.get('schema') != 1 or not isinstance(inventory.get('items'), list):
     print('invalid Rust inventory schema', file=sys.stderr)
     raise SystemExit(1)
@@ -1122,6 +1131,32 @@ normalize = lambda row: (row['vm_id'], row.get('protocol', row.get('proto')), ro
 if sorted(map(normalize, stored)) != sorted(map(normalize, manifest['port_forwards'])):
     print(f'port-forward mismatch: expected {len(manifest["port_forwards"])}, got {len(stored)}', file=sys.stderr)
     raise SystemExit(1)
+targets = []
+for item in inventory['items']:
+    if not isinstance(item, dict):
+        continue
+    if expected.get(item.get('id')) is not True:
+        continue
+    pid = item.get('init_pid')
+    if not isinstance(pid, int) or pid <= 0:
+        print(f"running instance {item.get('id')} has no valid init PID", file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        ipv4 = next(str(ipaddress.ip_address(address)) for address in item.get('ips', [])
+                    if ipaddress.ip_address(address).version == 4)
+    except (StopIteration, ValueError, TypeError):
+        print(f"running instance {item.get('id')} has no valid IPv4 address", file=sys.stderr)
+        raise SystemExit(1)
+    ipv6 = ""
+    if ipv6_mode in {"snat", "subnet"}:
+        try:
+            ipv6 = next(str(ipaddress.ip_address(address)) for address in item.get('ips', [])
+                        if ipaddress.ip_address(address).version == 6)
+        except (StopIteration, ValueError, TypeError):
+            print(f"running instance {item.get('id')} has no valid IPv6 address", file=sys.stderr)
+            raise SystemExit(1)
+    targets.append(f"{item['id']}\t{pid}\t{ipv4}\t{ipv6}")
+pathlib.Path(sys.argv[5]).write_text(''.join(row + '\n' for row in targets))
 PY
             then
                 health_ok=1
@@ -1146,6 +1181,105 @@ PY
         sleep 1
     done
     [ "$health_ok" = 1 ] || die "Rust migration inventory or port-forward verification failed"
+    if [ -s "$network_targets" ]; then
+        network_test_pid=""
+        while IFS=$'\t' read -r vm_id guest_pid guest_ipv4 guest_ipv6; do
+            [ -n "$vm_id" ] && [[ "$guest_pid" =~ ^[0-9]+$ ]] \
+                || die "Rust migration network inventory is invalid; Go rollback will run"
+            [ -r "/proc/$guest_pid/ns/net" ] \
+                || die "migrated guest $vm_id has no live network namespace; Go rollback will run"
+            route_ok=0
+            for _ in $(seq 1 20); do
+                host_route=$(ip -4 route get "$guest_ipv4" 2>/dev/null || true)
+                guest_route=$(nsenter --target "$guest_pid" --net -- ip -4 route get 1.1.1.1 2>/dev/null || true)
+                if [[ " $host_route " == *" dev rmbr0 "* \
+                    && " $guest_route " == *" via "* && " $guest_route " == *" dev eth0 "* ]]; then
+                    if [ "$migration_ipv6_mode" = none ]; then
+                        route_ok=1
+                    elif [ -n "$guest_ipv6" ]; then
+                        host_route6=$(ip -6 route get "$guest_ipv6" 2>/dev/null || true)
+                        guest_route6=$(nsenter --target "$guest_pid" --net -- \
+                            ip -6 route get 2606:4700:4700::1111 2>/dev/null || true)
+                        if [[ " $host_route6 " == *" dev rmbr0 "* \
+                            && " $guest_route6 " == *" via "* \
+                            && " $guest_route6 " == *" dev eth0 "* ]]; then
+                            route_ok=1
+                        fi
+                    fi
+                    if [ "$route_ok" = 1 ]; then break; fi
+                fi
+                sleep 1
+            done
+            [ "$route_ok" = 1 ] \
+                || die "migrated guest $vm_id does not route through rmbr0/eth0 (host: ${host_route:-missing}; guest: ${guest_route:-missing}; IPv6 host: ${host_route6:-skipped}; IPv6 guest: ${guest_route6:-skipped}); Go rollback will run"
+            [ -n "$network_test_pid" ] || network_test_pid=$guest_pid
+        done < "$network_targets"
+
+        egress_ok=0
+        for _ in $(seq 1 10); do
+            if nsenter --target "$network_test_pid" --net -- env \
+                -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy \
+                curl -4 -fsS --connect-timeout 2 --max-time 4 \
+                    --resolve one.one.one.one:443:1.1.1.1 \
+                    https://one.one.one.one/ -o /dev/null 2>/dev/null; then
+                egress_ok=1
+                break
+            fi
+            sleep 1
+        done
+        [ "$egress_ok" = 1 ] \
+            || die "migrated guest cannot reach IPv4 HTTPS through rmbr0; Go rollback will run"
+        dns_probe="$MIGRATION_DIR/dns-probe.py"
+        cat > "$dns_probe" <<'PY'
+import secrets
+import socket
+import struct
+import sys
+
+name = "one.one.one.one"
+transaction_id = int.from_bytes(secrets.token_bytes(2), "big")
+question = b"".join(bytes([len(label)]) + label.encode("ascii") for label in name.split(".")) + b"\0\0\1\0\1"
+query = struct.pack("!HHHHHH", transaction_id, 0x0100, 1, 0, 0, 0) + question
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+    client.settimeout(3)
+    client.sendto(query, (sys.argv[1], 53))
+    response, _ = client.recvfrom(2048)
+if len(response) < 12:
+    raise SystemExit("short DNS response")
+reply_id, flags, _, answers, _, _ = struct.unpack("!HHHHHH", response[:12])
+if reply_id != transaction_id or flags & 0x000F or answers < 1:
+    raise SystemExit("invalid DNS response")
+PY
+        chmod 600 "$dns_probe"
+        dns_ok=0
+        for dns_server in 1.1.1.1 8.8.8.8; do
+            if nsenter --target "$network_test_pid" --net -- python3 "$dns_probe" "$dns_server" >/dev/null 2>&1; then
+                dns_ok=1
+                break
+            fi
+        done
+        [ "$dns_ok" = 1 ] \
+            || die "migrated guest cannot resolve through the configured DNS servers; Go rollback will run"
+        if [ "$migration_ipv6_mode" != none ]; then
+            ipv6_egress_ok=0
+            for _ in $(seq 1 10); do
+                if nsenter --target "$network_test_pid" --net -- env \
+                    -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy \
+                    curl -6 -fsS --connect-timeout 2 --max-time 4 \
+                        --resolve 'one.one.one.one:443:[2606:4700:4700::1111]' \
+                        https://one.one.one.one/ -o /dev/null 2>/dev/null; then
+                    ipv6_egress_ok=1
+                    break
+                fi
+                sleep 1
+            done
+            [ "$ipv6_egress_ok" = 1 ] \
+                || die "migrated guest cannot reach IPv6 HTTPS in $migration_ipv6_mode mode; Go rollback will run"
+        fi
+        log "verified host routes to all running guests, DNS, and IPv4 HTTPS egress from a migrated guest"
+    else
+        log "no guests were running before migration; guest egress probe skipped"
+    fi
     if [ -n "$WEB_LISTEN" ]; then
         host_port=${WEB_LISTEN##*:}
         web_host=${WEB_LISTEN%:*}
