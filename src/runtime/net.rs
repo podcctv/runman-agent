@@ -506,10 +506,7 @@ impl Net {
             "    ip saddr {sub4} ip daddr {sub4} ct status dnat masquerade"
         );
         if self.v6 == V6Mode::Snat {
-            let _ = writeln!(
-                r,
-                "    ip6 saddr {sub6} ip6 daddr != {sub6} masquerade"
-            );
+            let _ = writeln!(r, "    ip6 saddr {sub6} ip6 daddr != {sub6} masquerade");
         }
         let _ = writeln!(r, "  }}");
         let _ = writeln!(
