@@ -278,20 +278,35 @@ def export(args):
         fail("Go database has duplicate VM identities in vm_configs")
     if len(set(provider_ids)) != len(provider_rows):
         fail(f"Go database has duplicate VM identities in {provider_table}")
-    if not base_rows:
-        if provider_rows:
-            fail(f"Go database has {len(provider_rows)} {provider_table} row(s) but no vm_configs rows")
-        unmanaged = backend_inventory(backend)
-        if unmanaged:
-            fail(
-                f"Go database has no instance records but {backend} inventory contains "
-                f"{len(unmanaged)} container(s); refusing an empty migration"
-            )
-        print("Go database and backend inventory are empty; proceeding with host-only migration")
     base_by_id = dict(zip(base_ids, base_rows))
     provider_by_id = dict(zip(provider_ids, provider_rows))
     if set(provider_by_id) != set(base_by_id):
         fail("Go core instance rows do not exactly match the selected backend rows")
+
+    managed_names = []
+    for row in provider_rows:
+        name = str(column(row, "container") or "").strip()
+        if not name or not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
+            fail(f"Go database has an invalid {backend} container name {name!r}")
+        managed_names.append(name)
+    if len(set(managed_names)) != len(managed_names):
+        fail(f"Go database maps multiple VM identities to the same {backend} container name")
+
+    inventory = backend_inventory(backend)
+    managed_set = set(managed_names)
+    unmanaged = inventory - managed_set
+    if unmanaged:
+        fail(
+            f"{backend} inventory contains {len(unmanaged)} container(s) without matching Go database records; "
+            "refusing migration because their ownership cannot be proven"
+        )
+    missing = managed_set - inventory
+    if missing:
+        fail(
+            f"Go database references {len(missing)} {backend} container(s) missing from the live inventory"
+        )
+    if not base_rows:
+        print("Go database and backend inventory are empty; proceeding with host-only migration")
 
     instances = []
     legacy_state = []
