@@ -58,6 +58,17 @@ struct NetworkQuarantineRequest {
     action: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopOverloadRequest {
+    container_name: String,
+    project: String,
+    instance_id: String,
+    threshold: u32,
+    metric_tcp_active: bool,
+    reason: String,
+}
+
 #[derive(Debug)]
 struct HttpRequest {
     method: String,
@@ -73,12 +84,13 @@ impl Drop for SocketCleanup {
     }
 }
 
-pub async fn serve_connlimit<F, Fut, I, IFut, E, EFut, N, NFut>(
+pub async fn serve_connlimit<F, Fut, I, IFut, E, EFut, N, NFut, S, SFut>(
     manager: Arc<crate::connlimit::Manager>,
     resolve: F,
     inventory: I,
     exec: E,
     network_quarantine: N,
+    stop_overload: S,
 ) -> Result<()>
 where
     F: Fn(String) -> Fut + Clone + Send + Sync + 'static,
@@ -89,6 +101,8 @@ where
     EFut: Future<Output = Result<(i32, String, String)>> + Send + 'static,
     N: Fn(String, String, String, String) -> NFut + Clone + Send + Sync + 'static,
     NFut: Future<Output = Result<(String, bool, bool, bool, i32)>> + Send + 'static,
+    S: Fn(String, String, String, u32, bool) -> SFut + Clone + Send + Sync + 'static,
+    SFut: Future<Output = Result<(String, u64)>> + Send + 'static,
 {
     let listener = bind(CONNLIMIT_SOCKET).await?;
     let _cleanup = SocketCleanup(CONNLIMIT_SOCKET);
@@ -102,6 +116,7 @@ where
         let inventory = inventory.clone();
         let exec = exec.clone();
         let network_quarantine = network_quarantine.clone();
+        let stop_overload = stop_overload.clone();
         tokio::spawn(async move {
             if let Err(e) = timeout(Duration::from_secs(100), async move {
                 handle_connlimit(
@@ -111,6 +126,7 @@ where
                     inventory,
                     exec,
                     network_quarantine,
+                    stop_overload,
                 )
                 .await
             })
@@ -142,13 +158,14 @@ pub async fn serve_firewall(manager: Arc<crate::hostpolicy::Manager>) -> Result<
     }
 }
 
-async fn handle_connlimit<F, Fut, I, IFut, E, EFut, N, NFut>(
+async fn handle_connlimit<F, Fut, I, IFut, E, EFut, N, NFut, S, SFut>(
     mut stream: UnixStream,
     manager: Arc<crate::connlimit::Manager>,
     resolve: F,
     inventory: I,
     exec: E,
     network_quarantine: N,
+    stop_overload: S,
 ) -> Result<()>
 where
     F: Fn(String) -> Fut,
@@ -159,6 +176,8 @@ where
     EFut: Future<Output = Result<(i32, String, String)>>,
     N: Fn(String, String, String, String) -> NFut,
     NFut: Future<Output = Result<(String, bool, bool, bool, i32)>>,
+    S: Fn(String, String, String, u32, bool) -> SFut,
+    SFut: Future<Output = Result<(String, u64)>>,
 {
     let request = match read_request(&mut stream, MAX_BODY).await {
         Ok(request) => request,
@@ -354,6 +373,60 @@ where
                 )
                 .await
             }
+            Err(error) => respond_error(&mut stream, 409, &format!("{error:#}")).await,
+        };
+    }
+    if request.method == "POST" && path == "/v1/stop-overload" {
+        let req: StopOverloadRequest = match serde_json::from_slice(&request.body) {
+            Ok(value) => value,
+            Err(_) => return respond_error(&mut stream, 400, "invalid overload stop JSON").await,
+        };
+        let canonical_generation = uuid::Uuid::parse_str(&req.instance_id)
+            .ok()
+            .filter(|id| id.get_version_num() == 4)
+            .map(|id| id.to_string());
+        if req.project != "default"
+            || req.reason != "sustained_connection_overload"
+            || !(1..=10_000_000).contains(&req.threshold)
+            || canonical_generation.as_deref() != Some(req.instance_id.as_str())
+        {
+            return respond_error(&mut stream, 400, "invalid generation-bound overload stop target")
+                .await;
+        }
+        let id = match crate::model::VmId::parse(&req.container_name) {
+            Ok(id) => id.as_str().to_owned(),
+            Err(_) => {
+                return respond_error(
+                    &mut stream,
+                    400,
+                    "container_name must be the managed Runman VM UUID",
+                )
+                .await;
+            }
+        };
+        return match stop_overload(
+            id,
+            req.instance_id.clone(),
+            req.project,
+            req.threshold,
+            req.metric_tcp_active,
+        )
+        .await
+        {
+            Ok((instance_id, current_connections)) if instance_id == req.instance_id => {
+                respond_json(
+                    &mut stream,
+                    200,
+                    &json!({
+                        "ok": true,
+                        "stopped": true,
+                        "instance_id": instance_id,
+                        "current_connections": current_connections,
+                    }),
+                )
+                .await
+            }
+            Ok(_) => respond_error(&mut stream, 409, "Runman stop identity readback changed").await,
             Err(error) => respond_error(&mut stream, 409, &format!("{error:#}")).await,
         };
     }
@@ -828,8 +901,23 @@ mod tests {
                 42,
             ))
         };
+        let stop_overload = |_: String,
+                             generation: String,
+                             _: String,
+                             threshold: u32,
+                             metric_tcp_active: bool| async move {
+            assert_eq!(threshold, 1500);
+            assert!(metric_tcp_active);
+            Ok((generation, 1600))
+        };
         let task = tokio::spawn(handle_connlimit(
-            server, manager, resolve, inventory, exec, network,
+            server,
+            manager,
+            resolve,
+            inventory,
+            exec,
+            network,
+            stop_overload,
         ));
         let body = serde_json::json!({
             "container_name": "11111111-2222-3333-4444-555555555555",
@@ -856,6 +944,72 @@ mod tests {
         let response = String::from_utf8(response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(response.contains("\"stdout\":\"watcher-ok\""));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn overload_stop_route_requires_canonical_generation_and_reads_back_stop() {
+        let dir = temp_path();
+        let manager = Arc::new(
+            crate::connlimit::Manager::new(dir.join("connlimit.json"), "rmbr0".into()).unwrap(),
+        );
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let resolve = |_| async {
+            Ok(crate::connlimit::Target {
+                managed: false,
+                running: false,
+                instance_id: String::new(),
+                ips: vec![],
+            })
+        };
+        let inventory = || async { Ok(serde_json::json!({"schema": 1, "items": []})) };
+        let exec = |_: String, _: String, _: String, _: String, _: u64| async {
+            Ok((0, String::new(), String::new()))
+        };
+        let network = |_: String, generation: String, _: String, _: String| async move {
+            Ok((generation, false, true, true, 42))
+        };
+        let stop = |id: String,
+                    generation: String,
+                    project: String,
+                    threshold: u32,
+                    metric_tcp_active: bool| async move {
+            assert_eq!(id, "11111111-2222-3333-4444-555555555555");
+            assert_eq!(generation, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+            assert_eq!(project, "default");
+            assert_eq!(threshold, 1500);
+            assert!(metric_tcp_active);
+            Ok((generation, 1600))
+        };
+        let task = tokio::spawn(handle_connlimit(
+            server, manager, resolve, inventory, exec, network, stop,
+        ));
+        let body = serde_json::json!({
+            "container_name": "11111111-2222-3333-4444-555555555555",
+            "project": "default",
+            "instance_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "threshold": 1500,
+            "metric_tcp_active": true,
+            "reason": "sustained_connection_overload"
+        })
+        .to_string();
+        client
+            .write_all(
+                format!(
+                    "POST /v1/stop-overload HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        task.await.unwrap().unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("\"stopped\":true"));
+        assert!(response.contains("\"current_connections\":1600"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

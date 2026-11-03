@@ -565,6 +565,75 @@ impl Runtime {
         ))
     }
 
+    /// Stop only the same, still-overloaded Runman generation. The VM lock
+    /// serializes the identity check, final procfs sample, desired-state
+    /// update and systemd stop against Runman lifecycle operations.
+    pub async fn watcher_stop_overload(
+        &self,
+        raw_id: &str,
+        expected_generation: &str,
+        project: &str,
+        threshold: u32,
+        metric_tcp_active: bool,
+    ) -> Result<(String, u64)> {
+        anyhow::ensure!(project == "default", "only the default project is supported");
+        anyhow::ensure!(
+            (1..=10_000_000).contains(&threshold),
+            "connection stop threshold is invalid"
+        );
+        let generation = uuid::Uuid::parse_str(expected_generation)
+            .context("invalid Runman instance generation")?;
+        anyhow::ensure!(
+            generation.get_version_num() == 4 && generation.to_string() == expected_generation,
+            "Runman instance generation must be a canonical UUID v4"
+        );
+        let id = VmId::parse(raw_id)?;
+        let _guard = self.lock_vm(id.as_str()).await;
+        let Some(rec) = self.load(id.as_str())? else {
+            bail!("Runman instance is not managed");
+        };
+        anyhow::ensure!(!rec.builder, "temporary image builders are not addressable");
+        anyhow::ensure!(
+            rec.generation == expected_generation,
+            "Runman instance generation changed"
+        );
+        anyhow::ensure!(
+            rec.desired == Desired::Running && self.is_active(id.as_str()).await,
+            "Runman instance is not running"
+        );
+        let pid_path = self.run_spec(&rec).init_pid_file();
+        let pid = std::fs::read_to_string(&pid_path)
+            .context("Runman init PID is unavailable")?
+            .trim()
+            .parse::<i32>()
+            .context("Runman init PID is invalid")?;
+        anyhow::ensure!(pid > 1, "Runman init PID is invalid");
+        let (established, pending, time_wait, udp_sockets) = monitor::watcher_tcp_counts(pid)
+            .context("fresh Runman connection tables are unavailable")?;
+        let current_connections = if metric_tcp_active {
+            established.saturating_add(pending)
+        } else {
+            established
+                .saturating_add(pending)
+                .saturating_add(time_wait)
+                .saturating_add(udp_sockets)
+        };
+        anyhow::ensure!(
+            current_connections > u64::from(threshold),
+            "Runman connection load recovered below the stop threshold"
+        );
+        let current_pid = std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i32>().ok());
+        anyhow::ensure!(
+            current_pid == Some(pid) && self.is_active(id.as_str()).await,
+            "Runman process changed during the final connection check"
+        );
+        self.set_desired(&id, Desired::Stopped)?;
+        self.halt(id.as_str(), false).await?;
+        Ok((rec.generation, current_connections))
+    }
+
     /// Apply or read a reversible per-instance network quarantine. The
     /// persistent record is written before toggling the host veth so restarts
     /// and crash recovery follow the same fail-closed desired state.

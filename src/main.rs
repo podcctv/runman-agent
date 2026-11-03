@@ -316,6 +316,7 @@ async fn agent_main() -> Result<()> {
         let inventory_runtime = runtime.clone();
         let exec_runtime = runtime.clone();
         let network_runtime = runtime.clone();
+        let stop_runtime = runtime.clone();
         tokio::spawn(async move {
             if let Err(e) = runman_agent::controlapi::serve_connlimit(
                 connlimit,
@@ -340,6 +341,20 @@ async fn agent_main() -> Result<()> {
                     async move {
                         runtime
                             .watcher_network_quarantine(&id, &generation, &project, &action)
+                            .await
+                    }
+                },
+                move |id, generation, project, threshold, metric_tcp_active| {
+                    let runtime = stop_runtime.clone();
+                    async move {
+                        runtime
+                            .watcher_stop_overload(
+                                &id,
+                                &generation,
+                                &project,
+                                threshold,
+                                metric_tcp_active,
+                            )
                             .await
                     }
                 },
