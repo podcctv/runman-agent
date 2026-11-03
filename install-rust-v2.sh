@@ -1184,8 +1184,9 @@ PY
     if [ -s "$network_targets" ]; then
         network_test_pid=""
         while IFS=$'\t' read -r vm_id guest_pid guest_ipv4 guest_ipv6; do
-            [ -n "$vm_id" ] && [[ "$guest_pid" =~ ^[0-9]+$ ]] \
-                || die "Rust migration network inventory is invalid; Go rollback will run"
+            if [ -z "$vm_id" ] || ! [[ "$guest_pid" =~ ^[0-9]+$ ]]; then
+                die "Rust migration network inventory is invalid; Go rollback will run"
+            fi
             [ -r "/proc/$guest_pid/ns/net" ] \
                 || die "migrated guest $vm_id has no live network namespace; Go rollback will run"
             route_ok=0
