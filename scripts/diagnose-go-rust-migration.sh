@@ -69,8 +69,34 @@ for row in rows:
 PY
 )
 else
-    instance_names=()
-    printf 'legacy-state.json is missing; no instance names can be read from the snapshot.\n'
+    inventory=$(incus list --format csv,noheader --columns n,s,p 2>&1)
+    inventory_rc=$?
+    if [ "$inventory_rc" -eq 0 ]; then
+        mapfile -t instance_names < <(printf '%s\n' "$inventory" | python3 -c '
+import csv
+import re
+import sys
+
+for row in csv.reader(sys.stdin):
+    if len(row) != 3 or row[1].strip().lower() != "running":
+        continue
+    try:
+        if int(row[2]) > 1:
+            continue
+    except ValueError:
+        pass
+    if re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", row[0]):
+        print(row[0])
+')
+        if [ "${#instance_names[@]}" -gt 0 ]; then
+            printf 'legacy-state.json is missing; inspecting running instances with invalid or missing init PIDs.\n'
+        else
+            printf 'legacy-state.json is missing; Incus did not report a running instance with an invalid init PID.\n'
+        fi
+    else
+        instance_names=()
+        printf 'legacy-state.json is missing; cannot inventory Incus instances: %s\n' "$inventory"
+    fi
 fi
 
 if [ "${#instance_names[@]}" -gt 0 ]; then
