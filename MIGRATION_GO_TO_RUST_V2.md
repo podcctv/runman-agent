@@ -22,17 +22,17 @@ becomes `ERROR` during shutdown is marked for clean rebuild and is preserved in
 the normal rollback-safe staging path.
 
 If less than 768 MiB is available on the Runman data filesystem, the installer
-asks for a second typed confirmation to force-delete only the unusable `ERROR`
-Incus guests present in the confirmed snapshot. It first saves VM settings, port
-forwards, the Go database/configuration, and generated replacement passwords;
-then it stops Go and its guests, deletes those confirmed `ERROR` guests, removes
-incomplete APT downloads and unused cached Incus images, and installs host
-prerequisites before Rust image staging. Newly unusable guests discovered while
-stopping are not covered by that deletion confirmation. If later Rust checks
-fail, the Go service/configuration can be restored; guests deleted for disk
-recovery cannot be restored automatically. Before each Incus stop, the helper
-checks the reported state and init PID; an unusable state uses the rebuild
-fallback instead of issuing a stop to PID -1.
+asks for a second typed confirmation to delete every Go-managed Incus guest
+listed in the confirmed snapshot. It first saves VM settings, port forwards, the
+Go database/configuration, and generated replacement passwords; then it stops
+Go and its guests, deletes the confirmed guests, removes incomplete APT
+downloads and unused cached Incus images, and installs host prerequisites before
+Rust image staging. A guest still running after the stop phase is not deleted;
+new or changed guests discovered after confirmation also abort this cleanup.
+If later Rust checks fail, the Go service/configuration can be restored; guests
+deleted for disk recovery cannot be restored automatically. Before each Incus
+stop, the helper checks the reported state and init PID; an unusable state uses
+the rebuild fallback instead of issuing a stop to PID -1.
 
 The verified, read-only migration diagnostic is also saved in the root-only
 snapshot. If rollback cannot confirm every guest, the installer prints the
@@ -63,9 +63,9 @@ routes each guest address through `rmbr0`, and one migrated guest can reach
 the configured DNS servers and IPv4 HTTPS. When IPv6 is enabled, the installer
 also checks each guest's IPv6 routes and probes IPv6 HTTPS. A failed network
 check triggers the existing Go rollback before normally usable old guests are
-removed. Low-space `ERROR` guests explicitly deleted before staging are not
-restored on rollback. If no guest was running, external DNS and egress probes
-are skipped.
+removed. Incus guests explicitly deleted before staging to recover disk space
+are not restored on rollback. If no guest was running, external DNS and egress
+probes are skipped.
 
 Generated root passwords are written to a root-only file in the migration
 backup directory. The operator must retrieve them there after migration.
@@ -91,8 +91,8 @@ Before normal destructive cleanup, an installer failure stops the partial Rust
 service, removes its managed state, restores the Go config/service state, and
 restarts recoverable guests that were running before migration. The snapshot
 stays under `/var/backups/runman-go-to-rust-v2.*` with mode 0700. If low-space
-recovery already deleted `ERROR` guests, Go can return with those guest
-containers absent; the snapshot still preserves their settings and database.
+recovery already deleted Incus guests, Go can return with those containers
+absent; the snapshot still preserves their settings and database.
 
 The installer marks migration committed only after the Rust service, panel,
 instance UUID/run-state inventory, port-forward records, and guest network

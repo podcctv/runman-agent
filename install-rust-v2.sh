@@ -50,8 +50,8 @@ MIGRATION_LXCFS_CONFIG_TOUCHED=0
 MIGRATION_LXCFS_STATE_TOUCHED=0
 MIGRATION_GO_STOP_ATTEMPTED=0
 HOST_PACKAGES_INSTALLED=0
-MIGRATION_ERROR_GUESTS_PREDELETE_CONFIRMED=0
-MIGRATION_ERROR_GUESTS_PREDELETE_ATTEMPTED=0
+MIGRATION_GUESTS_PREDELETE_CONFIRMED=0
+MIGRATION_GUESTS_PREDELETE_ATTEMPTED=0
 MIGRATION_MIN_FREE_BYTES=$((768 * 1024 * 1024))
 WORK=""
 
@@ -101,7 +101,7 @@ migration_available_bytes() {
     printf '%s\n' "$available"
 }
 
-migration_fallback_count() {
+migration_instance_count() {
     python3 - "$1" <<'PY'
 import json
 import pathlib
@@ -115,31 +115,34 @@ except (OSError, UnicodeError, json.JSONDecodeError) as exc:
 if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
     print("saved legacy state is not a list of objects", file=sys.stderr)
     raise SystemExit(1)
-print(sum(row.get("rebuild_fallback") is True for row in rows))
+if any(not str(row.get("name") or "").strip() for row in rows):
+    print("saved legacy state contains an instance without a name", file=sys.stderr)
+    raise SystemExit(1)
+print(len(rows))
 PY
 }
 
 migration_confirm_low_space_cleanup() {
-    local available fallback_count answer
+    local available instance_count answer
     [ "$MIGRATION_BACKEND" = incus ] || return 0
     available=$(migration_available_bytes)
     [ "$available" -lt "$MIGRATION_MIN_FREE_BYTES" ] || return 0
-    fallback_count=$(migration_fallback_count "$MIGRATION_DIR/legacy-state.json") \
-        || die "could not count ERROR Incus guests for low-space recovery"
-    [ "$fallback_count" -gt 0 ] \
-        || die "only ${available} bytes are free; no unusable Incus guests can safely be removed to recover space"
+    instance_count=$(migration_instance_count "$MIGRATION_DIR/legacy-state.json") \
+        || die "could not count Go-managed Incus guests for low-space recovery"
+    [ "$instance_count" -gt 0 ] \
+        || die "only ${available} bytes are free; no Go-managed Incus guests can be removed to recover space"
 
     printf '\nLow disk space: %s bytes are available; this migration needs at least %s bytes for Rust image staging.\n' \
         "$available" "$MIGRATION_MIN_FREE_BYTES"
     printf 'The root-only snapshot at %s preserves parameters, port forwards, and the Go database, but not old guest files.\n' \
         "$MIGRATION_DIR"
-    printf 'To proceed, the %s ERROR Incus guest(s) will be force-deleted before Rust health checks; rollback can restore Go service/configuration but not those guest files.\n' \
-        "$fallback_count"
-    read -r -p 'Type DELETE ERROR GUESTS to continue: ' answer </dev/tty \
+    printf 'To proceed, all %s Go-managed Incus guest(s) in this snapshot will be deleted before Rust health checks; rollback can restore Go service/configuration but not those guest files.\n' \
+        "$instance_count"
+    read -r -p 'Type DELETE INCUS GUESTS to continue: ' answer </dev/tty \
         || die "could not read the low-space deletion confirmation; Go remains active"
-    [ "$answer" = "DELETE ERROR GUESTS" ] \
+    [ "$answer" = "DELETE INCUS GUESTS" ] \
         || die "low-space guest deletion cancelled; Go and the legacy guests remain untouched"
-    MIGRATION_ERROR_GUESTS_PREDELETE_CONFIRMED=1
+    MIGRATION_GUESTS_PREDELETE_CONFIRMED=1
 }
 
 migration_capture_file() {
@@ -363,8 +366,8 @@ migration_rollback() {
         "$MIGRATION_HELPER" lifecycle start --backend "$MIGRATION_BACKEND" \
             --state "$MIGRATION_DIR/legacy-state.json" || failed=1
     fi
-    if [ "$MIGRATION_ERROR_GUESTS_PREDELETE_ATTEMPTED" = 1 ]; then
-        printf 'Low-space recovery had begun deleting unusable ERROR Incus guests before Rust health checks. The snapshot preserves their parameters and Go database, but their guest files cannot be restored. Review predeleted_for_space in %s/legacy-state.json.\n' \
+    if [ "$MIGRATION_GUESTS_PREDELETE_ATTEMPTED" = 1 ]; then
+        printf 'Low-space recovery had begun deleting confirmed Go-managed Incus guests before Rust health checks. The snapshot preserves their parameters and Go database, but their guest files cannot be restored. Review predeleted_for_space in %s/legacy-state.json.\n' \
             "$MIGRATION_DIR" >&2
     fi
     if [ "$MIGRATION_GO_STOP_ATTEMPTED" = 1 ]; then
@@ -384,8 +387,8 @@ migration_rollback() {
                 "$MIGRATION_DIR/diagnose-go-rust-migration.sh" "$MIGRATION_DIR" >&2
         fi
     else
-        if [ "$MIGRATION_ERROR_GUESTS_PREDELETE_ATTEMPTED" = 1 ]; then
-            printf 'Go service/configuration was restored. ERROR guests deleted for disk recovery remain absent; their settings/database are backed up but their files cannot be restored.\n' >&2
+        if [ "$MIGRATION_GUESTS_PREDELETE_ATTEMPTED" = 1 ]; then
+            printf 'Go service/configuration was restored. Incus guests deleted for disk recovery remain absent; their settings/database are backed up but their files cannot be restored.\n' >&2
         elif [ "$MIGRATION_GO_STOP_ATTEMPTED" = 1 ]; then
             printf 'Go service state and recoverable pre-existing containers were restored.\n' >&2
         else
@@ -985,7 +988,7 @@ prepare_go_migration() {
     printf '\nThis migration rebuilds clean Alpine/Debian guests and permanently discards their old root filesystems after Rust health checks pass.\n'
     printf 'VM UUIDs, CPU/RAM/disk/bandwidth settings, running/stopped state, and supported TCP/UDP host-to-guest port forwards are retained.\n'
     printf 'Guest data, mounted volumes, installed software, traffic history, WireGuard bindings, custom images, and guest IP addresses are not migrated.\n'
-    printf 'The installer attempts service/config/container rollback on failure. If disk space is below 768 MiB, a second typed confirmation can force-delete unusable ERROR Incus guests before Rust health checks; their parameters/database are backed up, but guest files cannot be restored. Power loss and host package changes cannot be guaranteed reversible.\n'
+    printf 'The installer attempts service/config/container rollback on failure. If disk space is below 768 MiB, a second typed confirmation can delete all Go-managed Incus guests before Rust health checks; their parameters/database are backed up, but guest files cannot be restored. Power loss and host package changes cannot be guaranteed reversible.\n'
     printf 'Rust will create a new rmbr0 bridge on %s (IPv6 mode: %s); old Podman/Incus bridges are not reused.\n' \
         "${migration_ipv4:-unknown}" "${migration_ipv6_mode:-unknown}"
     printf 'Backup and generated root passwords: %s\n' "$MIGRATION_DIR"
@@ -999,7 +1002,7 @@ prepare_go_migration() {
     # Go and its guests, and delete only the ERROR guests covered by the second
     # confirmation. Their storage is needed to make room for APT and Rust.
     # Normal migrations retain the earlier package preflight ordering.
-    if [ "$MIGRATION_ERROR_GUESTS_PREDELETE_CONFIRMED" != 1 ]; then
+    if [ "$MIGRATION_GUESTS_PREDELETE_CONFIRMED" != 1 ]; then
         install_host_packages
     fi
     MIGRATION_GO_STOP_ATTEMPTED=1
@@ -1020,31 +1023,30 @@ import json
 import pathlib
 import sys
 
-def fallback_names(path):
+def instance_names(path):
     rows = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise ValueError("legacy state is not a list of objects")
-    return {
-        str(row.get("name") or "")
-        for row in rows
-        if row.get("rebuild_fallback") is True or row.get("was_error_state") is True
-    }
+    names = [str(row.get("name") or "") for row in rows]
+    if any(not name for name in names) or len(names) != len(set(names)):
+        raise ValueError("legacy state has a missing or duplicate instance name")
+    return set(names)
 
 try:
-    changed = fallback_names(sys.argv[2]) ^ fallback_names(sys.argv[1])
+    changed = instance_names(sys.argv[2]) ^ instance_names(sys.argv[1])
 except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
-    print(f"cannot compare Incus error-state preflight: {exc}", file=sys.stderr)
+    print(f"cannot compare Incus instance set: {exc}", file=sys.stderr)
     raise SystemExit(2)
 if changed:
     print(
-        "unusable Incus instance set changed after confirmation; retry after reviewing: "
+        "Go-managed Incus instance set changed after confirmation; retry after reviewing: "
         + ", ".join(sorted(changed)),
         file=sys.stderr,
     )
     raise SystemExit(1)
 PY
         then
-            die "unusable Incus instance set changed after confirmation; no legacy guest has been deleted"
+            die "Go-managed Incus instance set changed after confirmation; no legacy guest has been deleted"
         fi
     fi
     MIGRATION_BACKEND=$(cat "$MIGRATION_DIR/source-backend")
@@ -1054,12 +1056,12 @@ PY
     cp -a "$MIGRATION_DIR/config.toml" "$MIGRATION_DIR/rust-config.toml"
     printf 'Go -> Rust v2 lossy migration\nCreated: %s\nBackend: %s\n' \
         "$(date -Is)" "$MIGRATION_BACKEND" > "$MIGRATION_DIR/README.txt"
-    log "checking and stopping legacy $MIGRATION_BACKEND instances; unusable Incus instances remain intact unless low-space deletion was explicitly confirmed"
+    log "checking and stopping legacy $MIGRATION_BACKEND instances; low-space deletion applies only after an explicit snapshot-based confirmation"
     "$MIGRATION_HELPER" lifecycle stop --backend "$MIGRATION_BACKEND" \
         --state "$MIGRATION_DIR/legacy-state.json"
-    if [ "$MIGRATION_ERROR_GUESTS_PREDELETE_CONFIRMED" = 1 ]; then
-        MIGRATION_ERROR_GUESTS_PREDELETE_ATTEMPTED=1
-        "$MIGRATION_HELPER" lifecycle purge-fallbacks --backend "$MIGRATION_BACKEND" \
+    if [ "$MIGRATION_GUESTS_PREDELETE_CONFIRMED" = 1 ]; then
+        MIGRATION_GUESTS_PREDELETE_ATTEMPTED=1
+        "$MIGRATION_HELPER" lifecycle purge-for-space --backend "$MIGRATION_BACKEND" \
             --state "$MIGRATION_DIR/legacy-state.json" \
             --confirmed-state "$MIGRATION_DIR/pre-confirm-legacy-state.json"
         cleanup_incus_cached_images
@@ -1067,7 +1069,7 @@ PY
         migration_free_after_delete=$(migration_available_bytes)
         log "low-space cleanup and host package preparation left ${migration_free_after_delete} bytes available"
         [ "$migration_free_after_delete" -ge "$MIGRATION_MIN_FREE_BYTES" ] \
-            || die "only ${migration_free_after_delete} bytes remain after deleting confirmed ERROR guests and preparing host packages; more disk space is required before Rust image staging"
+            || die "only ${migration_free_after_delete} bytes remain after deleting confirmed Incus guests and preparing host packages; more disk space is required before Rust image staging"
     fi
     log "legacy Go configuration, database snapshot, root passwords, and host settings saved at $MIGRATION_DIR"
 }
