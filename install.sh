@@ -260,8 +260,8 @@ purge_incus_artifacts() {
     esac
     names=$(incus list --format csv -c n 2>/dev/null || true)
     log "$(t "Incus instances to delete:" "将删除的 Incus 实例:") ${names:-<none>}"
-    log "$(t "Managed image aliases to delete:" "将删除的受管镜像别名:") alpine/3.24/cloud/$purge_arch/ready, alpine/3.23/cloud/$purge_arch/ready, debian/13/cloud/$purge_arch/ready"
-    log "$(t "Managed network/remote to delete:" "将删除的受管网络/远端:") incusbr0, podcctv-mirror"
+    log "$(t "Managed image aliases to delete:" "将删除的受管镜像别名:") alpine/3.24/cloud/$purge_arch/ready, alpine/3.23/cloud/$purge_arch/ready, debian/13/cloud/$purge_arch/ready, custom/alpine-base, podcctv/alpine-base"
+    log "$(t "Managed network/remote to delete:" "将删除的受管网络/远端:") incusbr0, custom-mirror, podcctv-mirror"
 
     if [ "$NON_INTERACTIVE" != "1" ] && [ -t 0 ]; then
         read -rp "$(t "Type PURGE to continue: " "输入 PURGE 继续: ")" answer
@@ -276,19 +276,21 @@ purge_incus_artifacts() {
         fi
     done <<< "$names"
 
-    for alias in "alpine/3.24/cloud/$purge_arch/ready" "alpine/3.23/cloud/$purge_arch/ready" "debian/13/cloud/$purge_arch/ready" podcctv/alpine-base; do
+    for alias in "alpine/3.24/cloud/$purge_arch/ready" "alpine/3.23/cloud/$purge_arch/ready" "debian/13/cloud/$purge_arch/ready" "custom/alpine-base" podcctv/alpine-base; do
         incus image info "$alias" >/dev/null 2>&1 || continue
         if ! incus image delete "$alias" >/dev/null 2>&1; then
             log "$(t "Failed to delete managed Incus image:" "删除受管 Incus 镜像失败:") $alias"
             failed=1
         fi
     done
-    if incus remote list --format csv -c n 2>/dev/null | grep -qx podcctv-mirror; then
-        incus remote remove podcctv-mirror >/dev/null 2>&1 || {
-            log "$(t "Failed to remove Incus remote: podcctv-mirror" "删除 Incus 远端失败: podcctv-mirror")"
-            failed=1
-        }
-    fi
+    for remote_name in custom-mirror podcctv-mirror; do
+        if incus remote list --format csv -c n 2>/dev/null | grep -qx "$remote_name"; then
+            incus remote remove "$remote_name" >/dev/null 2>&1 || {
+                log "$(t "Failed to remove Incus remote:" "删除 Incus 远端失败:") $remote_name"
+                failed=1
+            }
+        fi
+    done
     if incus network show incusbr0 >/dev/null 2>&1; then
         incus network delete incusbr0 >/dev/null 2>&1 || {
             log "$(t "Failed to delete incusbr0; check for remaining instances or profiles." "删除 incusbr0 失败；请检查残留实例或 profile 引用。")"
@@ -2381,6 +2383,7 @@ prompt_existing_image_update() {
         printf '  3) %s\n' "$(t "Import from an offline local directory" "从离线本地目录导入")"
         printf '  4) %s\n' "$(t "Set a custom Alpine base file/alias" "设置自定义 Alpine 基础镜像文件/别名")"
         printf '  5) %s\n' "$(t "Reset to the podcctv default mirror" "恢复 podcctv 默认镜像源")"
+        printf '  6) %s\n' "$(t "Reset to official GitHub releases" "恢复官方 GitHub 镜像源")"
         read -rp '[1] > ' choice
         case "${choice:-1}" in
             1) INCUS_IMAGE_MIRROR="$current" ;;
@@ -2388,6 +2391,7 @@ prompt_existing_image_update() {
             3) read -rp "$(t "Local image directory: " "本地镜像目录: ")" value; [ -d "$value" ] || die "$(t "Directory not found: $value" "目录不存在: $value")"; INCUS_LOCAL_IMAGE_DIR="$value" ;;
             4) read -rp "$(t "Alpine base tarball path or Incus alias: " "Alpine 基础镜像 tarball 路径或 Incus 别名: ")" value; [ -n "$value" ] || die "$(t "Value cannot be empty." "输入不能为空。")"; INCUS_ALPINE_BASE="$value" ;;
             5) INCUS_IMAGE_MIRROR="$DEFAULT_INCUS_IMAGE_MIRROR"; INCUS_IMAGE_MIRROR_EXPLICIT=1 ;;
+            6) INCUS_IMAGE_MIRROR=""; INCUS_IMAGE_MIRROR_EXPLICIT=1 ;;
             *) die "$(t "Invalid image operation." "无效的镜像操作。")" ;;
         esac
     elif [ "$virt" = "podman" ]; then
