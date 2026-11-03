@@ -557,7 +557,7 @@ else
 fi
 # Tokens are only ever issued by the platform; none means standalone mode.
 if [ -n "$TOKEN" ]; then
-    "$BIN" --config "$CONFIG" set-token "$TOKEN" >/dev/null
+    printf '%s\n' "$TOKEN" | "$BIN" --config "$CONFIG" set-token --stdin >/dev/null
 fi
 
 # ── rfw ─────────────────────────────────────────────────────────────────────
@@ -754,7 +754,7 @@ if grep -qE '^token = ".+"' "$CONFIG"; then
     echo "  mode:    platform (connects to $(sed -n 's/^platform_url = "\(.*\)"$/\1/p' "$CONFIG"))"
 else
     echo "  mode:    standalone (no platform token; manage instances in the panel)"
-    echo "           connect later: runman-agent set-token '<token from the platform>' && systemctl restart runman-agent"
+    echo "           connect later: read -rsp 'Platform token: ' token; echo; printf '%s\\n' \"\$token\" | runman-agent set-token --stdin && unset token && systemctl restart runman-agent"
 fi
 echo "  OS images are downloaded in the background on first start (journalctl -fu runman-agent)."
 if [ "$MIGRATE_GO" = 1 ]; then

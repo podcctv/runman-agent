@@ -45,7 +45,13 @@ bash install.sh --token '<平台下发的 Token>'      # 接入平台
 - **升级**：重新运行 `install.sh` 即可，配置保持不变；默认也会自动更新。
 - **卸载**：`bash install.sh --uninstall`（节点上还有实例时拒绝执行）；`--uninstall --purge` 会连同全部实例和数据一起删除。
 - **忘记面板密码**：`echo '新密码' | runman-agent set-password`。
-- **接入或断开平台**：`runman-agent set-token '<Token>'` / `runman-agent set-token --clear`，然后执行 `systemctl restart runman-agent`；也可以在面板「设置」里操作（立即生效）。节点上已有本地实例时接入平台要谨慎：平台会删除它数据库里没有的实例。
+- **接入或断开平台**：用隐藏输入并从 stdin 设置平台签发的 Token，然后执行 `systemctl restart runman-agent`：
+  ```bash
+  read -rsp 'Platform token: ' token; echo
+  printf '%s\n' "$token" | runman-agent set-token --stdin
+  unset token
+  ```
+  也可以执行 `runman-agent set-token --clear` 断开平台，或在面板「设置」里操作（立即生效）。节点上已有本地实例时接入平台要谨慎：平台会删除它数据库里没有的实例。
 
 - **节点带宽**：agent 首次启动时向 Cloudflare 测速一次，之后不再自动测速（8 路并发，每个方向两轮取较好的一轮，最多约 800 MB），把上下行中较小的值上报平台，平台据此限制可售套餐的带宽上限。测速可能偏低，可以在面板「设置 → 节点带宽」里修正：可以改成任意更低的值，最高为测速结果的 2 倍；需要重新测速时点面板里的「重新测速」，或在节点上执行 `runman-agent speedtest`（之后重启 agent 生效）。
 - **流量重置**：两种方式，在面板「设置 → 流量统计」中切换，立即生效，当前周期已用的流量会保留到新的重置时间：

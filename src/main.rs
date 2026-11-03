@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -37,12 +38,18 @@ enum Command {
     SetPassword,
     /// Set the token issued by the platform (restart the agent afterwards).
     SetToken {
-        /// Token from the platform.
-        #[arg(required_unless_present = "clear")]
+        /// Token from the platform. Prefer --stdin to keep it out of process arguments.
+        #[arg(
+            required_unless_present_any = ["clear", "stdin"],
+            conflicts_with_all = ["clear", "stdin"]
+        )]
         token: Option<String>,
+        /// Read the token from stdin (trailing line endings are removed).
+        #[arg(long, conflicts_with_all = ["clear", "token"])]
+        stdin: bool,
         /// Remove the token: the agent stops talking to the platform and the
         /// panel manages the node on its own.
-        #[arg(long, conflicts_with = "token")]
+        #[arg(long, conflicts_with_all = ["token", "stdin"])]
         clear: bool,
     },
     /// Probe the host and print suggested IPv6 settings for `[network]`.
@@ -140,9 +147,26 @@ async fn agent_main() -> Result<()> {
             #[cfg(not(target_os = "linux"))]
             anyhow::bail!("Go migration is supported only on Linux");
         }
-        Some(Command::SetToken { token, clear }) => {
+        Some(Command::SetToken {
+            token,
+            stdin,
+            clear,
+        }) => {
             let token = if clear {
                 String::new()
+            } else if stdin {
+                let mut value = String::new();
+                std::io::stdin().lock().read_to_string(&mut value)?;
+                let value = value.trim_end_matches(['\r', '\n']).to_owned();
+                anyhow::ensure!(
+                    !value.trim().is_empty(),
+                    "platform token from stdin must not be empty"
+                );
+                anyhow::ensure!(
+                    !value.contains('\r') && !value.contains('\n'),
+                    "platform token from stdin must be a single line"
+                );
+                value
             } else {
                 token.unwrap_or_default()
             };
