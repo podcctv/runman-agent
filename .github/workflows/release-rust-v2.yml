@@ -81,9 +81,10 @@ jobs:
         run: |
           cp install-rust-v2.sh dist/install.sh
           cp scripts/migrate-go-state.py dist/
+          cp scripts/diagnose-go-rust-migration.sh dist/
           cd dist
-          chmod 755 runman-agent-linux-* install.sh migrate-go-state.py
-          sha256sum runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh migrate-go-state.py > SHA256SUMS
+          chmod 755 runman-agent-linux-* install.sh migrate-go-state.py diagnose-go-rust-migration.sh
+          sha256sum runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh migrate-go-state.py diagnose-go-rust-migration.sh > SHA256SUMS
           ls -l
       - name: Reject superseded continuous build
         if: github.ref == 'refs/heads/main'
@@ -101,7 +102,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd dist
-          files=(runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh migrate-go-state.py SHA256SUMS)
+          files=(runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh migrate-go-state.py diagnose-go-rust-migration.sh SHA256SUMS)
           if [ "${{ github.ref_type }}" = tag ]; then
             gh release create "${{ github.ref_name }}" "${files[@]}" --title "${{ github.ref_name }}" --generate-notes
           else

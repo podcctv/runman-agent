@@ -11,8 +11,20 @@ flow.
 The migration supports the standard Go Podman and Incus container backends.
 Preflight reads the Go JSON config, takes an SQLite online backup, verifies the
 live backend objects, and validates every item before stopping the Go agent.
+For Incus, each instance must be `Running` with a valid init PID or `Stopped`;
+an `ERROR` state or missing PID aborts preflight before the destructive prompt.
 After confirmation it stops Go, takes a final config/database/live-state
-snapshot, then stops the old guests.
+snapshot, then gracefully stops the old guests. Incus gets up to 120 seconds
+per guest to shut down cleanly; the installer never force-stops a guest after a
+timeout.
+Before each Incus stop, the helper also checks the reported state and init PID.
+If Incus reports `Running` with an invalid PID, migration aborts and keeps the
+old guests for manual inspection.
+
+The verified, read-only migration diagnostic is also saved in the root-only
+snapshot. If rollback cannot confirm every guest, the installer prints the
+command to run it against that snapshot. It reports service/Incus state and
+relevant logs without reading the saved passwords or changing host state.
 
 A host with no Go instances can use the same migration. The helper permits an
 empty manifest only when both Go instance tables and the complete Podman/Incus
@@ -98,5 +110,6 @@ implemented.
 - Stable Rust releases: `rust-v*` tags.
 
 The Go menu downloads the Rust installer (`install.sh` release asset), migration
-helper, binary, and checksums from `continuous-rs`. The Rust release workflow
-publishes those assets when Rust source changes land on `main`.
+helper, read-only diagnostic helper, binary, and checksums from `continuous-rs`.
+The Rust release workflow publishes those assets when Rust source changes land
+on `main`.

@@ -380,6 +380,16 @@ images, and mounted-volume attachments are not migrated. Generated root
 passwords are saved in a root-only file under
 `/var/backups/runman-go-to-rust-v2.*/root-passwords.txt`.
 
+If an Incus instance is already in `ERROR`, or reports `RUNNING` without a
+valid init PID, the installer displays
+`volatile.last_state.power` as a hint and asks whether its replacement should
+run or remain stopped, since that field can be stale. It leaves the old error
+instance in place while staging Rust and force-deletes it only after the Rust
+health checks pass. If the final pre-stop review finds that the set of unusable
+Incus instances changed after confirmation, migration aborts before legacy
+guest cleanup. On rollback, a pre-existing
+unusable instance is left in place and is not started again.
+
 An installer/import/health failure before cleanup triggers best-effort rollback
 of the Go service/config and previously running guests. If cleanup partially
 fails, Rust stays active and remaining cleanup is reported; already deleted Go

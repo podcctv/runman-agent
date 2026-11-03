@@ -2,6 +2,8 @@
 """Export and manage the deliberately limited Go -> Rust clean-rebuild migration."""
 
 import argparse
+import csv
+import io
 import ipaddress
 import itertools
 import json
@@ -18,6 +20,7 @@ from pathlib import Path
 DEFAULT_CONFIG = Path("/opt/narwhal-agent/config.json")
 DEFAULT_DB = Path("/opt/narwhal-agent/agent.db")
 MAX_DB_BYTES = 2 * 1024 * 1024 * 1024
+INCUS_STOP_TIMEOUT = 120
 DEFAULT_SNAT6_PREFIX = "fd91:cafe:cafe:10::/64"
 
 
@@ -25,9 +28,9 @@ def fail(message):
     raise SystemExit(message)
 
 
-def checked_run(args, *, capture=True):
+def checked_run(args, *, capture=True, timeout=45):
     try:
-        result = subprocess.run(args, check=False, text=True, capture_output=capture, timeout=45)
+        result = subprocess.run(args, check=False, text=True, capture_output=capture, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
         fail(f"cannot run {args[0]}: {exc}")
     if result.returncode != 0:
@@ -75,6 +78,66 @@ def bounded_int(value, label, minimum, maximum):
     return parsed
 
 
+def incus_instance_state(name):
+    if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
+        fail(f"unsupported legacy container name {name!r}")
+    result = checked_run(
+        ["incus", "list", "--format", "csv,noheader", "--columns", "n,s,p", name]
+    )
+    try:
+        rows = list(csv.reader(io.StringIO(result)))
+    except csv.Error as exc:
+        fail(f"Incus returned invalid state data for {name}: {exc}")
+    if len(rows) != 1 or len(rows[0]) != 3 or rows[0][0] != name:
+        fail(f"Incus did not return one unambiguous instance state for {name}")
+    return rows[0][1].strip().lower(), rows[0][2].strip()
+
+
+def incus_state_needs_rebuild(status, init_pid):
+    if status == "error":
+        return True
+    if status != "running":
+        return False
+    try:
+        return int(init_pid) <= 1
+    except ValueError:
+        return True
+
+
+def incus_running_from_state(status, init_pid, name):
+    if status not in {"running", "stopped"}:
+        fail(
+            f"Incus instance {name} is in {status.upper()} state; "
+            "migration supports only Running or Stopped instances"
+        )
+    if status == "stopped":
+        return False
+    try:
+        pid = int(init_pid)
+    except ValueError:
+        fail(f"Incus reports {name} as Running but returned an invalid init PID")
+    if pid <= 1:
+        fail(f"Incus reports {name} as Running with invalid init PID {pid}")
+    return True
+
+
+def incus_last_power_state(name):
+    try:
+        result = subprocess.run(
+            ["incus", "config", "get", name, "volatile.last_state.power"],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    state = result.stdout.strip().lower()
+    return state if state in {"running", "stopped"} else ""
+
+
 def canonical_uuid(value):
     try:
         return str(uuid.UUID(str(value)))
@@ -90,14 +153,8 @@ def live_state(backend, name):
         if result not in {"true", "false"}:
             fail(f"Podman returned an unrecognized state for {name}")
         return result == "true"
-    result = checked_run(["incus", "info", name])
-    match = re.search(r"(?m)^Status:\s*(\S+)", result)
-    if not match:
-        fail(f"Incus did not report an instance status for {name}")
-    status = match.group(1).lower()
-    if status not in {"running", "stopped"}:
-        fail(f"unsupported Incus status {status!r} for {name}")
-    return status == "running"
+    status, init_pid = incus_instance_state(name)
+    return incus_running_from_state(status, init_pid, name)
 
 
 def backend_inventory(backend):
@@ -228,6 +285,18 @@ def migration_network_selection(output, ipv6_mode):
 
 def export(args):
     cfg, backend = read_config(args.config)
+    error_state_overrides = {}
+    override_path = getattr(args, "error_state_overrides", None)
+    if override_path is not None and override_path.exists():
+        try:
+            error_state_overrides = json.loads(override_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            fail(f"cannot read Incus ERROR run-state choices: {exc}")
+        if not isinstance(error_state_overrides, dict) or any(
+            not isinstance(name, str) or type(running) is not bool
+            for name, running in error_state_overrides.items()
+        ):
+            fail("Incus ERROR run-state choices must map instance names to true/false")
     db_path = Path(str(cfg.get("db") or DEFAULT_DB))
     if not db_path.is_absolute():
         db_path = args.config.parent / db_path
@@ -262,30 +331,64 @@ def export(args):
         fail("Go database has duplicate VM identities in vm_configs")
     if len(set(provider_ids)) != len(provider_rows):
         fail(f"Go database has duplicate VM identities in {provider_table}")
-    if not base_rows:
-        if provider_rows:
-            fail(f"Go database has {len(provider_rows)} {provider_table} row(s) but no vm_configs rows")
-        unmanaged = backend_inventory(backend)
-        if unmanaged:
-            fail(
-                f"Go database has no instance records but {backend} inventory contains "
-                f"{len(unmanaged)} container(s); refusing an empty migration"
-            )
-        print("Go database and backend inventory are empty; proceeding with host-only migration")
     base_by_id = dict(zip(base_ids, base_rows))
     provider_by_id = dict(zip(provider_ids, provider_rows))
     if set(provider_by_id) != set(base_by_id):
         fail("Go core instance rows do not exactly match the selected backend rows")
 
+    managed_names = []
+    for row in provider_rows:
+        name = str(column(row, "container") or "").strip()
+        if not name or not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
+            fail(f"Go database has an invalid {backend} container name {name!r}")
+        managed_names.append(name)
+    if len(set(managed_names)) != len(managed_names):
+        fail(f"Go database maps multiple VM identities to the same {backend} container name")
+
+    inventory = backend_inventory(backend)
+    managed_set = set(managed_names)
+    unmanaged = inventory - managed_set
+    if unmanaged:
+        fail(
+            f"{backend} inventory contains {len(unmanaged)} container(s) without matching Go database records; "
+            "refusing migration because their ownership cannot be proven"
+        )
+    missing = managed_set - inventory
+    if missing:
+        fail(
+            f"Go database references {len(missing)} {backend} container(s) missing from the live inventory"
+        )
+    if set(error_state_overrides) - managed_set:
+        fail("Incus ERROR run-state choices contain an instance not managed by the Go database")
+    if not base_rows:
+        print("Go database and backend inventory are empty; proceeding with host-only migration")
+
     instances = []
     legacy_state = []
+    rebuild_fallback_instances = []
     passwords = ["VM UUID\tnew root password (root-only; guest data is rebuilt)\n"]
     for vm_id, row in base_by_id.items():
         provider = provider_by_id[vm_id]
         name = str(column(provider, "container") or "").strip()
         if not name:
             fail(f"backend container name is missing for {vm_id}")
-        running = live_state(backend, name)
+        rebuild_fallback = False
+        fallback_status = ""
+        fallback_init_pid = ""
+        last_power_state = ""
+        if backend == "incus":
+            status, init_pid = incus_instance_state(name)
+            if incus_state_needs_rebuild(status, init_pid):
+                rebuild_fallback = True
+                fallback_status = status
+                fallback_init_pid = init_pid
+                last_power_state = incus_last_power_state(name)
+                running = error_state_overrides.get(name, last_power_state == "running")
+                rebuild_fallback_instances.append((name, status, init_pid, last_power_state))
+            else:
+                running = incus_running_from_state(status, init_pid, name)
+        else:
+            running = live_state(backend, name)
         image = str(column(row, "image") or column(provider, "image") or "").strip().lower()
         if image == "alpine" or image.startswith("alpine/") or image.startswith("alpine-"):
             os_image = "alpine"
@@ -304,7 +407,14 @@ def export(args):
             "root_password": password,
             "was_running": running,
         })
-        legacy_state.append({"name": name, "was_running": running})
+        legacy_row = {"vm_id": vm_id, "name": name, "was_running": running}
+        if rebuild_fallback:
+            legacy_row["rebuild_fallback"] = True
+            legacy_row["fallback_status"] = fallback_status
+            legacy_row["fallback_init_pid"] = fallback_init_pid
+            legacy_row["last_state_power"] = last_power_state
+            legacy_row["run_state_confirmed"] = name in error_state_overrides
+        legacy_state.append(legacy_row)
         passwords.append(f"{vm_id}\t{password}\n")
 
     forwards = []
@@ -408,6 +518,16 @@ def export(args):
     except OSError:
         pass
     print(f"exported {len(instances)} instance(s), {len(forwards)} port forward(s), backend={backend}")
+    for name, status, init_pid, last_power_state in rebuild_fallback_instances:
+        confirmed = name in error_state_overrides
+        state = "confirmed by operator" if confirmed else "requires operator choice"
+        print(
+            f"Incus rebuild fallback: {name} (status={status.upper()}, init PID={init_pid or 'missing'}, "
+            f"volatile.last_state.power="
+            f"{last_power_state.upper() or 'unset'}, replacement state {state}); "
+            "leave it untouched during staging, rebuild it as a clean Rust guest, "
+            "and force-delete the old guest only after Rust health checks pass"
+        )
 
 
 def state_file(path):
@@ -426,6 +546,7 @@ def lifecycle(args):
     if backend not in {"podman", "incus"}:
         fail("invalid legacy backend")
     if args.action == "stop":
+        failed_name = ""
         try:
             for row in rows:
                 if row.get("was_running") is not True:
@@ -433,8 +554,39 @@ def lifecycle(args):
                 name = str(row.get("name") or "")
                 if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
                     fail(f"unsupported legacy container name {name!r}")
-                command = ["podman", "stop", "--time", "20", name] if backend == "podman" else ["incus", "stop", name, "--timeout", "30"]
-                checked_run(command)
+                failed_name = name
+                if backend == "incus" and row.get("rebuild_fallback") is True:
+                    status, init_pid = incus_instance_state(name)
+                    if incus_state_needs_rebuild(status, init_pid):
+                        print(
+                            f"{name}: leaving the pre-existing unusable Incus instance in place "
+                            "until the Rust health checks pass"
+                        )
+                        continue
+                # A previous stop may have completed even if its client timed
+                # out. Make this phase idempotent before retrying a stop.
+                if not live_state(backend, name):
+                    continue
+                if backend == "podman":
+                    checked_run(["podman", "stop", "--time", "20", name])
+                else:
+                    # Give guests more time for a clean shutdown. Keep the
+                    # client timeout longer than Incus's own shutdown timeout.
+                    try:
+                        checked_run(
+                            ["incus", "stop", name, "--timeout", str(INCUS_STOP_TIMEOUT)],
+                            timeout=INCUS_STOP_TIMEOUT + 30,
+                        )
+                    except SystemExit as stop_error:
+                        # Incus can report a timed-out stop after the guest
+                        # actually reached Stopped. Continue only when that
+                        # state is independently confirmed.
+                        try:
+                            stopped = not live_state(backend, name)
+                        except SystemExit as state_error:
+                            fail(f"{name}: stop failed ({stop_error}); state check failed ({state_error})")
+                        if not stopped:
+                            raise stop_error
         except SystemExit as exc:
             restore_errors = []
             for row in rows:
@@ -445,6 +597,10 @@ def lifecycle(args):
                     restore_errors.append(f"invalid saved name {name!r}")
                     continue
                 try:
+                    if backend == "incus" and row.get("rebuild_fallback") is True:
+                        status, init_pid = incus_instance_state(name)
+                        if incus_state_needs_rebuild(status, init_pid):
+                            continue
                     if live_state(backend, name):
                         continue
                     command = ["podman", "start", name] if backend == "podman" else ["incus", "start", name]
@@ -452,11 +608,23 @@ def lifecycle(args):
                 except SystemExit as restore_exc:
                     restore_errors.append(f"{name}: {restore_exc}")
             if restore_errors:
-                fail(f"{exc}; stop rollback was incomplete: " + "; ".join(restore_errors))
+                message = f"{exc}; stop rollback was incomplete: " + "; ".join(restore_errors)
+                if backend == "incus" and failed_name:
+                    message += (
+                        f"; inspect with `incus info --show-log {failed_name}` "
+                        "and do not force-stop or delete the instance"
+                    )
+                fail(message)
+            if backend == "incus" and failed_name:
+                fail(
+                    f"{failed_name}: {exc}; inspect with `incus info --show-log {failed_name}` "
+                    "and do not force-stop or delete the instance"
+                )
             raise
         return
     if args.action == "start":
         errors = []
+        skipped_error_instances = []
         for row in rows:
             if row.get("was_running") is not True:
                 continue
@@ -465,6 +633,11 @@ def lifecycle(args):
                 errors.append(f"invalid saved name {name!r}")
                 continue
             try:
+                if backend == "incus" and row.get("rebuild_fallback") is True:
+                    status, init_pid = incus_instance_state(name)
+                    if incus_state_needs_rebuild(status, init_pid):
+                        skipped_error_instances.append(name)
+                        continue
                 if live_state(backend, name):
                     continue
             except SystemExit as exc:
@@ -476,6 +649,11 @@ def lifecycle(args):
                 errors.append(f"{name}: {(result.stderr or result.stdout or '').strip()[-300:]}")
         if errors:
             fail("could not restore all previously running Go containers: " + "; ".join(errors))
+        if skipped_error_instances:
+            print(
+                "left pre-existing Incus ERROR instance(s) untouched during rollback: "
+                + ", ".join(skipped_error_instances)
+            )
         return
     if args.action == "purge":
         errors = []
@@ -500,6 +678,7 @@ def main():
     export_parser = sub.add_parser("export")
     export_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     export_parser.add_argument("--output", type=Path, required=True)
+    export_parser.add_argument("--error-state-overrides", type=Path)
     export_parser.set_defaults(func=export)
     life = sub.add_parser("lifecycle")
     life.add_argument("action", choices=["stop", "start", "purge"])

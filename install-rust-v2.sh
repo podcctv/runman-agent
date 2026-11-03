@@ -44,6 +44,10 @@ MIGRATION_GO_WAS_ACTIVE=0
 MIGRATION_GO_WAS_ENABLED=0
 MIGRATION_LXCFS_WAS_ACTIVE=0
 MIGRATION_LXCFS_WAS_ENABLED=0
+MIGRATION_MODULES_CONFIG_TOUCHED=0
+MIGRATION_SYSCTL_CONFIG_TOUCHED=0
+MIGRATION_LXCFS_CONFIG_TOUCHED=0
+MIGRATION_LXCFS_STATE_TOUCHED=0
 WORK=""
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -73,6 +77,125 @@ migration_restore_file() {
     fi
 }
 
+migration_choose_error_states() {
+    local rows_file name fallback_status fallback_pid last_power answer selected found=0
+    [ "$MIGRATION_BACKEND" = incus ] || return 0
+
+    rows_file="$MIGRATION_DIR/incus-error-instances.tsv"
+    if ! python3 - "$MIGRATION_DIR/legacy-state.json" > "$rows_file" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    rows = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    print(f"cannot read Incus ERROR instances: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+    print("legacy state is not a list of objects", file=sys.stderr)
+    raise SystemExit(1)
+for row in rows:
+    if (
+        row.get("rebuild_fallback") is True or row.get("was_error_state") is True
+    ) and row.get("run_state_confirmed") is not True:
+        name = str(row.get("name") or "")
+        status = str(row.get("fallback_status") or "ERROR")
+        pid = str(row.get("fallback_init_pid") or "missing")
+        power = str(row.get("last_state_power") or "unset")
+        print(f"{name}\t{status}\t{pid}\t{power}")
+PY
+    then
+        die "could not read Incus ERROR instance state choices"
+    fi
+
+    while IFS=$'\t' read -r name fallback_status fallback_pid last_power; do
+        [ -n "$name" ] || continue
+        found=1
+        [ -n "$last_power" ] || last_power='unset'
+        printf '\nIncus reports %s as %s with init PID %s; its guest filesystem will be rebuilt.\n' \
+            "$name" "${fallback_status^^}" "$fallback_pid"
+        printf 'Incus volatile.last_state.power is %s and may be stale.\n' "${last_power^^}"
+        while true; do
+            read -r -p "Should the replacement guest start after migration? Enter RUNNING or STOPPED: " answer \
+                || die "could not read the replacement run state for $name"
+            case "${answer^^}" in
+                RUNNING|R) selected=running; break ;;
+                STOPPED|S) selected=stopped; break ;;
+                *) warn "enter RUNNING or STOPPED" ;;
+            esac
+        done
+        python3 - "$MIGRATION_DIR/error-state-overrides.json" "$name" "$selected" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    choices = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    print(f"cannot read prior run-state choices: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(choices, dict):
+    print("run-state choices are not an object", file=sys.stderr)
+    raise SystemExit(1)
+choices[sys.argv[2]] = sys.argv[3] == "running"
+tmp = path.with_name(path.name + ".tmp")
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as stream:
+    json.dump(choices, stream, separators=(",", ":"))
+    stream.write("\n")
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+        printf 'Replacement for %s will be %s after migration.\n' "$name" "${selected^^}"
+    done < "$rows_file"
+    rm -f -- "$rows_file"
+
+    if [ "$found" = 1 ]; then
+        "$MIGRATION_HELPER" export --config "$1" --output "$MIGRATION_DIR" \
+            --error-state-overrides "$MIGRATION_DIR/error-state-overrides.json" \
+            || die "could not save the selected Incus replacement states"
+        if ! python3 - "$MIGRATION_DIR/legacy-state.json" \
+            "$MIGRATION_DIR/error-state-overrides.json" <<'PY'
+import json
+import pathlib
+import sys
+
+rows = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+choices = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+    print("invalid legacy state", file=sys.stderr)
+    raise SystemExit(2)
+if not isinstance(choices, dict):
+    print("invalid replacement run-state choices", file=sys.stderr)
+    raise SystemExit(2)
+fallbacks = {
+    str(row.get("name") or "")
+    for row in rows
+    if row.get("rebuild_fallback") is True
+}
+pending = [
+    str(row.get("name") or "")
+    for row in rows
+    if row.get("rebuild_fallback") is True
+    and row.get("run_state_confirmed") is not True
+]
+if pending:
+    print("new unusable Incus state needs a run-state choice: " + ", ".join(pending), file=sys.stderr)
+    raise SystemExit(1)
+stale_choices = sorted(set(choices) - fallbacks)
+if stale_choices:
+    print("Incus state changed while choosing replacement states: " + ", ".join(stale_choices), file=sys.stderr)
+    raise SystemExit(1)
+PY
+        then
+            die "Incus state changed while selecting replacement states; retry migration to review it"
+        fi
+    fi
+}
+
 migration_rollback() {
     local failed=0 record id
     printf '\nMigration did not commit; restoring the Go service and containers. Snapshot: %s\n' "$MIGRATION_DIR" >&2
@@ -91,22 +214,43 @@ migration_rollback() {
     rm -rf -- "$CONFIG_DIR" "$DATA_DIR" /run/runman-agent
     rm -f /run/narwhal-agent/connlimit.sock /run/narwhal-agent/firewall.sock
     rmdir /run/narwhal-agent >/dev/null 2>&1 || true
-    migration_restore_file /etc/modules-load.d/runman.conf || failed=1
-    migration_restore_file /etc/sysctl.d/90-runman.conf || failed=1
-    migration_restore_file /etc/systemd/system/lxcfs.service.d/runman.conf || failed=1
-    systemctl daemon-reload >/dev/null 2>&1 || failed=1
-    sysctl --system >/dev/null 2>&1 || true
-    # Restore lxcfs before restarting the old guests so they mount its views
-    # with the original service configuration.
-    if [ "$MIGRATION_LXCFS_WAS_ACTIVE" = 1 ]; then
-        systemctl restart lxcfs.service >/dev/null 2>&1 || failed=1
-    else
-        systemctl stop lxcfs.service >/dev/null 2>&1 || true
+    if [ "$MIGRATION_MODULES_CONFIG_TOUCHED" = 1 ]; then
+        migration_restore_file /etc/modules-load.d/runman.conf || failed=1
     fi
-    if [ "$MIGRATION_LXCFS_WAS_ENABLED" = 1 ]; then
-        systemctl enable lxcfs.service >/dev/null 2>&1 || failed=1
-    else
-        systemctl disable lxcfs.service >/dev/null 2>&1 || true
+    if [ "$MIGRATION_SYSCTL_CONFIG_TOUCHED" = 1 ]; then
+        migration_restore_file /etc/sysctl.d/90-runman.conf || failed=1
+    fi
+    if [ "$MIGRATION_LXCFS_CONFIG_TOUCHED" = 1 ]; then
+        migration_restore_file /etc/systemd/system/lxcfs.service.d/runman.conf || failed=1
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || failed=1
+    if [ "$MIGRATION_SYSCTL_CONFIG_TOUCHED" = 1 ]; then
+        sysctl --system >/dev/null 2>&1 || true
+    fi
+
+    if [ "$MIGRATION_LXCFS_CONFIG_TOUCHED" = 1 ] || [ "$MIGRATION_LXCFS_STATE_TOUCHED" = 1 ]; then
+        local lxcfs_active_now=0 lxcfs_enabled_now=0
+        if systemctl is-active --quiet lxcfs.service; then lxcfs_active_now=1; fi
+        if systemctl is-enabled --quiet lxcfs.service; then lxcfs_enabled_now=1; fi
+
+        # Restore lxcfs configuration only when this installer changed it.
+        # If the service was already in its original state, avoid restarting
+        # it during an early rollback (which detaches its /proc views).
+        if [ "$MIGRATION_LXCFS_WAS_ACTIVE" = 1 ]; then
+            if [ "$lxcfs_active_now" = 0 ]; then
+                systemctl start lxcfs.service >/dev/null 2>&1 || failed=1
+            elif [ "$MIGRATION_LXCFS_CONFIG_TOUCHED" = 1 ]; then
+                systemctl restart lxcfs.service >/dev/null 2>&1 || failed=1
+            fi
+        elif [ "$lxcfs_active_now" = 1 ]; then
+            systemctl stop lxcfs.service >/dev/null 2>&1 || failed=1
+        fi
+
+        if [ "$MIGRATION_LXCFS_WAS_ENABLED" = 1 ]; then
+            [ "$lxcfs_enabled_now" = 1 ] || systemctl enable lxcfs.service >/dev/null 2>&1 || failed=1
+        elif [ "$lxcfs_enabled_now" = 1 ]; then
+            systemctl disable lxcfs.service >/dev/null 2>&1 || failed=1
+        fi
     fi
     if [ -x "$MIGRATION_HELPER" ] && [ -f "$MIGRATION_DIR/legacy-state.json" ]; then
         "$MIGRATION_HELPER" lifecycle start --backend "$MIGRATION_BACKEND" \
@@ -122,8 +266,12 @@ migration_rollback() {
     fi
     if [ "$failed" = 1 ]; then
         printf 'Automatic rollback could not confirm every restoration. Review %s and systemd/container logs.\n' "$MIGRATION_DIR" >&2
+        if [ -x "$MIGRATION_DIR/diagnose-go-rust-migration.sh" ]; then
+            printf 'Run the read-only diagnostic: bash %q %q\n' \
+                "$MIGRATION_DIR/diagnose-go-rust-migration.sh" "$MIGRATION_DIR" >&2
+        fi
     else
-        printf 'Go service state and pre-existing containers were restored.\n' >&2
+        printf 'Go service state and recoverable pre-existing containers were restored.\n' >&2
     fi
 }
 
@@ -631,7 +779,7 @@ esac
 
 prepare_go_migration() {
     local go_config=/opt/narwhal-agent/config.json go_binary=/opt/narwhal-agent/narwhal-agent
-    local asset go_unit_path host_port
+    local asset go_unit_path host_port diagnostic_asset=diagnose-go-rust-migration.sh
     [ "$MIGRATE_GO" = 1 ] || return 0
     [ -t 0 ] || die "Go -> Rust migration requires an interactive terminal for the destructive confirmation"
     if [ ! -f "$go_config" ] || [ ! -x "$go_binary" ]; then
@@ -656,16 +804,18 @@ prepare_go_migration() {
         || die "cannot fetch the Rust release checksum list; Go remains active"
     curl -fsSL --retry 3 --connect-timeout 20 -o "$WORK/release/migrate-go-state.py" "$RELEASE_URL/migrate-go-state.py" \
         || die "the Rust release has no Go migration helper; Go remains active"
+    curl -fsSL --retry 3 --connect-timeout 20 -o "$WORK/release/$diagnostic_asset" "$RELEASE_URL/$diagnostic_asset" \
+        || die "the Rust release has no migration diagnostic helper; Go remains active"
     asset="runman-agent-linux-$ARCH"
     curl -fsSL --retry 3 --connect-timeout 20 -o "$WORK/release/$asset" "$RELEASE_URL/$asset" \
         || die "cannot fetch the Rust binary; Go remains active"
-    for asset in migrate-go-state.py "runman-agent-linux-$ARCH"; do
+    for asset in migrate-go-state.py "$diagnostic_asset" "runman-agent-linux-$ARCH"; do
         [ "$(grep -Ec "  \*?$asset\$" "$WORK/SHA256SUMS")" = 1 ] \
             || die "release checksum list does not contain exactly one entry for $asset"
         (cd "$WORK/release" && grep -E "  \*?$asset\$" "$WORK/SHA256SUMS" | sha256sum -c --quiet -) \
             || die "Rust release checksum mismatch for $asset"
     done
-    chmod 755 "$WORK/release/migrate-go-state.py" "$WORK/release/runman-agent-linux-$ARCH"
+    chmod 755 "$WORK/release/migrate-go-state.py" "$WORK/release/$diagnostic_asset" "$WORK/release/runman-agent-linux-$ARCH"
     "$WORK/release/runman-agent-linux-$ARCH" --version >/dev/null \
         || die "Rust release binary does not run on this host; Go remains active"
     MIGRATION_HELPER="$WORK/release/migrate-go-state.py"
@@ -673,6 +823,9 @@ prepare_go_migration() {
     install -d -m 700 /var/backups
     MIGRATION_DIR=$(mktemp -d /var/backups/runman-go-to-rust-v2.XXXXXXXX)
     chmod 700 "$MIGRATION_DIR"
+    printf '{}\n' > "$MIGRATION_DIR/error-state-overrides.json"
+    chmod 600 "$MIGRATION_DIR/error-state-overrides.json"
+    install -m 700 "$WORK/release/$diagnostic_asset" "$MIGRATION_DIR/$diagnostic_asset"
     cp -a "$go_config" "$MIGRATION_DIR/go-config.json"
     cp -a "$go_binary" "$MIGRATION_DIR/go-agent"
     go_unit_path=$(systemctl show -p FragmentPath --value narwhal-agent.service 2>/dev/null || true)
@@ -692,9 +845,15 @@ prepare_go_migration() {
     if systemctl is-active --quiet lxcfs.service; then MIGRATION_LXCFS_WAS_ACTIVE=1; fi
     if systemctl is-enabled --quiet lxcfs.service; then MIGRATION_LXCFS_WAS_ENABLED=1; fi
 
-    "$MIGRATION_HELPER" export --config "$go_config" --output "$MIGRATION_DIR" \
-        || die "Go migration preflight failed; Go remains active"
+    if ! "$MIGRATION_HELPER" export --config "$go_config" --output "$MIGRATION_DIR" \
+        --error-state-overrides "$MIGRATION_DIR/error-state-overrides.json"; then
+        printf 'Go migration preflight failed; Go remains active. Snapshot: %s\n' "$MIGRATION_DIR" >&2
+        printf 'Read-only diagnostic: bash %q %q\n' \
+            "$MIGRATION_DIR/$diagnostic_asset" "$MIGRATION_DIR" >&2
+        exit 1
+    fi
     MIGRATION_BACKEND=$(cat "$MIGRATION_DIR/source-backend")
+    migration_choose_error_states "$go_config"
     WEB_LISTEN=$(cat "$MIGRATION_DIR/web-listen")
     migration_ipv4=$(sed -n 's/^ipv4_subnet = "\([^"]*\)"$/\1/p' "$MIGRATION_DIR/config.toml")
     migration_ipv6_mode=$(sed -n 's/^ipv6_mode = "\([^"]*\)"$/\1/p' "$MIGRATION_DIR/config.toml")
@@ -721,8 +880,43 @@ prepare_go_migration() {
     # export is a preflight; this final export closes the window in which the
     # Go panel could change instances or forwards while the user confirmed.
     cp -a "$go_config" "$MIGRATION_DIR/go-config.json"
+    cp -a "$MIGRATION_DIR/legacy-state.json" "$MIGRATION_DIR/pre-confirm-legacy-state.json"
     "$MIGRATION_HELPER" export --config "$go_config" --output "$MIGRATION_DIR" \
+        --error-state-overrides "$MIGRATION_DIR/error-state-overrides.json" \
         || die "final Go snapshot failed; the old guests remain intact and rollback will restart Go"
+    if [ "$MIGRATION_BACKEND" = incus ]; then
+        if ! python3 - "$MIGRATION_DIR/pre-confirm-legacy-state.json" "$MIGRATION_DIR/legacy-state.json" <<'PY'
+import json
+import pathlib
+import sys
+
+def fallback_names(path):
+    rows = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ValueError("legacy state is not a list of objects")
+    return {
+        str(row.get("name") or "")
+        for row in rows
+        if row.get("rebuild_fallback") is True or row.get("was_error_state") is True
+    }
+
+try:
+    changed = fallback_names(sys.argv[2]) ^ fallback_names(sys.argv[1])
+except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+    print(f"cannot compare Incus error-state preflight: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+if changed:
+    print(
+        "unusable Incus instance set changed after confirmation; retry after reviewing: "
+        + ", ".join(sorted(changed)),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+        then
+            die "unusable Incus instance set changed after confirmation; no legacy guest has been deleted"
+        fi
+    fi
     MIGRATION_BACKEND=$(cat "$MIGRATION_DIR/source-backend")
     WEB_LISTEN=$(cat "$MIGRATION_DIR/web-listen")
     migration_ipv4=$(sed -n 's/^ipv4_subnet = "\([^"]*\)"$/\1/p' "$MIGRATION_DIR/config.toml")
@@ -868,18 +1062,21 @@ log "installing packages"
 # Wait for other apt/dpkg runs (e.g. unattended-upgrades) instead of killing them.
 apt_get() { LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 -y -q "$@"; }
 apt_get update >/dev/null
+if [ "$MIGRATION_ACTIVE" = 1 ]; then MIGRATION_LXCFS_STATE_TOUCHED=1; fi
 apt_get install --no-install-recommends \
     ca-certificates curl iproute2 iptables nftables wireguard-tools e2fsprogs tar gzip zstd util-linux kmod lxcfs >/dev/null
 
 for mod in wireguard ifb sch_cake tcp_bbr; do
     modprobe "$mod" 2>/dev/null || warn "kernel module $mod is unavailable; related features will fail"
 done
+if [ "$MIGRATION_ACTIVE" = 1 ]; then MIGRATION_MODULES_CONFIG_TOUCHED=1; fi
 printf '%s\n' wireguard ifb sch_cake tcp_bbr > /etc/modules-load.d/runman.conf
 
 log "tuning kernel limits"
 # Each instance runs a full init. Their inotify instances, keys and neighbour
 # entries add up on the host (inotify instances of all instances count against
 # one host user: the default of 128 runs out after a handful of instances).
+if [ "$MIGRATION_ACTIVE" = 1 ]; then MIGRATION_SYSCTL_CONFIG_TOUCHED=1; fi
 cat > /etc/sysctl.d/90-runman.conf <<'SYSCTL'
 # Written by the runman installer.
 fs.inotify.max_user_instances = 65536
@@ -901,6 +1098,7 @@ sysctl -q -p /etc/sysctl.d/90-runman.conf || warn "some kernel settings could no
 lxcfs_dropin=/etc/systemd/system/lxcfs.service.d/runman.conf
 lxcfs_conf=$(printf '[Service]\nExecStart=\nExecStart=/usr/bin/lxcfs --enable-cfs -l /var/lib/lxcfs')
 if [ "$(cat "$lxcfs_dropin" 2>/dev/null)" != "$lxcfs_conf" ]; then
+    if [ "$MIGRATION_ACTIVE" = 1 ]; then MIGRATION_LXCFS_CONFIG_TOUCHED=1; fi
     install -d /etc/systemd/system/lxcfs.service.d
     printf '%s\n' "$lxcfs_conf" > "$lxcfs_dropin"
     systemctl daemon-reload
