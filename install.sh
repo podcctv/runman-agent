@@ -953,10 +953,7 @@ show_go_menu() {
                     continue
                 fi
                 GUIDED_INSTALL=1; return 0 ;;
-            2)
-                if go_installation_present; then SYSTEM_ACTION="status"; return 0; fi
-                log "Go v1 is not installed."
-                ;;
+            2) SYSTEM_ACTION="status"; return 0 ;;
             3) go_menu_require_agent || continue; SYSTEM_ACTION="restart"; return 0 ;;
             4) go_menu_require_agent || continue; SYSTEM_ACTION="reset-password"; return 0 ;;
             5) IPV6_ONESHOT_MODE="detect"; return 0 ;;
