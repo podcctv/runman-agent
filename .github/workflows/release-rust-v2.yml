@@ -28,8 +28,9 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-rust-v2-${{ github.ref }}
-  cancel-in-progress: true
+  # All refs publish to the same release assets; serialize them globally.
+  group: runman-rust-v2-release
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -68,6 +69,7 @@ jobs:
 
   publish:
     needs: build
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/rust-v')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -83,6 +85,17 @@ jobs:
           chmod 755 runman-agent-linux-* install.sh migrate-go-state.py
           sha256sum runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh migrate-go-state.py > SHA256SUMS
           ls -l
+      - name: Reject superseded continuous build
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git fetch --no-tags origin main
+          if ! git diff --quiet "$GITHUB_SHA" origin/main -- \
+            Cargo.toml Cargo.lock build.rs config.example.toml proto/agent.proto \
+            src/ scripts/ images/ install-rust-v2.sh README-RUST-V2.md DESIGN.md \
+            MIGRATION_GO_TO_RUST_V2.md .github/workflows/release-rust-v2.yml; then
+            echo "Rust release inputs changed after this run started; refusing to publish stale assets."
+            exit 1
+          fi
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
