@@ -407,13 +407,23 @@ def export(args):
             "root_password": password,
             "was_running": running,
         })
-        legacy_row = {"vm_id": vm_id, "name": name, "was_running": running}
+        legacy_row = {
+            "vm_id": vm_id,
+            "name": name,
+            "was_running": running,
+            # For an already unusable guest, the selected replacement state
+            # does not describe the old guest's rollback state.
+            "rollback_was_running": None if rebuild_fallback else running,
+        }
         if rebuild_fallback:
             legacy_row["rebuild_fallback"] = True
             legacy_row["fallback_status"] = fallback_status
             legacy_row["fallback_init_pid"] = fallback_init_pid
             legacy_row["last_state_power"] = last_power_state
             legacy_row["run_state_confirmed"] = name in error_state_overrides
+            legacy_row["run_state_source"] = (
+                "operator_choice" if name in error_state_overrides else "volatile.last_state.power"
+            )
         legacy_state.append(legacy_row)
         passwords.append(f"{vm_id}\t{password}\n")
 
@@ -540,6 +550,59 @@ def state_file(path):
     return value
 
 
+def write_state_file(path, rows):
+    temporary = path.with_name(path.name + ".tmp")
+    write_private(temporary, json.dumps(rows, separators=(",", ":")) + "\n")
+    try:
+        os.replace(temporary, path)
+    except OSError as exc:
+        fail(f"cannot update saved legacy container state: {exc}")
+
+
+def mark_rebuild_fallback(row, name, status, init_pid, state_path, rows):
+    is_new_fallback = row.get("rebuild_fallback") is not True
+    changed = False
+    updated = {
+        "rebuild_fallback": True,
+        "fallback_status": status,
+        "fallback_init_pid": init_pid,
+    }
+    for key, value in updated.items():
+        if row.get(key) != value:
+            row[key] = value
+            changed = True
+    if not row.get("last_state_power"):
+        power_state = incus_last_power_state(name)
+        if power_state:
+            row["last_state_power"] = power_state
+            changed = True
+    if is_new_fallback:
+        row["fallback_detected_during_migration"] = True
+        row["run_state_confirmed"] = True
+        row["run_state_source"] = "last_valid_incus_state"
+        changed = True
+    if changed:
+        write_state_file(state_path, rows)
+    if is_new_fallback:
+        target_state = "RUNNING" if row.get("was_running") is True else "STOPPED"
+        print(
+            f"{name}: Incus became unusable during migration (status={status.upper()}, "
+            f"init PID={init_pid or 'missing'}); rebuilding it as a clean Rust guest "
+            f"with the last valid state {target_state}"
+        )
+    else:
+        print(
+            f"{name}: leaving the pre-existing unusable Incus instance in place "
+            "until the Rust health checks pass"
+        )
+
+
+def rollback_should_start(row):
+    if "rollback_was_running" in row:
+        return row.get("rollback_was_running") is True
+    return row.get("rebuild_fallback") is not True and row.get("was_running") is True
+
+
 def lifecycle(args):
     rows = state_file(args.state)
     backend = args.backend
@@ -549,24 +612,27 @@ def lifecycle(args):
         failed_name = ""
         try:
             for row in rows:
-                if row.get("was_running") is not True:
+                if backend != "incus" and row.get("was_running") is not True:
                     continue
                 name = str(row.get("name") or "")
                 if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
                     fail(f"unsupported legacy container name {name!r}")
                 failed_name = name
-                if backend == "incus" and row.get("rebuild_fallback") is True:
+                if backend == "incus":
                     status, init_pid = incus_instance_state(name)
                     if incus_state_needs_rebuild(status, init_pid):
-                        print(
-                            f"{name}: leaving the pre-existing unusable Incus instance in place "
-                            "until the Rust health checks pass"
-                        )
+                        mark_rebuild_fallback(row, name, status, init_pid, args.state, rows)
                         continue
+                    running = incus_running_from_state(status, init_pid, name)
+                    if row.get("rollback_was_running") is not running:
+                        row["rollback_was_running"] = running
+                        write_state_file(args.state, rows)
+                    if not running:
+                        continue
+                elif not live_state(backend, name):
+                    continue
                 # A previous stop may have completed even if its client timed
                 # out. Make this phase idempotent before retrying a stop.
-                if not live_state(backend, name):
-                    continue
                 if backend == "podman":
                     checked_run(["podman", "stop", "--time", "20", name])
                 else:
@@ -579,34 +645,53 @@ def lifecycle(args):
                         )
                     except SystemExit as stop_error:
                         # Incus can report a timed-out stop after the guest
-                        # actually reached Stopped. Continue only when that
-                        # state is independently confirmed.
+                        # actually reached Stopped, or the guest can become
+                        # unusable while stopping. Confirm the resulting state
+                        # before deciding whether to retry, rebuild, or abort.
                         try:
-                            stopped = not live_state(backend, name)
+                            status, init_pid = incus_instance_state(name)
+                        except SystemExit as state_error:
+                            fail(f"{name}: stop failed ({stop_error}); state check failed ({state_error})")
+                        if incus_state_needs_rebuild(status, init_pid):
+                            mark_rebuild_fallback(row, name, status, init_pid, args.state, rows)
+                            continue
+                        try:
+                            stopped = not incus_running_from_state(status, init_pid, name)
                         except SystemExit as state_error:
                             fail(f"{name}: stop failed ({stop_error}); state check failed ({state_error})")
                         if not stopped:
                             raise stop_error
         except SystemExit as exc:
             restore_errors = []
+            skipped_error_instances = []
             for row in rows:
-                if row.get("was_running") is not True:
-                    continue
                 name = str(row.get("name") or "")
                 if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
                     restore_errors.append(f"invalid saved name {name!r}")
                     continue
                 try:
-                    if backend == "incus" and row.get("rebuild_fallback") is True:
+                    if backend == "incus":
+                        if not rollback_should_start(row):
+                            continue
                         status, init_pid = incus_instance_state(name)
                         if incus_state_needs_rebuild(status, init_pid):
+                            mark_rebuild_fallback(row, name, status, init_pid, args.state, rows)
+                            skipped_error_instances.append(name)
                             continue
-                    if live_state(backend, name):
-                        continue
+                        if incus_running_from_state(status, init_pid, name):
+                            continue
+                    else:
+                        if row.get("was_running") is not True or live_state(backend, name):
+                            continue
                     command = ["podman", "start", name] if backend == "podman" else ["incus", "start", name]
                     checked_run(command)
                 except SystemExit as restore_exc:
                     restore_errors.append(f"{name}: {restore_exc}")
+            if skipped_error_instances:
+                print(
+                    "left unusable Incus instance(s) untouched during rollback: "
+                    + ", ".join(skipped_error_instances)
+                )
             if restore_errors:
                 message = f"{exc}; stop rollback was incomplete: " + "; ".join(restore_errors)
                 if backend == "incus" and failed_name:
@@ -626,20 +711,24 @@ def lifecycle(args):
         errors = []
         skipped_error_instances = []
         for row in rows:
-            if row.get("was_running") is not True:
-                continue
             name = str(row.get("name") or "")
             if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
                 errors.append(f"invalid saved name {name!r}")
                 continue
             try:
-                if backend == "incus" and row.get("rebuild_fallback") is True:
+                if backend == "incus":
+                    if not rollback_should_start(row):
+                        continue
                     status, init_pid = incus_instance_state(name)
                     if incus_state_needs_rebuild(status, init_pid):
+                        mark_rebuild_fallback(row, name, status, init_pid, args.state, rows)
                         skipped_error_instances.append(name)
                         continue
-                if live_state(backend, name):
-                    continue
+                    if incus_running_from_state(status, init_pid, name):
+                        continue
+                else:
+                    if row.get("was_running") is not True or live_state(backend, name):
+                        continue
             except SystemExit as exc:
                 errors.append(f"{name}: {exc}")
                 continue
@@ -651,7 +740,7 @@ def lifecycle(args):
             fail("could not restore all previously running Go containers: " + "; ".join(errors))
         if skipped_error_instances:
             print(
-                "left pre-existing Incus ERROR instance(s) untouched during rollback: "
+                "left unusable Incus instance(s) untouched during rollback: "
                 + ", ".join(skipped_error_instances)
             )
         return

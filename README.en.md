@@ -387,8 +387,9 @@ run or remain stopped, since that field can be stale. It leaves the old error
 instance in place while staging Rust and force-deletes it only after the Rust
 health checks pass. If the final pre-stop review finds that the set of unusable
 Incus instances changed after confirmation, migration aborts before legacy
-guest cleanup. On rollback, a pre-existing
-unusable instance is left in place and is not started again.
+guest cleanup. If an instance becomes unusable while stopping, the installer
+uses its last valid run state for the clean rebuild and does not retry stopping
+it. On rollback, an unusable instance is left in place and is not started.
 
 An installer/import/health failure before cleanup triggers best-effort rollback
 of the Go service/config and previously running guests. If cleanup partially
