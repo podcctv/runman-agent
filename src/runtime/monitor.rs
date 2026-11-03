@@ -218,7 +218,10 @@ mod watcher_tests {
         let _socket = UdpSocket::bind("127.0.0.1:0").expect("bind test UDP socket");
         let (_, _, _, udp_sockets) = watcher_tcp_counts(std::process::id() as i32)
             .expect("read the current network namespace socket tables");
-        assert!(udp_sockets >= 1, "the bound UDP socket must be present in /proc/net/udp");
+        assert!(
+            udp_sockets >= 1,
+            "the bound UDP socket must be present in /proc/net/udp"
+        );
     }
 }
 

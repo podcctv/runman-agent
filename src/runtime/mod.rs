@@ -706,11 +706,13 @@ impl Runtime {
                         "allocated_bytes": metadata.blocks().saturating_mul(512)
                     })
                 })
-                .unwrap_or_else(|| serde_json::json!({
-                    "source": "runman_disk_image",
-                    "available": false,
-                    "sampled_at": now
-                }));
+                .unwrap_or_else(|| {
+                    serde_json::json!({
+                        "source": "runman_disk_image",
+                        "available": false,
+                        "sampled_at": now
+                    })
+                });
             let mut ips = vec![rec.addrs.ipv4.to_string()];
             if let Some(ip) = rec.addrs.ipv6 {
                 ips.push(ip.to_string());
