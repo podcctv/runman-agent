@@ -691,7 +691,8 @@ expected = {item['vm_id']: item['was_running'] for item in manifest['instances']
 actual = {item.get('id'): item.get('running') is True for item in inventory['items'] if isinstance(item, dict)}
 if set(actual) != set(expected) or actual != expected:
     raise SystemExit(1)
-stored = json.loads(pathlib.Path(sys.argv[4]).read_text())
+forward_path = pathlib.Path(sys.argv[4])
+stored = json.loads(forward_path.read_text()) if forward_path.exists() else []
 normalize = lambda row: (row['vm_id'], row.get('protocol', row.get('proto')), row['host_port'], row['guest_port'])
 if sorted(map(normalize, stored)) != sorted(map(normalize, manifest['port_forwards'])):
     raise SystemExit(1)

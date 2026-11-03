@@ -14,6 +14,11 @@ live backend objects, and validates every item before stopping the Go agent.
 After confirmation it stops Go, takes a final config/database/live-state
 snapshot, then stops the old guests.
 
+A host with no Go instances can use the same migration. The helper permits an
+empty manifest only when both Go instance tables and the complete Podman/Incus
+inventory are empty; if containers exist without database records, it refuses
+to proceed because their ownership cannot be proven.
+
 It rebuilds clean Rust containers and retains:
 
 - the platform host ID and token, panel user/password hash and listen address;

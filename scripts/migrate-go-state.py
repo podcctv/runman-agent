@@ -97,6 +97,14 @@ def live_state(backend, name):
     return status == "running"
 
 
+def backend_inventory(backend):
+    if backend == "podman":
+        output = checked_run(["podman", "ps", "--all", "--format", "{{.Names}}"])
+    else:
+        output = checked_run(["incus", "list", "--format", "csv", "-c", "n"])
+    return {line.strip() for line in output.splitlines() if line.strip()}
+
+
 def toml_string(value):
     return json.dumps(str(value), ensure_ascii=False)
 
@@ -138,10 +146,24 @@ def export(args):
     base_rows = table_rows(conn, "vm_configs")
     provider_table = "podman_vm_configs" if backend == "podman" else "incus_vm_configs"
     provider_rows = table_rows(conn, provider_table)
-    provider_by_id = {canonical_uuid(column(row, "vm_id")): row for row in provider_rows}
-    base_by_id = {canonical_uuid(column(row, "vm_id")): row for row in base_rows}
-    if not base_rows or len(base_by_id) != len(base_rows):
-        fail("Go database has no instances or duplicate VM identities")
+    base_ids = [canonical_uuid(column(row, "vm_id")) for row in base_rows]
+    provider_ids = [canonical_uuid(column(row, "vm_id")) for row in provider_rows]
+    if len(set(base_ids)) != len(base_rows):
+        fail("Go database has duplicate VM identities in vm_configs")
+    if len(set(provider_ids)) != len(provider_rows):
+        fail(f"Go database has duplicate VM identities in {provider_table}")
+    if not base_rows:
+        if provider_rows:
+            fail(f"Go database has {len(provider_rows)} {provider_table} row(s) but no vm_configs rows")
+        unmanaged = backend_inventory(backend)
+        if unmanaged:
+            fail(
+                f"Go database has no instance records but {backend} inventory contains "
+                f"{len(unmanaged)} container(s); refusing an empty migration"
+            )
+        print("Go database and backend inventory are empty; proceeding with host-only migration")
+    base_by_id = dict(zip(base_ids, base_rows))
+    provider_by_id = dict(zip(provider_ids, provider_rows))
     if set(provider_by_id) != set(base_by_id):
         fail("Go core instance rows do not exactly match the selected backend rows")
 

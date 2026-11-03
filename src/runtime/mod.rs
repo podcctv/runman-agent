@@ -601,10 +601,6 @@ impl Runtime {
             "unsupported source backend"
         );
         anyhow::ensure!(
-            !manifest.instances.is_empty(),
-            "migration manifest contains no instances"
-        );
-        anyhow::ensure!(
             manifest.instances.len() <= 4096,
             "migration instance count exceeds 4096"
         );
