@@ -93,6 +93,7 @@ async fn agent_main() -> Result<()> {
         return Ok(());
     }
     let store = config::Store::load(&cli.config)?;
+    let cfg = store.get();
     match cli.command {
         None | Some(Command::Run) => {}
         Some(Command::SetPassword) => {
@@ -157,7 +158,6 @@ async fn agent_main() -> Result<()> {
             return Ok(());
         }
     }
-    let cfg = store.get();
     info!(
         "runman-agent {} starting (backend {:?})",
         runman_agent::updater::version(),
