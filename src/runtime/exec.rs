@@ -14,13 +14,23 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use nix::sched::{CloneFlags, setns};
-use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Gid, Uid, fork};
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, killpg, sigaction};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::unistd::{ForkResult, Gid, Pid, Uid, fork};
+use tokio::io::AsyncReadExt;
+use tokio::process::Child;
 use tokio::sync::mpsc;
+
+static TERMINATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_termination(_: libc::c_int) {
+    TERMINATION_REQUESTED.store(true, Ordering::Relaxed);
+}
 
 use crate::backend::ConsoleIo;
 use crate::model::ConsoleSize;
@@ -50,9 +60,26 @@ pub fn main(args: &[OsString]) -> ! {
 }
 
 fn helper(args: &[OsString]) -> Result<i32> {
-    let [pid_file, unit, sep, cmd @ ..] = args else {
+    let [pid_file, unit, rest @ ..] = args else {
         bail!("usage: __exec <init.pid> <unit cgroup> -- <cmd>...");
     };
+    let (timeout, command_offset) = if rest.first().is_some_and(|arg| arg == "--timeout-seconds") {
+        let seconds = rest
+            .get(1)
+            .and_then(|value| value.to_str())
+            .context("missing execution timeout")?
+            .parse::<u64>()?;
+        if !(1..=120).contains(&seconds) {
+            bail!("execution timeout must be between 1 and 120 seconds");
+        }
+        (Some(Duration::from_secs(seconds)), 2)
+    } else {
+        (None, 0)
+    };
+    let sep = rest
+        .get(command_offset)
+        .context("missing command separator")?;
+    let cmd = &rest[command_offset + 1..];
     if sep != "--" || cmd.is_empty() {
         bail!("missing command");
     }
@@ -81,6 +108,19 @@ fn helper(args: &[OsString]) -> Result<i32> {
         setns(fd.as_fd(), *flag).with_context(|| format!("setns {flag:?}"))?;
     }
     drop(fds);
+    TERMINATION_REQUESTED.store(false, Ordering::Relaxed);
+    // Let the supervising caller cancel cleanly: the helper must stop the
+    // guest command process group before it exits, or it could orphan a scan.
+    unsafe {
+        sigaction(
+            Signal::SIGTERM,
+            &SigAction::new(
+                SigHandler::Handler(request_termination),
+                SaFlags::empty(),
+                SigSet::empty(),
+            ),
+        )?;
+    }
 
     let argv: Vec<CString> = cmd
         .iter()
@@ -93,14 +133,66 @@ fn helper(args: &[OsString]) -> Result<i32> {
             eprintln!("runman exec: {err:#}");
             unsafe { libc::_exit(127) }
         }
-        ForkResult::Parent { child } => loop {
-            match waitpid(child, None) {
-                Ok(WaitStatus::Exited(_, c)) => return Ok(c),
-                Ok(WaitStatus::Signaled(_, s, _)) => return Ok(128 + s as i32),
-                Ok(_) | Err(nix::errno::Errno::EINTR) => continue,
-                Err(e) => return Err(e.into()),
+        ForkResult::Parent { child } => wait_for_child(child, timeout),
+    }
+}
+
+fn wait_for_child(child: Pid, timeout: Option<Duration>) -> Result<i32> {
+    let started = Instant::now();
+    loop {
+        match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(_, code)) => {
+                terminate_descendants(child);
+                return Ok(code);
             }
-        },
+            Ok(WaitStatus::Signaled(_, signal, _)) => {
+                terminate_descendants(child);
+                return Ok(128 + signal as i32);
+            }
+            Ok(WaitStatus::StillAlive) | Err(nix::errno::Errno::EINTR) => {}
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+        if TERMINATION_REQUESTED.swap(false, Ordering::Relaxed) {
+            terminate_child(child)?;
+            return Ok(143);
+        }
+        if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+            // The guest child calls setsid() before exec, so its process group
+            // contains the requested command and its descendants. Signal the
+            // group first, then the exact child to cover the setsid race.
+            terminate_child(child)?;
+            return Ok(124);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn terminate_descendants(process_group: Pid) {
+    // A bounded command must not leave background children holding the output
+    // pipes open after its direct process exits. The guest child called
+    // setsid(), so its descendants normally remain in this private group.
+    let _ = killpg(process_group, Signal::SIGTERM);
+    std::thread::sleep(Duration::from_millis(50));
+    let _ = killpg(process_group, Signal::SIGKILL);
+}
+
+fn terminate_child(child: Pid) -> Result<()> {
+    // The guest child calls setsid() before exec, so its process group contains
+    // the requested command and descendants. Signal the group first, then the
+    // exact child to cover the setsid race, and always reap the direct child.
+    let _ = killpg(child, Signal::SIGTERM);
+    let _ = kill(child, Signal::SIGTERM);
+    std::thread::sleep(Duration::from_millis(100));
+    let _ = killpg(child, Signal::SIGKILL);
+    let _ = kill(child, Signal::SIGKILL);
+    loop {
+        match waitpid(child, None) {
+            Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => return Ok(()),
+            Ok(_) | Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::ECHILD) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
     }
 }
 
@@ -191,13 +283,18 @@ pub struct ExecTarget {
 }
 
 impl ExecTarget {
-    fn command(&self, argv: &[&str]) -> std::process::Command {
+    fn command_with_timeout(
+        &self,
+        argv: &[&str],
+        timeout: Option<Duration>,
+    ) -> std::process::Command {
         let mut cmd = std::process::Command::new(&self.exe);
-        cmd.arg("__exec")
-            .arg(&self.pid_file)
-            .arg(&self.unit_cgroup)
-            .arg("--")
-            .args(argv);
+        cmd.arg("__exec").arg(&self.pid_file).arg(&self.unit_cgroup);
+        if let Some(timeout) = timeout {
+            cmd.arg("--timeout-seconds")
+                .arg(timeout.as_secs().clamp(1, 120).to_string());
+        }
+        cmd.arg("--").args(argv);
         cmd.env_clear()
             .env("PATH", PATH)
             .env("HOME", "/root")
@@ -206,6 +303,10 @@ impl ExecTarget {
             .env("LANG", "C.UTF-8")
             .env("TERM", "xterm-256color");
         cmd
+    }
+
+    fn command(&self, argv: &[&str]) -> std::process::Command {
+        self.command_with_timeout(argv, None)
     }
 
     /// Run a command to completion, feeding `stdin`.
@@ -228,6 +329,83 @@ impl ExecTarget {
             );
         }
         Ok(())
+    }
+
+    /// Run a bounded local-control command and return its output and exit code.
+    pub async fn run_capture(
+        &self,
+        argv: &[&str],
+        stdin: &[u8],
+        timeout: Duration,
+        max_output: usize,
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        let mut child =
+            tokio::process::Command::from(self.command_with_timeout(argv, Some(timeout)))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("guest stdout pipe unavailable")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("guest stderr pipe unavailable")?;
+        let captured = Arc::new(AtomicUsize::new(0));
+        let (overflow_tx, mut overflow_rx) = mpsc::unbounded_channel();
+        let stdout_task = tokio::spawn(read_bounded(
+            stdout,
+            max_output,
+            captured.clone(),
+            overflow_tx.clone(),
+        ));
+        let stderr_task = tokio::spawn(read_bounded(
+            stderr,
+            max_output,
+            captured.clone(),
+            overflow_tx.clone(),
+        ));
+        drop(overflow_tx);
+        if let Some(mut input) = child.stdin.take() {
+            tokio::io::AsyncWriteExt::write_all(&mut input, stdin).await?;
+        }
+
+        let deadline = Instant::now() + timeout + Duration::from_secs(3);
+        let mut overflowed = false;
+        let mut timed_out = false;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                timed_out = true;
+                signal_helper(&child, Signal::SIGTERM);
+                break wait_for_helper(&mut child).await?;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(remaining.min(Duration::from_millis(20))) => {},
+                signal = overflow_rx.recv() => {
+                    if signal.is_some() {
+                        overflowed = true;
+                        signal_helper(&child, Signal::SIGTERM);
+                        break wait_for_helper(&mut child).await?;
+                    }
+                }
+            }
+        };
+        let stdout = stdout_task.await??;
+        let stderr = stderr_task.await??;
+        if overflowed || captured.load(Ordering::Relaxed) > max_output {
+            bail!("guest command output exceeded the response limit");
+        }
+        if timed_out || status.code() == Some(124) {
+            bail!("guest command timed out");
+        }
+        Ok((status.code().unwrap_or(-1), stdout, stderr))
     }
 
     /// Run a command feeding `stdin`, appending its stdout and stderr to
@@ -338,6 +516,50 @@ impl ExecTarget {
             input: in_tx,
             resize: resize_tx,
         })
+    }
+}
+
+async fn read_bounded<R>(
+    mut reader: R,
+    max_output: usize,
+    captured: Arc<AtomicUsize>,
+    overflow_tx: mpsc::UnboundedSender<()>,
+) -> Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let mut output = Vec::with_capacity(max_output.min(8192));
+    let mut buffer = [0u8; 8192];
+    let mut overflow_reported = false;
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(output);
+        }
+        let previous = captured.fetch_add(count, Ordering::Relaxed);
+        let room = max_output.saturating_sub(previous);
+        let keep = room.min(count);
+        output.extend_from_slice(&buffer[..keep]);
+        if keep < count && !overflow_reported {
+            overflow_reported = true;
+            let _ = overflow_tx.send(());
+        }
+    }
+}
+
+fn signal_helper(child: &Child, signal: Signal) {
+    if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+        let _ = kill(Pid::from_raw(pid), signal);
+    }
+}
+
+async fn wait_for_helper(child: &mut Child) -> Result<std::process::ExitStatus> {
+    match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+        Ok(status) => Ok(status?),
+        Err(_) => {
+            child.start_kill()?;
+            Ok(child.wait().await?)
+        }
     }
 }
 

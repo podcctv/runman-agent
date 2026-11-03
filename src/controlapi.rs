@@ -20,7 +20,9 @@ use tracing::warn;
 const CONNLIMIT_SOCKET: &str = "/run/narwhal-agent/connlimit.sock";
 const FIREWALL_SOCKET: &str = "/run/narwhal-agent/firewall.sock";
 const MAX_HEADER: usize = 16 * 1024;
-const MAX_BODY: usize = 128 * 1024;
+// The exec request accepts a 64 KiB shell script. JSON escaping can expand
+// control characters by up to 6x, so leave enough headroom for valid input.
+const MAX_BODY: usize = 512 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,6 +37,25 @@ struct ConnLimitRequest {
     max_connections: u32,
     #[serde(default)]
     expires_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuestExecRequest {
+    container_name: String,
+    project: String,
+    instance_id: String,
+    command: String,
+    timeout_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkQuarantineRequest {
+    container_name: String,
+    project: String,
+    instance_id: String,
+    action: String,
 }
 
 #[derive(Debug)]
@@ -52,16 +73,22 @@ impl Drop for SocketCleanup {
     }
 }
 
-pub async fn serve_connlimit<F, Fut, I, IFut>(
+pub async fn serve_connlimit<F, Fut, I, IFut, E, EFut, N, NFut>(
     manager: Arc<crate::connlimit::Manager>,
     resolve: F,
     inventory: I,
+    exec: E,
+    network_quarantine: N,
 ) -> Result<()>
 where
     F: Fn(String) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<crate::connlimit::Target>> + Send + 'static,
     I: Fn() -> IFut + Clone + Send + Sync + 'static,
     IFut: Future<Output = Result<Value>> + Send + 'static,
+    E: Fn(String, String, String, String, u64) -> EFut + Clone + Send + Sync + 'static,
+    EFut: Future<Output = Result<(i32, String, String)>> + Send + 'static,
+    N: Fn(String, String, String, String) -> NFut + Clone + Send + Sync + 'static,
+    NFut: Future<Output = Result<(String, bool, bool, bool, i32)>> + Send + 'static,
 {
     let listener = bind(CONNLIMIT_SOCKET).await?;
     let _cleanup = SocketCleanup(CONNLIMIT_SOCKET);
@@ -73,9 +100,19 @@ where
         let manager = manager.clone();
         let resolve = resolve.clone();
         let inventory = inventory.clone();
+        let exec = exec.clone();
+        let network_quarantine = network_quarantine.clone();
         tokio::spawn(async move {
-            if let Err(e) = timeout(Duration::from_secs(10), async move {
-                handle_connlimit(stream, manager, resolve, inventory).await
+            if let Err(e) = timeout(Duration::from_secs(100), async move {
+                handle_connlimit(
+                    stream,
+                    manager,
+                    resolve,
+                    inventory,
+                    exec,
+                    network_quarantine,
+                )
+                .await
             })
             .await
             .context("connection-limit control request timed out")
@@ -105,19 +142,25 @@ pub async fn serve_firewall(manager: Arc<crate::hostpolicy::Manager>) -> Result<
     }
 }
 
-async fn handle_connlimit<F, Fut, I, IFut>(
+async fn handle_connlimit<F, Fut, I, IFut, E, EFut, N, NFut>(
     mut stream: UnixStream,
     manager: Arc<crate::connlimit::Manager>,
     resolve: F,
     inventory: I,
+    exec: E,
+    network_quarantine: N,
 ) -> Result<()>
 where
     F: Fn(String) -> Fut,
     Fut: Future<Output = Result<crate::connlimit::Target>>,
     I: Fn() -> IFut,
     IFut: Future<Output = Result<Value>>,
+    E: Fn(String, String, String, String, u64) -> EFut,
+    EFut: Future<Output = Result<(i32, String, String)>>,
+    N: Fn(String, String, String, String) -> NFut,
+    NFut: Future<Output = Result<(String, bool, bool, bool, i32)>>,
 {
-    let request = match read_request(&mut stream, 8192).await {
+    let request = match read_request(&mut stream, MAX_BODY).await {
         Ok(request) => request,
         Err(e) => return respond_error(&mut stream, 400, &format!("invalid request: {e:#}")).await,
     };
@@ -201,6 +244,117 @@ where
                 )
                 .await
             }
+        };
+    }
+    if request.method == "POST" && path == "/v1/exec" {
+        let req: GuestExecRequest = match serde_json::from_slice(&request.body) {
+            Ok(value) => value,
+            Err(_) => return respond_error(&mut stream, 400, "invalid guest execution JSON").await,
+        };
+        if req.project != "default"
+            || req.container_name.is_empty()
+            || req.instance_id.is_empty()
+            || req.command.is_empty()
+            || req.command.len() > 64 * 1024
+            || req.command.contains('\0')
+            || !(1..=90).contains(&req.timeout_seconds)
+        {
+            return respond_error(
+                &mut stream,
+                400,
+                "invalid guest target, command, or timeout",
+            )
+            .await;
+        }
+        let id = match crate::model::VmId::parse(&req.container_name) {
+            Ok(id) => id.as_str().to_owned(),
+            Err(_) => {
+                return respond_error(
+                    &mut stream,
+                    400,
+                    "container_name must be the managed Runman VM UUID",
+                )
+                .await;
+            }
+        };
+        return match exec(
+            id,
+            req.instance_id.clone(),
+            req.project,
+            req.command,
+            req.timeout_seconds,
+        )
+        .await
+        {
+            Ok((exit_code, stdout, stderr)) => {
+                let ok = exit_code == 0;
+                respond_json(
+                    &mut stream,
+                    if ok { 200 } else { 409 },
+                    &json!({
+                        "ok": ok,
+                        "instance_id": req.instance_id,
+                        "exit_code": exit_code,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "message": if ok { "guest command completed" } else { "guest command failed" }
+                    }),
+                )
+                .await
+            }
+            Err(error) => respond_error(&mut stream, 409, &format!("{error:#}")).await,
+        };
+    }
+    if request.method == "POST" && path == "/v1/network-quarantine" {
+        let req: NetworkQuarantineRequest = match serde_json::from_slice(&request.body) {
+            Ok(value) => value,
+            Err(_) => {
+                return respond_error(&mut stream, 400, "invalid network quarantine JSON").await;
+            }
+        };
+        if req.project != "default"
+            || req.instance_id.is_empty()
+            || req.instance_id.len() > 200
+            || !matches!(
+                req.action.as_str(),
+                "inspect" | "isolate" | "release" | "replacement"
+            )
+        {
+            return respond_error(
+                &mut stream,
+                400,
+                "invalid Runman network quarantine target or action",
+            )
+            .await;
+        }
+        let id = match crate::model::VmId::parse(&req.container_name) {
+            Ok(id) => id.as_str().to_owned(),
+            Err(_) => {
+                return respond_error(
+                    &mut stream,
+                    400,
+                    "container_name must be the managed Runman VM UUID",
+                )
+                .await;
+            }
+        };
+        return match network_quarantine(id, req.instance_id, req.project, req.action).await {
+            Ok((instance_id, isolated, interface_up, running, init_pid)) => {
+                respond_json(
+                    &mut stream,
+                    200,
+                    &json!({
+                        "ok": true,
+                        "instance_id": instance_id,
+                        "isolated": isolated,
+                        "interface_up": interface_up,
+                        "running": running,
+                        "init_pid": init_pid,
+                    }),
+                )
+                .await
+            }
+            Err(error) => respond_error(&mut stream, 409, &format!("{error:#}")).await,
         };
     }
     if request.method != "POST" || path != "/v1/connlimit" {
@@ -600,7 +754,23 @@ async fn respond_json(stream: &mut UnixStream, status: u16, value: &Value) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::parse_request_line;
+    use super::{handle_connlimit, parse_request_line};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    fn temp_path() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "runman-controlapi-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     #[test]
     fn accepts_standard_http_1_request_lines() {
@@ -619,5 +789,73 @@ mod tests {
         assert!(parse_request_line("GET /v1/inventory").is_err());
         assert!(parse_request_line("GET /v1/inventory HTTP/2").is_err());
         assert!(parse_request_line("GET /v1/inventory HTTP/1.1 extra").is_err());
+    }
+
+    #[tokio::test]
+    async fn guest_exec_route_requires_bound_identity_and_returns_output() {
+        let dir = temp_path();
+        let manager = Arc::new(
+            crate::connlimit::Manager::new(dir.join("connlimit.json"), "rmbr0".into()).unwrap(),
+        );
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let resolve = |_| async {
+            Ok(crate::connlimit::Target {
+                managed: false,
+                running: false,
+                instance_id: String::new(),
+                ips: vec![],
+            })
+        };
+        let inventory = || async { Ok(serde_json::json!({"schema": 1, "items": []})) };
+        let exec = |id: String,
+                    generation: String,
+                    project: String,
+                    command: String,
+                    timeout_seconds: u64| async move {
+            assert_eq!(id, "11111111-2222-3333-4444-555555555555");
+            assert_eq!(generation, "generation-1");
+            assert_eq!(project, "default");
+            assert_eq!(command, "printf watcher-ok");
+            assert_eq!(timeout_seconds, 10);
+            Ok((0, "watcher-ok".to_owned(), String::new()))
+        };
+        let network = |_: String, generation: String, _: String, action: String| async move {
+            Ok((
+                generation,
+                action == "isolate",
+                action != "isolate",
+                true,
+                42,
+            ))
+        };
+        let task = tokio::spawn(handle_connlimit(
+            server, manager, resolve, inventory, exec, network,
+        ));
+        let body = serde_json::json!({
+            "container_name": "11111111-2222-3333-4444-555555555555",
+            "project": "default",
+            "instance_id": "generation-1",
+            "command": "printf watcher-ok",
+            "timeout_seconds": 10
+        })
+        .to_string();
+        client
+            .write_all(
+                format!(
+                    "POST /v1/exec HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        task.await.unwrap().unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("\"stdout\":\"watcher-ok\""));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

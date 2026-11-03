@@ -141,6 +141,9 @@ struct Record {
     hostname: String,
     addrs: Addrs,
     desired: Desired,
+    /// Watcher quarantine state is persistent and survives instance restart.
+    #[serde(default)]
+    network_quarantined: bool,
     /// Temporary instance building a custom image: hidden from listings and
     /// heartbeats (the platform would delete it as an orphan).
     #[serde(default)]
@@ -413,6 +416,7 @@ impl Runtime {
                 bridge: self.net.bridge.clone(),
                 mac: net::mac(rec.idx),
                 bandwidth_mbps: rec.bandwidth_mbps,
+                isolated: rec.network_quarantined,
             }),
         }
     }
@@ -507,12 +511,176 @@ impl Runtime {
         })
     }
 
-    /// Minimal, read-only inventory contract for Podman Watcher. It exposes
-    /// Runman-owned instance identity and fresh resource/TCP evidence without
-    /// shell access or pretending the runtime is Incus/Podman.
+    /// Execute a bounded guest command requested by the local, root-only
+    /// Watcher socket. UUID plus generation prevents work from following a
+    /// replaced instance; the VM lock serializes it with lifecycle changes.
+    pub async fn watcher_exec(
+        &self,
+        raw_id: &str,
+        expected_generation: &str,
+        project: &str,
+        command: &str,
+        timeout_seconds: u64,
+    ) -> Result<(i32, String, String)> {
+        anyhow::ensure!(
+            project == "default",
+            "only the default project is supported"
+        );
+        anyhow::ensure!(
+            !command.is_empty() && command.len() <= 64 * 1024 && !command.contains('\0'),
+            "guest command is empty or exceeds 64 KiB"
+        );
+        anyhow::ensure!(
+            (1..=90).contains(&timeout_seconds),
+            "guest command timeout must be between 1 and 90 seconds"
+        );
+        let id = VmId::parse(raw_id)?;
+        let _guard = self.lock_vm(id.as_str()).await;
+        let Some(rec) = self.load(id.as_str())? else {
+            bail!("Runman instance is not managed");
+        };
+        anyhow::ensure!(!rec.builder, "temporary image builders are not addressable");
+        anyhow::ensure!(
+            !expected_generation.is_empty() && rec.generation == expected_generation,
+            "Runman instance generation changed"
+        );
+        anyhow::ensure!(
+            rec.desired == Desired::Running && self.is_active(id.as_str()).await,
+            "Runman instance is not running"
+        );
+
+        let (code, stdout, stderr) = self
+            .exec_target(id.as_str())
+            .run_capture(
+                &["/bin/sh", "-s"],
+                command.as_bytes(),
+                Duration::from_secs(timeout_seconds),
+                64 * 1024,
+            )
+            .await?;
+        Ok((
+            code,
+            String::from_utf8_lossy(&stdout).into_owned(),
+            String::from_utf8_lossy(&stderr).into_owned(),
+        ))
+    }
+
+    /// Apply or read a reversible per-instance network quarantine. The
+    /// persistent record is written before toggling the host veth so restarts
+    /// and crash recovery follow the same fail-closed desired state.
+    pub async fn watcher_network_quarantine(
+        &self,
+        raw_id: &str,
+        expected_generation: &str,
+        project: &str,
+        action: &str,
+    ) -> Result<(String, bool, bool, bool, i32)> {
+        anyhow::ensure!(
+            project == "default",
+            "only the default project is supported"
+        );
+        anyhow::ensure!(
+            !expected_generation.is_empty() && expected_generation.len() <= 200,
+            "Runman instance generation is required"
+        );
+        anyhow::ensure!(
+            matches!(action, "inspect" | "isolate" | "release" | "replacement"),
+            "unsupported Runman network quarantine action"
+        );
+        let id = VmId::parse(raw_id)?;
+        let _guard = self.lock_vm(id.as_str()).await;
+        let Some(mut rec) = self.load(id.as_str())? else {
+            bail!("Runman instance is not managed");
+        };
+        anyhow::ensure!(!rec.builder, "temporary image builders are not addressable");
+        if action != "replacement" {
+            anyhow::ensure!(
+                rec.generation == expected_generation,
+                "Runman instance generation changed"
+            );
+        }
+
+        let running = rec.desired == Desired::Running && self.is_active(id.as_str()).await;
+        let host_if = self.net.host_if(rec.idx);
+        let mut interface_up = if running {
+            attach::host_link_up(&host_if)?
+        } else {
+            false
+        };
+
+        match action {
+            "inspect" | "replacement" => {
+                if running {
+                    anyhow::ensure!(
+                        rec.network_quarantined == !interface_up,
+                        "Runman network link state does not match its quarantine record"
+                    );
+                }
+            }
+            "isolate" => {
+                anyhow::ensure!(running, "Runman instance is not running");
+                if !rec.network_quarantined {
+                    anyhow::ensure!(
+                        interface_up,
+                        "Runman interface is down without a quarantine record"
+                    );
+                    rec.network_quarantined = true;
+                    self.save(&rec)?;
+                }
+                if interface_up {
+                    attach::set_host_link_up(&host_if, false)?;
+                }
+                interface_up = false;
+            }
+            "release" => {
+                anyhow::ensure!(
+                    rec.network_quarantined,
+                    "Runman instance has no active quarantine"
+                );
+                if running {
+                    anyhow::ensure!(
+                        !interface_up,
+                        "Runman quarantine link state changed; refused to re-enable it"
+                    );
+                }
+                rec.network_quarantined = false;
+                self.save(&rec)?;
+                if running {
+                    attach::set_host_link_up(&host_if, true)?;
+                    interface_up = true;
+                }
+            }
+            _ => unreachable!("action was validated above"),
+        }
+        let pid = std::fs::read_to_string(self.run_spec(&rec).init_pid_file())
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i32>().ok())
+            .filter(|pid| *pid > 1)
+            .unwrap_or(0);
+        Ok((
+            rec.generation,
+            rec.network_quarantined,
+            interface_up,
+            running,
+            pid,
+        ))
+    }
+
+    /// Read-only inventory contract for Podman Watcher. Runman remains a
+    /// distinct runtime; metrics include their own freshness and generation.
     pub async fn watcher_inventory(&self) -> Result<serde_json::Value> {
         let now = unix_now();
         let schedule = *self.traffic_schedule();
+        let history = self.history.clone();
+        let recent_usage = tokio::task::spawn_blocking(move || history.usage(180, now))
+            .await
+            .ok()
+            .and_then(|result| result.ok())
+            .unwrap_or_default();
+        let usage_by_vm: HashMap<_, _> = recent_usage
+            .into_iter()
+            .map(|usage| (usage.vm_id.clone(), usage))
+            .collect();
         let mut items = Vec::new();
         for rec in self.records()?.into_iter().filter(|r| !r.builder) {
             let running = rec.desired == Desired::Running && self.is_active(&rec.id).await;
@@ -537,6 +705,14 @@ impl Runtime {
                 .map(|(established, pending, time_wait)| (established, pending, time_wait, true))
                 .unwrap_or((0, 0, 0, false));
             let tcp_total = established + pending + time_wait;
+            let usage = usage_by_vm.get(&rec.id);
+            let usage_valid = usage.is_some_and(|u| {
+                u.samples > 0
+                    && u.avg.ts > 0
+                    && now >= u.avg.ts
+                    && now.saturating_sub(u.avg.ts) <= 180
+            });
+            let recent_metrics = usage.filter(|_| usage_valid);
             items.push(serde_json::json!({
                 "id": &rec.id,
                 "name": &rec.id,
@@ -544,6 +720,7 @@ impl Runtime {
                 "managed": true,
                 "running": running,
                 "status": if running { "running" } else { "stopped" },
+                "network_quarantined": rec.network_quarantined,
                 "os_image": &rec.os_image,
                 "cpu": rec.cpu,
                 "cpu_percent": summary.cpu_pct,
@@ -556,7 +733,28 @@ impl Runtime {
                 "traffic_out_bytes": summary.traffic_out_bytes.max(0) as u64,
                 "ips": ips,
                 "init_pid": pid,
-                "net_metrics_available": false,
+                "net_metrics_available": usage_valid,
+                "monitor_metrics": {
+                    "schema": 1,
+                    "source": "runman_history",
+                    "sampled_at": usage.map(|u| u.avg.ts).unwrap_or(0),
+                    "window_seconds": 180,
+                    "samples": usage.map(|u| u.samples).unwrap_or(0),
+                    "valid": usage_valid,
+                    "cpu_percent": recent_metrics.map(|u| u.avg.cpu),
+                    "disk_used_bytes": recent_metrics.map(|u| u.avg.disk),
+                    "disk_read_bytes_per_second": recent_metrics.map(|u| u.avg.rd),
+                    "disk_write_bytes_per_second": recent_metrics.map(|u| u.avg.wr),
+                    "disk_read_iops": recent_metrics.map(|u| u.avg.rio),
+                    "disk_write_iops": recent_metrics.map(|u| u.avg.wio),
+                    "net_rx_bits_per_second": recent_metrics.map(|u| u.avg.rx),
+                    "net_tx_bits_per_second": recent_metrics.map(|u| u.avg.tx),
+                    "net_rx_packets_per_second": recent_metrics.map(|u| u.avg.rxp),
+                    "net_tx_packets_per_second": recent_metrics.map(|u| u.avg.txp),
+                    "tcp_connections": recent_metrics.and_then(|u| u.avg.tcp),
+                    "udp_flows": recent_metrics.and_then(|u| u.avg.udp),
+                    "remote_ip_count": recent_metrics.and_then(|u| u.avg.ips)
+                },
                 "connection_metrics": {
                     "schema": 1,
                     "source": "runman_proc_net",
@@ -991,20 +1189,49 @@ impl Runtime {
                 }
             }
         }
-        for rec in records {
+        for snapshot in records {
+            let _g = self.lock_vm(&snapshot.id).await;
+            let Ok(Some(rec)) = self.load(&snapshot.id) else {
+                continue;
+            };
             let host_if = self.net.host_if(rec.idx);
             let master =
                 std::fs::read_link(Path::new("/sys/class/net").join(&host_if).join("master"));
-            if master
+            let attached = master
                 .ok()
                 .and_then(|m| m.file_name().map(|n| n == self.net.bridge.as_str()))
-                == Some(true)
-            {
-                continue;
-            }
-            let _g = self.lock_vm(&rec.id).await;
+                == Some(true);
             if !self.is_active(&rec.id).await {
                 continue;
+            }
+            if attached {
+                match attach::host_link_up(&host_if) {
+                    Ok(up) if up == !rec.network_quarantined => continue,
+                    Ok(_) => {
+                        warn!(
+                            "instance {}: restoring {} host link state to match quarantine record",
+                            rec.id, host_if
+                        );
+                        let interface = host_if.clone();
+                        let wanted_up = !rec.network_quarantined;
+                        match tokio::task::spawn_blocking(move || {
+                            attach::set_host_link_up(&interface, wanted_up)
+                        })
+                        .await
+                        {
+                            Ok(Ok(())) => continue,
+                            Ok(Err(e)) => {
+                                warn!("instance {}: restore network link state: {e:#}", rec.id)
+                            }
+                            Err(e) => warn!("instance {}: restore network link state: {e}", rec.id),
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("instance {}: read network link state: {e:#}", rec.id);
+                        continue;
+                    }
+                }
             }
             // No init.pid while the supervisor is (re)booting the instance;
             // it attaches the network itself then.
@@ -1263,6 +1490,7 @@ impl Runtime {
             hostname: hostname_for(id),
             addrs: self.net.addrs_for(idx)?,
             desired: Desired::Running,
+            network_quarantined: false,
             builder,
             created,
         };

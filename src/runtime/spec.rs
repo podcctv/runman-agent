@@ -43,6 +43,9 @@ pub struct NetSpec {
     pub mac: String,
     /// 0 = unlimited.
     pub bandwidth_mbps: u32,
+    /// Keep the host-side veth administratively down across supervisor restarts.
+    #[serde(default)]
+    pub isolated: bool,
 }
 
 impl RunSpec {

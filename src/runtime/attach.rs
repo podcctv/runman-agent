@@ -25,7 +25,11 @@ pub fn attach(net: &NetSpec, pid: i32) -> Result<()> {
     ])?;
     sh(&["ip", "link", "set", hif, "master", &net.bridge])?;
     sh(&["bridge", "link", "set", "dev", hif, "isolated", "on"])?;
-    sh(&["ip", "link", "set", hif, "up"])?;
+    if net.isolated {
+        sh(&["ip", "link", "set", "dev", hif, "down"])?;
+    } else {
+        sh(&["ip", "link", "set", "dev", hif, "up"])?;
+    }
     if net.bandwidth_mbps > 0 {
         let rate = format!("{}mbit", net.bandwidth_mbps);
         // Download (host -> instance): shaped on the host end's egress.
@@ -69,6 +73,38 @@ pub fn attach(net: &NetSpec, pid: i32) -> Result<()> {
             "tc", "filter", "replace", "dev", hif, "parent", "ffff:", "matchall", "action",
             "mirred", "egress", "redirect", "dev", &ifb,
         ])?;
+    }
+    Ok(())
+}
+
+/// Read the administrative `IFF_UP` state of a host-side veth.
+pub fn host_link_up(host_if: &str) -> Result<bool> {
+    validate_host_if(host_if)?;
+    let flags = std::fs::read_to_string(format!("/sys/class/net/{host_if}/flags"))?;
+    let flags = flags.trim().strip_prefix("0x").unwrap_or(flags.trim());
+    let flags = u32::from_str_radix(flags, 16)?;
+    Ok(flags & libc::IFF_UP as u32 != 0)
+}
+
+/// Change only a Runman-managed host-side veth and verify the kernel readback.
+pub fn set_host_link_up(host_if: &str, up: bool) -> Result<()> {
+    validate_host_if(host_if)?;
+    let state = if up { "up" } else { "down" };
+    sh(&["ip", "link", "set", "dev", host_if, state])?;
+    if host_link_up(host_if)? != up {
+        bail!("host interface {host_if} link-state readback mismatch");
+    }
+    Ok(())
+}
+
+fn validate_host_if(host_if: &str) -> Result<()> {
+    if host_if.is_empty()
+        || host_if.len() > 15
+        || !host_if
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+    {
+        bail!("invalid Runman host interface name");
     }
     Ok(())
 }
