@@ -64,16 +64,17 @@ jobs:
       - name: Checksums
         run: |
           cp install.sh dist/
+          cp scripts/migrate-go-state.py dist/
           cd dist
-          chmod 755 runman-agent-linux-*
-          sha256sum runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh > SHA256SUMS
+          chmod 755 runman-agent-linux-* migrate-go-state.py
+          sha256sum runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh migrate-go-state.py > SHA256SUMS
           ls -l
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd dist
-          files=(runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh SHA256SUMS)
+          files=(runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh migrate-go-state.py SHA256SUMS)
           if [ "${{ github.ref_type }}" = tag ]; then
             gh release create "${{ github.ref_name }}" "${files[@]}" --title "${{ github.ref_name }}" --generate-notes
           else

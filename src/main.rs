@@ -50,6 +50,11 @@ enum Command {
     /// Measure the uplink bandwidth now and save it (restart the agent to
     /// report a result measured here).
     Speedtest,
+    /// Rebuild supported Go instances from a root-only, lossy migration manifest.
+    ImportGoManifest {
+        /// JSON produced by install.sh --migrate-go.
+        manifest: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -114,6 +119,22 @@ async fn agent_main() -> Result<()> {
                 m.mbps()
             );
             return Ok(());
+        }
+        Some(Command::ImportGoManifest { manifest }) => {
+            #[cfg(target_os = "linux")]
+            {
+                anyhow::ensure!(cfg.backend == BackendKind::Container, "Go migration requires the container backend");
+                let runtime = Runtime::new(Options::from_config(&cfg))?.with_config(store.clone());
+                runtime.init().await?;
+                runtime.refresh_images().await;
+                let imported = runtime
+                    .import_go_manifest(&manifest, cfg.max_forwards)
+                    .await?;
+                println!("imported {imported} Go VM(s) and their supported port forwards");
+                return Ok(());
+            }
+            #[cfg(not(target_os = "linux"))]
+            anyhow::bail!("Go migration is supported only on Linux");
         }
         Some(Command::SetToken { token, clear }) => {
             let token = if clear {
@@ -261,10 +282,14 @@ async fn agent_main() -> Result<()> {
     #[cfg(target_os = "linux")]
     if let Some((connlimit, hostpolicy, runtime)) = local_control {
         let target_runtime = runtime.clone();
+        let inventory_runtime = runtime.clone();
         tokio::spawn(async move {
             if let Err(e) = runman_agent::controlapi::serve_connlimit(connlimit, move |id| {
                 let runtime = target_runtime.clone();
                 async move { runtime.connlimit_target(&id).await }
+            }, move || {
+                let runtime = inventory_runtime.clone();
+                async move { runtime.watcher_inventory().await }
             })
             .await
             {

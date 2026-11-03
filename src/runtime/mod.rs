@@ -25,7 +25,7 @@ pub mod supervisor;
 pub mod sys;
 pub mod wg;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -69,6 +69,38 @@ pub struct Options {
     pub tun: bool,
     pub network: NetworkConfig,
     pub traffic: Schedule,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoMigrationManifest {
+    schema: u32,
+    source_backend: String,
+    instances: Vec<GoMigrationInstance>,
+    port_forwards: Vec<GoMigrationForward>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoMigrationInstance {
+    vm_id: String,
+    cpu: u32,
+    ram_mb: u64,
+    disk_gb: u64,
+    bandwidth_mbps: u32,
+    os_image: String,
+    root_password: String,
+    was_running: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoMigrationForward {
+    vm_id: String,
+    protocol: String,
+    host_port: u16,
+    guest_port: u16,
+    description: String,
 }
 
 impl Options {
@@ -473,6 +505,160 @@ impl Runtime {
             instance_id: rec.generation,
             ips,
         })
+    }
+
+    /// Minimal, read-only inventory contract for Podman Watcher. It exposes
+    /// Runman-owned instance identity and fresh resource/TCP evidence without
+    /// shell access or pretending the runtime is Incus/Podman.
+    pub async fn watcher_inventory(&self) -> Result<serde_json::Value> {
+        let now = unix_now();
+        let schedule = *self.traffic_schedule();
+        let mut items = Vec::new();
+        for rec in self.records()?.into_iter().filter(|r| !r.builder) {
+            let running = rec.desired == Desired::Running && self.is_active(&rec.id).await;
+            let pid = std::fs::read_to_string(self.run_spec(&rec).init_pid_file())
+                .ok()
+                .and_then(|raw| raw.trim().parse::<i32>().ok())
+                .filter(|pid| *pid > 0);
+            let connections = if running {
+                pid.and_then(monitor::watcher_tcp_counts)
+            } else {
+                None
+            };
+            let summary = self.summary(
+                &rec,
+                running,
+                &schedule.period(rec.created, now),
+            );
+            let mut ips = vec![rec.addrs.ipv4.to_string()];
+            if let Some(ip) = rec.addrs.ipv6 {
+                ips.push(ip.to_string());
+            }
+            ips.extend(self.dedicated_for(&rec.id).iter().map(ToString::to_string));
+            ips.sort();
+            ips.dedup();
+            let (established, pending, time_wait, valid) = connections
+                .map(|(established, pending, time_wait)| (established, pending, time_wait, true))
+                .unwrap_or((0, 0, 0, false));
+            let tcp_total = established + pending + time_wait;
+            items.push(serde_json::json!({
+                "id": &rec.id,
+                "name": &rec.id,
+                "instance_id": &rec.generation,
+                "managed": true,
+                "running": running,
+                "status": if running { "running" } else { "stopped" },
+                "os_image": &rec.os_image,
+                "cpu": rec.cpu,
+                "cpu_percent": summary.cpu_pct,
+                "ram_mb": rec.ram_mb,
+                "mem_bytes": summary.ram_used_mb.max(0) as u64 * 1_048_576,
+                "mem_limit_bytes": rec.ram_mb.saturating_mul(1_048_576),
+                "disk_gb": rec.disk_gb,
+                "bandwidth_mbps": rec.bandwidth_mbps,
+                "traffic_in_bytes": summary.traffic_in_bytes.max(0) as u64,
+                "traffic_out_bytes": summary.traffic_out_bytes.max(0) as u64,
+                "ips": ips,
+                "init_pid": pid,
+                "net_metrics_available": false,
+                "connection_metrics": {
+                    "schema": 1,
+                    "source": "runman_proc_net",
+                    "sampled_at": now,
+                    "epoch": rec.generation,
+                    "valid": valid,
+                    "total": tcp_total,
+                    "tcp_total": tcp_total,
+                    "tcp_established": established,
+                    "tcp_pending": pending,
+                    "tcp_time_wait": time_wait,
+                    "udp_sockets": 0
+                }
+            }));
+        }
+        Ok(serde_json::json!({
+            "schema": 1,
+            "observed_at": now,
+            "bridge": &self.net.bridge,
+            "items": items
+        }))
+    }
+
+    /// Import only the explicitly supported, lossy Go migration contract.
+    /// Guest files and addresses are not imported; the caller must keep the Go
+    /// installation and its guest data intact until every check succeeds.
+    pub async fn import_go_manifest(&self, path: &Path, max_forwards: u32) -> Result<usize> {
+        let raw = std::fs::read(path).with_context(|| format!("read migration manifest {}", path.display()))?;
+        anyhow::ensure!(raw.len() <= 16 * 1024 * 1024, "migration manifest is too large");
+        let manifest: GoMigrationManifest = serde_json::from_slice(&raw).context("parse Go migration manifest")?;
+        anyhow::ensure!(manifest.schema == 1, "unsupported Go migration manifest schema");
+        anyhow::ensure!(matches!(manifest.source_backend.as_str(), "podman" | "incus"), "unsupported source backend");
+        anyhow::ensure!(!manifest.instances.is_empty(), "migration manifest contains no instances");
+        anyhow::ensure!(manifest.instances.len() <= 4096, "migration instance count exceeds 4096");
+        anyhow::ensure!(manifest.port_forwards.len() <= 65535, "too many port forwards in migration manifest");
+
+        let mut ids = HashSet::new();
+        let mut instance_specs = Vec::with_capacity(manifest.instances.len());
+        for item in &manifest.instances {
+            let id = VmId::parse(&item.vm_id)?;
+            anyhow::ensure!(ids.insert(id.to_string()), "duplicate VM ID {}", item.vm_id);
+            anyhow::ensure!(matches!(item.os_image.as_str(), "alpine" | "debian"), "unsupported migration image {:?}", item.os_image);
+            anyhow::ensure!((1..=256).contains(&item.cpu), "CPU count is out of range for {}", item.vm_id);
+            anyhow::ensure!((128..=1_048_576).contains(&item.ram_mb), "memory is out of range for {}", item.vm_id);
+            anyhow::ensure!((1..=65_536).contains(&item.disk_gb), "disk size is out of range for {}", item.vm_id);
+            anyhow::ensure!(item.bandwidth_mbps <= 10_000_000, "bandwidth is out of range for {}", item.vm_id);
+            crate::model::validate_password(&item.root_password)?;
+            instance_specs.push((
+                id,
+                crate::model::InstanceSpec {
+                    vm_id: VmId::parse(&item.vm_id)?,
+                    cpu: item.cpu,
+                    ram_mb: item.ram_mb,
+                    disk_gb: item.disk_gb,
+                    bandwidth_mbps: item.bandwidth_mbps,
+                    os_image: item.os_image.clone(),
+                    root_password: item.root_password.clone(),
+                },
+                item.was_running,
+            ));
+        }
+
+        let mut host_ports = HashSet::new();
+        let mut forward_counts: HashMap<&str, u32> = HashMap::new();
+        let mut forwards = Vec::with_capacity(manifest.port_forwards.len());
+        for item in &manifest.port_forwards {
+            anyhow::ensure!(ids.contains(&item.vm_id), "port forward references unknown VM {}", item.vm_id);
+            anyhow::ensure!(item.host_port != 0 && item.guest_port != 0, "port forward has a zero port");
+            let proto = match item.protocol.as_str() {
+                "tcp" => crate::model::L4Proto::Tcp,
+                "udp" => crate::model::L4Proto::Udp,
+                _ => anyhow::bail!("unsupported port-forward protocol {:?}", item.protocol),
+            };
+            anyhow::ensure!(host_ports.insert((proto, item.host_port)), "duplicate host port {}/{}", item.host_port, item.protocol);
+            let count = forward_counts.entry(item.vm_id.as_str()).or_default();
+            *count += 1;
+            if max_forwards > 0 {
+                anyhow::ensure!(*count <= max_forwards, "VM {} exceeds the preserved port-forward limit {}", item.vm_id, max_forwards);
+            }
+            forwards.push(crate::model::PortForward {
+                vm_id: VmId::parse(&item.vm_id)?,
+                proto,
+                host_port: item.host_port,
+                guest_port: item.guest_port,
+                description: item.description.chars().take(200).collect(),
+            });
+        }
+
+        for (id, spec, was_running) in instance_specs {
+            crate::backend::Instances::create(self, &spec).await.with_context(|| format!("rebuild Go VM {id}"))?;
+            if !was_running {
+                crate::backend::Instances::stop(self, &id, true).await.with_context(|| format!("restore stopped state for {id}"))?;
+            }
+        }
+        for forward in forwards {
+            crate::backend::PortForwards::add(self, forward).await.context("restore port forward")?;
+        }
+        Ok(ids.len())
     }
 
     fn allocate_idx(&self) -> Result<u32> {

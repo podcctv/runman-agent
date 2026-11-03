@@ -1,53 +1,82 @@
-# Go Agent to Rust v2 migration plan
+# Go Agent to Rust v2 migration
 
-Rust v2 is a parallel major line. The Go `main` branch and its `continuous`
-release remain the production line until each migration has a verified
-cutover. Rust v2 publishes to `continuous-rs`; it never replaces that Go asset.
+Rust v2 is a parallel major line. Go `main` and its `continuous` release remain
+available; Rust publishes separately to `continuous-rs`. The Go installer
+offers menu item 15, which downloads the Rust installer and starts the same
+`--migrate-go` flow.
 
-## Compatibility boundary
+## Supported source and retained settings
 
-Rust v2 does not read or convert the Go configuration at
-`/opt/narwhal-agent/config.json`, the Go `agent.db`, or Go-managed Podman and
-Incus instances. It uses `/etc/runman-agent/config.toml`, its own data under
-`/var/lib/runman-agent`, and a different system-container runtime. A guest or
-database copy is not a supported in-place migration.
+The migration supports the standard Go Podman and Incus container backends.
+Preflight reads the Go JSON config, takes an SQLite online backup, verifies the
+live backend objects, and validates every item before stopping the Go agent.
+After confirmation it stops Go, takes a final config/database/live-state
+snapshot, then stops the old guests.
 
-The installer checks for a Go installation and stops before changing the
-host. Do not remove that guard or point the Go updater at `continuous-rs`.
+It rebuilds clean Rust containers and retains:
 
-## Recommended staged cutover
+- the platform host ID and token, panel user/password hash and listen address;
+- each VM UUID, CPU, memory, disk and bandwidth limits;
+- Alpine or Debian OS family and whether the guest was running;
+- supported TCP/UDP host-to-guest port forwards;
+- the supported host IPv6 mode/prefix and RFW API address.
 
-1. Inventory the old host: VM IDs, guest disks and attached volumes, addresses,
-   forwards, dedicated IPs, RFW rules, active temporary connection limits,
-   tokens, and service configuration. Take application-consistent backups and
-   prove that representative guest data can be restored.
-2. Confirm the platform can register a separate Rust v2 canary node without
-   replacing the Go node that owns the production token. If it cannot, stop
-   here and add a platform-side staging identity/mapping first.
-3. Install Rust v2 on a fresh Debian/Ubuntu host with an isolated canary
-   identity. Recreate a small workload from verified application backups;
-   restore forwards, dedicated IP bindings, and policies explicitly.
-4. Verify guest data, network reachability, inbound services, outbound
-   connectivity, RFW readback, Watcher firewall actions, connlimit apply,
-   expiry, and removal after stop/delete/recreate.
-5. Schedule a maintenance window. Freeze new sales and changes, take final
-   backups, drain traffic, and migrate workloads in measured batches. Keep the
-   old Go host intact and disconnected from the platform during the Rust
-   ownership window so both agents cannot reconcile the same node identity.
-6. Roll back by draining Rust v2, restoring the old Go host and its original
-   state from the verified backup, and reconnecting only the Go identity.
-   Do not run both agents against one platform identity during rollback.
+Generated root passwords are written to a root-only file in the migration
+backup directory. The operator must retrieve them there after migration.
 
-## RFW and connection-limit state
+## Data that is intentionally lost
 
-Rust v2 stores its desired RFW policy and rule ownership in
-`/var/lib/runman-agent/host-firewall.json`. Watcher connects over the
-root-only Unix socket `/run/narwhal-agent/firewall.sock`. Temporary connection
-limits are stored in `/var/lib/runman-agent/connlimit.json` and managed through
-`/run/narwhal-agent/connlimit.sock`. Limits bind to the Rust instance UUID and
-generation; a replacement instance cannot inherit an old lease. The local
-connlimit API accepts the managed VM UUID as `container_name`; a caller can
-query `/v1/connlimit/target` to obtain the current generation, or omit
-`instance_id` during apply and use the identity returned by the successful
-response. Existing Incus identities do not identify Rust instances. Reapply
-active Watcher policies after a cutover instead of copying Go runtime state.
+This is a destructive clean rebuild. Successful commit deletes old Podman or
+Incus guest root filesystems. Guest files, installed applications, databases,
+traffic history, per-guest IPv4/IPv6 addresses, WireGuard bindings, dedicated
+addresses, custom images, and mounted-volume attachments are not migrated.
+The old host packages and container images are left in place. Incus host-path
+mounts and other unsupported backend-specific settings are not recreated in
+Rust.
+
+Only standard Alpine and Debian image families are accepted. Unknown images,
+invalid resource settings, unsupported Go config, missing records, occupied
+ports, and failed Rust checks abort before old guests are purged.
+
+## Rollback boundary
+
+Before the destructive cleanup phase, an installer failure stops the partial
+Rust service, removes its managed state, restores the Go config/service state,
+and restarts the guests that were running before migration. The snapshot stays
+under `/var/backups/runman-go-to-rust-v2.*` with mode 0700.
+
+The installer marks migration committed only after the Rust service, panel,
+instance UUID/run-state inventory, and port-forward records pass checks. It
+then removes old guest root filesystems. If that cleanup partially fails, Rust
+remains active and cleanup is reported as pending; deleted Go guests cannot be
+restored automatically. Power loss, hardware faults, and every package change
+cannot be guaranteed reversible. Do not describe this process as 100% rollback
+guaranteed.
+
+The Go agent is stopped and disabled before Rust starts so both agents never
+reconcile the same platform identity concurrently. RFW is not migrated or
+reinstalled by this flow; its existing host service remains outside guest
+cleanup.
+
+## Podman Watcher compatibility
+
+The root-only Runman Unix socket exposes read-only inventory and fresh
+connection evidence, plus existing host RFW and temporary TCP connection-limit
+operations. Podman Watcher maps those records to runtime `runman`; it does not
+pretend Runman is Incus or Podman. Connection-limit requests bind to the VM UUID
+and current instance generation.
+
+The adapter does not provide per-process attribution, in-guest service
+inspection/remediation, or guest network byte counters. Those Watcher features
+remain unavailable for Runman until a separate evidence-backed interface is
+implemented.
+
+## Release channels
+
+- Go fork: `main` → `continuous`.
+- Rust v2: `rust-v2` → `continuous-rs`.
+- Stable Rust releases: `rust-v*` tags.
+
+The Go menu downloads the Rust `install.sh`, migration helper, binary, and
+checksums from `continuous-rs`. The Rust branch must publish those assets before
+menu item 15 can complete a migration.

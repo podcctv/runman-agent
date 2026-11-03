@@ -148,6 +148,49 @@ fn count_tcp(table: impl BufRead, conns: &mut Conns) {
     }
 }
 
+/// Read fresh TCP established/pending counts from one instance network
+/// namespace. `None` means the namespace evidence could not be read completely.
+pub(crate) fn watcher_tcp_counts(init_pid: i32) -> Option<(u64, u64, u64)> {
+    if init_pid <= 0 {
+        return None;
+    }
+    let mut established = 0;
+    let mut pending = 0;
+    let mut time_wait = 0;
+    for table in ["tcp", "tcp6"] {
+        let file = File::open(format!("/proc/{init_pid}/net/{table}")).ok()?;
+        let mut lines = BufReader::new(file).lines();
+        // A missing or malformed header means the table format was not
+        // verified, so do not publish a partial count as fresh evidence.
+        let header = lines.next()?.ok()?;
+        if !header.split_whitespace().any(|field| field == "st") {
+            return None;
+        }
+        for line in lines {
+            let line = line.ok()?;
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() < 4 {
+                return None;
+            }
+            let state = fields[3];
+            if !matches!(state, "01" | "02" | "03" | "06") {
+                continue;
+            }
+            let remote = fields[2].split(':').next().and_then(parse_proc_addr)?;
+            if remote.is_loopback() {
+                continue;
+            }
+            match state {
+                "01" => established += 1,
+                "02" | "03" => pending += 1,
+                "06" => time_wait += 1,
+                _ => {}
+            }
+        }
+    }
+    Some((established, pending, time_wait))
+}
+
 /// Add UDP flows from `/proc/net/nf_conntrack` to the instance owning either
 /// end: `owners` maps its addresses to its index in `conns`. UDP sockets have
 /// no peers to read, and these entries expire within minutes.

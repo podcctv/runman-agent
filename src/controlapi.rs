@@ -52,13 +52,16 @@ impl Drop for SocketCleanup {
     }
 }
 
-pub async fn serve_connlimit<F, Fut>(
+pub async fn serve_connlimit<F, Fut, I, IFut>(
     manager: Arc<crate::connlimit::Manager>,
     resolve: F,
+    inventory: I,
 ) -> Result<()>
 where
     F: Fn(String) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<crate::connlimit::Target>> + Send + 'static,
+    I: Fn() -> IFut + Clone + Send + Sync + 'static,
+    IFut: Future<Output = Result<Value>> + Send + 'static,
 {
     let listener = bind(CONNLIMIT_SOCKET).await?;
     let _cleanup = SocketCleanup(CONNLIMIT_SOCKET);
@@ -69,9 +72,10 @@ where
             .context("accept connection-limit socket")?;
         let manager = manager.clone();
         let resolve = resolve.clone();
+        let inventory = inventory.clone();
         tokio::spawn(async move {
             if let Err(e) = timeout(Duration::from_secs(10), async move {
-                handle_connlimit(stream, manager, resolve).await
+                handle_connlimit(stream, manager, resolve, inventory).await
             })
             .await
             .context("connection-limit control request timed out")
@@ -101,14 +105,17 @@ pub async fn serve_firewall(manager: Arc<crate::hostpolicy::Manager>) -> Result<
     }
 }
 
-async fn handle_connlimit<F, Fut>(
+async fn handle_connlimit<F, Fut, I, IFut>(
     mut stream: UnixStream,
     manager: Arc<crate::connlimit::Manager>,
     resolve: F,
+    inventory: I,
 ) -> Result<()>
 where
     F: Fn(String) -> Fut,
     Fut: Future<Output = Result<crate::connlimit::Target>>,
+    I: Fn() -> IFut,
+    IFut: Future<Output = Result<Value>>,
 {
     let request = match read_request(&mut stream, 8192).await {
         Ok(request) => request,
@@ -118,6 +125,12 @@ where
         .target
         .split_once('?')
         .unwrap_or((&request.target, ""));
+    if request.method == "GET" && path == "/v1/inventory" {
+        return match inventory().await {
+            Ok(report) => respond_json(&mut stream, 200, &report).await,
+            Err(e) => respond_error(&mut stream, 503, &format!("inventory unavailable: {e:#}")).await,
+        };
+    }
     if request.method == "GET" && path == "/v1/connlimit/target" {
         if query_value(query, "project")
             .as_deref()
@@ -140,8 +153,27 @@ where
                 .await;
             }
         };
-        return match resolve(id).await {
+        return match resolve(id.clone()).await {
             Ok(target) => {
+                let report = match inventory().await {
+                    Ok(report) => report,
+                    Err(e) => {
+                        return respond_error(
+                            &mut stream,
+                            503,
+                            &format!("fresh Runman connection evidence unavailable: {e:#}"),
+                        )
+                        .await;
+                    }
+                };
+                let item = report
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.iter().find(|item| item.get("id").and_then(Value::as_str) == Some(id.as_str())));
+                let metrics = item
+                    .and_then(|item| item.get("connection_metrics"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({"schema": 1, "valid": false}));
                 respond_json(
                     &mut stream,
                     200,
@@ -150,6 +182,7 @@ where
                         "running": target.running,
                         "instance_id": target.instance_id,
                         "ips": target.ips,
+                        "connection_metrics": metrics,
                     }),
                 )
                 .await
@@ -315,6 +348,12 @@ async fn handle_firewall(
                     respond_error(&mut stream, 503, "RFW event telemetry is unavailable").await
                 }
             }
+        }
+        // The Watcher capability probe intentionally GETs this known path:
+        // Go's ServeMux returns 405 for the existing POST route, while 404
+        // means the Runman firewall control API is not installed.
+        ("GET", "/v1/firewall/policy") => {
+            respond_error(&mut stream, 405, "POST required").await
         }
         ("POST", "/v1/firewall/policy") => {
             if request.body.len() > MAX_BODY {

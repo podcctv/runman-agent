@@ -62,11 +62,12 @@ Rust v2 在 `rust-v2` 分支并行维护，推送后发布 `continuous-rs`；`ru
 
 - `runman-agent-linux-amd64`、`runman-agent-linux-arm64`（静态 musl 二进制）
 - `install.sh`
+- `migrate-go-state.py`（Go 容器清单/快照辅助程序）
 - `SHA256SUMS`
 
 节点从 fork 的 GitHub Release 下载，只安装与 `SHA256SUMS` 校验和匹配、能正常运行的版本，发现新版后随机延迟 0–6 小时再应用，以免整批节点同时重启（面板里可立即更新）。本地编译的版本不会自动更新。
 
-Rust v2 不读取 Go 版配置、数据库或 Podman/Incus 实例。生产迁移前请按 [Go 到 Rust v2 迁移计划](MIGRATION_GO_TO_RUST_V2.md) 使用独立 canary 身份、验证备份与恢复，并保留 Go 节点回滚能力。
+常规 Rust 安装不会接管 Go 配置、数据库或 Podman/Incus 实例。Go 一键安装器的菜单 **15** 可启动有损的 clean-rebuild 迁移：保留受支持的主机/面板设置、实例 UUID/资源/运行状态和端口转发，在健康核验后删除旧容器根文件系统。它不保留客体文件、应用、IP、WireGuard 和挂载卷关联；删除阶段开始后无法承诺完整回滚。开始前先读 [Go 到 Rust v2 迁移计划](MIGRATION_GO_TO_RUST_V2.md) 并备份关键数据。此迁移会复用现有平台主机标识和 Token，且先停用 Go agent，避免两个 agent 同时协调同一节点。
 
 
 ## 实例镜像
