@@ -236,16 +236,30 @@ EOF
         install -m 644 "$work/desired.conf" "$conf"
         if ! systemd-analyze cat-config systemd/journald.conf > "$work/effective.conf" \
             || ! awk -F= '
-                $1 == "SystemMaxUse" { system_max=$2 }
-                $1 == "RuntimeMaxUse" { runtime_max=$2 }
-                $1 == "SystemKeepFree" { system_keep_free=$2 }
-                $1 == "MaxRetentionSec" { max_retention=$2 }
-                $1 == "MaxFileSec" { max_file=$2 }
-                END { exit !(system_max == "512M" && runtime_max == "128M" && system_keep_free == "1G" && max_retention == "7day" && max_file == "1day") }
+                function trim(value) {
+                    sub(/^[[:space:]]+/, "", value)
+                    sub(/[[:space:]]+$/, "", value)
+                    return value
+                }
+                index($0, "=") == 0 { next }
+                {
+                    key=trim(substr($0, 1, index($0, "=") - 1))
+                    value=trim(substr($0, index($0, "=") + 1))
+                    sub(/[[:space:]]+[;#].*$/, "", value)
+                    if (key == "SystemMaxUse") system_max=value
+                    if (key == "RuntimeMaxUse") runtime_max=value
+                    if (key == "SystemKeepFree") system_keep_free=value
+                    if (key == "MaxRetentionSec") max_retention=value
+                    if (key == "MaxFileSec") max_file=value
+                }
+                END {
+                    if (system_max == "512M" && runtime_max == "128M" && system_keep_free == "1G" && max_retention == "7day" && max_file == "1day") exit 0
+                    printf "effective journald settings differ: SystemMaxUse=%s RuntimeMaxUse=%s SystemKeepFree=%s MaxRetentionSec=%s MaxFileSec=%s\n", system_max, runtime_max, system_keep_free, max_retention, max_file > "/dev/stderr"
+                    exit 1
+                }
             ' "$work/effective.conf"; then
             if [ "$had_conf" = 1 ]; then cp -a "$work/original.conf" "$conf"; else rm -f "$conf"; fi
             warn "journald rejected the 7-day retention configuration; restored its previous drop-in"
-            failed=1
         elif ! systemctl restart systemd-journald.service; then
             if [ "$had_conf" = 1 ]; then cp -a "$work/original.conf" "$conf"; else rm -f "$conf"; fi
             systemctl restart systemd-journald.service >/dev/null 2>&1 || true
@@ -256,10 +270,8 @@ EOF
         fi
     fi
 
-    if [ "$failed" = 0 ]; then
-        journalctl --rotate || { warn "could not rotate the active journal"; failed=1; }
-        journalctl --vacuum-time=7d || { warn "could not vacuum journals older than 7 days"; failed=1; }
-    fi
+    journalctl --rotate || { warn "could not rotate the active journal"; failed=1; }
+    journalctl --vacuum-time=7d || { warn "could not vacuum journals older than 7 days"; failed=1; }
 
     if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
         if podman image prune -f; then
@@ -828,8 +840,12 @@ kernel=$(uname -r | cut -d- -f1)
     || die "kernel $kernel is too old; $MIN_KERNEL or newer is required (idmapped mounts)"
 
 if [ "$CLEANUP_ONLY" = 1 ]; then
-    maintenance_cleanup || die "maintenance cleanup was incomplete; see warnings above"
-    if [ "$CLEANUP_RUNTIMES" = 1 ]; then cleanup_unused_container_runtimes; fi
+    cleanup_failed=0
+    maintenance_cleanup || cleanup_failed=1
+    if [ "$CLEANUP_RUNTIMES" = 1 ]; then
+        cleanup_unused_container_runtimes || cleanup_failed=1
+    fi
+    [ "$cleanup_failed" = 0 ] || die "maintenance cleanup was incomplete; see warnings above"
     exit 0
 fi
 
