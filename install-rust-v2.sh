@@ -371,8 +371,11 @@ cleanup_unused_podman() {
         rm -rf -- "$work"
         return 0
     fi
-    if ! podman pod ps --all --quiet >"$work/pods" 2>&1; then
+    # `podman pod ps` already lists pods in every state; unlike `podman ps`,
+    # this subcommand does not accept --all on supported Podman releases.
+    if ! podman pod ps --quiet >"$work/pods" 2>&1; then
         warn "could not inventory Podman pods; keeping Podman"
+        tail -n 8 "$work/pods" >&2 || true
         rm -rf -- "$work"
         return 0
     fi
