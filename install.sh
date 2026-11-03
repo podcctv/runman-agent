@@ -1164,7 +1164,13 @@ esac
 [ "$INCUS_IPV6_ALLOC" -ge 1 ] && [ "$INCUS_IPV6_ALLOC" -le 15 ] \
     || die "--ipv6-alloc must be an integer from 1 to 15"
 
-# Use Chinese by default; retain the explicit `en` argument for compatibility.
+# Keep non-interactive/one-shot CLI output English by default for compatibility;
+# interactive menus use Chinese unless the caller explicitly selects `en`.
+if [ -z "$LANG_CODE" ] && { [ -n "$SYSTEM_ACTION" ] || [ -n "$TOKEN_ACTION" ] \
+    || [ -n "$IPV6_ONESHOT_MODE" ] || [ -n "$RUST_ACTION" ] \
+    || [ "$UNINSTALL" = "1" ] || [ "$NON_INTERACTIVE" = "1" ]; }; then
+    LANG_CODE="en"
+fi
 LANG_CODE="${LANG_CODE:-zh}"
 
 # 无参数且有终端时默认打开版本选择；--menu / --go-menu / --rust-menu 可显式打开。

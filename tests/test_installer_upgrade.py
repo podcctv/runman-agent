@@ -161,7 +161,7 @@ exit 93
 
     def test_menu_agent_only_upgrade(self):
         result = subprocess.run(["bash", str(self.script), "en", "--menu"],
-                                cwd=self.root, env=self.env, input="14\n",
+                                cwd=self.root, env=self.env, input="1\n14\n",
                                 text=True, capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Agent-only update complete", result.stdout)

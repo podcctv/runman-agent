@@ -146,7 +146,7 @@ test "${TEST_RESTART_FAIL:-0}" != 1
     def test_streamed_installer_chinese_menu_and_crlf_paste(self):
         terminal = self.start(mode="menu")
         terminal.wait_for("> ")
-        terminal.send("2\n")
+        terminal.send("1\n")
         terminal.wait_for("> ")
         terminal.send("4\n")
         terminal.wait_for("新面板密码")
