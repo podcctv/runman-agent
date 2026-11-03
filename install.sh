@@ -761,6 +761,17 @@ if [ "$FORCE_MENU" = "1" ] || { [ "$ORIGINAL_ARGC" -eq 0 ] && [ -t 0 ]; }; then
     show_main_menu
 fi
 
+# Route migration before any standalone management action (including uninstall)
+# can run. Conflicting options must fail closed without changing host state.
+if [ "$RUST_V2_MIGRATION" = "1" ]; then
+    [ "$UPDATE_ONLY" = "0" ] && [ -z "$SYSTEM_ACTION" ] && [ -z "$TOKEN_ACTION" ] \
+        && [ -z "$IPV6_ONESHOT_MODE" ] && [ "$UNINSTALL" != "1" ] \
+        && [ "$GENERATE_TOKEN" = "0" ] \
+        || die "Rust v2 migration cannot be combined with other management actions"
+    run_rust_v2_migration
+    exit 0
+fi
+
 # ── 一键 Token / 备份 / 回滚 / 卸载（处理完即退出）──
 if [ "$UPDATE_ONLY" = "1" ]; then
     [ -z "$SYSTEM_ACTION" ] && [ -z "$TOKEN_ACTION" ] && [ -z "$IPV6_ONESHOT_MODE" ] \
@@ -785,14 +796,6 @@ if [ "$UNINSTALL" = "1" ]; then
     do_uninstall
     exit 0
 fi
-if [ "$RUST_V2_MIGRATION" = "1" ]; then
-    [ "$UPDATE_ONLY" = "0" ] && [ -z "$SYSTEM_ACTION" ] && [ -z "$TOKEN_ACTION" ] \
-        && [ -z "$IPV6_ONESHOT_MODE" ] && [ "$UNINSTALL" != "1" ] \
-        || die "Rust v2 migration cannot be combined with other management actions"
-    run_rust_v2_migration
-    exit 0
-fi
-
 log "$(t "Recommended OS: Debian 13 (Trixie) for best compatibility." "推荐操作系统：使用 Debian 13 (Trixie) 以获得最佳兼容性。")"
 
 # ────────────────────────────────────────────────────────────────────────────────

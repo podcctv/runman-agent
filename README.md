@@ -133,6 +133,21 @@ bash <(curl -fsSL https://raw.githubusercontent.com/podcctv/runman-agent/main/in
 | 12 | Incus 完整清理：删除受管实例、ready 镜像、`incusbr0` 和镜像 remote | **破坏性，菜单要求确认** |
 | 13 | 配置/刷新镜像：Incus URL/离线目录/基础镜像；Podman registry mirror/基础镜像 | 是 |
 | 14 | 仅升级 Agent / 从原版就地迁移，先备份，保留网络和后端 | 是，运行中的 Agent 短暂重启 |
+| 15 | 有损重建迁移到 Rust v2 | **破坏性，必须逐字确认** |
+
+#### 一键有损迁移到 Rust v2
+
+仅适用于标准安装路径下的 Go Podman/Incus 容器后端。菜单 `15` 会先检查 Go 配置、SQLite 数据库、容器状态和支持的镜像；输入 `MIGRATE TO RUST` 后停止 Go Agent，再做一次最终快照，随后用 Rust v2 重建容器。
+
+它保留平台 Token/主机标识、面板登录配置、容器 UUID、CPU/内存/磁盘/带宽限制、Alpine/Debian 系统类型、运行状态和支持的 TCP/UDP 端口转发。新容器的 root 密码保存在 `/var/backups/runman-go-to-rust-v2.*/root-passwords.txt`，仅 root 可读。
+
+这是有损迁移：成功提交后删除旧容器根文件系统；容器文件、已安装软件、数据库、流量历史、容器 IP、WireGuard 绑定、专用地址、自定义镜像和挂载卷关联不会迁移。**Rust 健康检查通过并开始清理旧容器前**发生失败时，安装器会尝试恢复 Go 服务、配置和原先运行的容器。若旧容器清理中途失败，Rust 保持运行并提示待清理；已删除的旧容器不能自动恢复。断电、硬件故障和已安装的系统软件包也无法承诺 100% 回退。
+
+升级前应自行备份关键客体数据，并确认 `continuous-rs` Rust 资产已发布。可从菜单进入，或运行：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/podcctv/runman-agent/main/install.sh) zh --migrate-rust-v2
+```
 
 #### 重置面板密码
 

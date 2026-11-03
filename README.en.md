@@ -68,13 +68,13 @@ The script will reboot the server and install Debian 13 automatically. Once the 
 
 ## Step 2 — Run the Installer
 
-> This fork pulls the installer directly from the `main` branch (the fork does not publish releases):
+> The installer is served from `main`; CI publishes matching Go binaries to the `continuous` release:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/podcctv/runman-agent/main/install.sh)
 ```
 
-With no arguments the installer opens a guided operations menu with 13 actions:
+With no arguments the installer opens a guided operations menu with 15 actions:
 install/update, status, Podman-network repair plus service restart, panel-password reset, IPv6 detection,
 manual `/64` validation, Token display/rotation, network backup/rollback, safe
 uninstall, full Incus cleanup, and backend-specific image management. The wizard
@@ -363,6 +363,32 @@ with `--update-only --non-interactive`; inspect `journalctl -u narwhal-agent-upd
 To disable automatic checks (not manual updates), add
 `Environment=RUNMAN_AGENT_AUTO_UPDATE=0` under `[Service]` using
 `systemctl edit narwhal-agent`, then daemon-reload and restart the Agent.
+
+### Lossy clean-rebuild migration to Rust v2
+
+Menu **15** (or `--migrate-rust-v2`) is for standard Go Podman/Incus installs.
+It preserves the host ID/token and panel login, VM UUIDs, CPU/RAM/disk/bandwidth,
+Alpine/Debian family, prior run state, and supported TCP/UDP port forwards. It
+downloads the Rust `continuous-rs` installer, helper, and binary with checksum
+verification. The Go service is stopped and a final SQLite/config snapshot is
+taken before the old guests are stopped.
+
+This is destructive: on successful Rust health, identity, and forwarding checks,
+the old guest root filesystems are deleted. Guest files, installed software,
+traffic history, guest IPs, WireGuard bindings, dedicated addresses, custom
+images, and mounted-volume attachments are not migrated. Generated root
+passwords are saved in a root-only file under
+`/var/backups/runman-go-to-rust-v2.*/root-passwords.txt`.
+
+An installer/import/health failure before cleanup triggers best-effort rollback
+of the Go service/config and previously running guests. If cleanup partially
+fails, Rust stays active and remaining cleanup is reported; already deleted Go
+guests cannot be restored automatically. Power loss and all host package changes
+cannot be guaranteed reversible. Back up guest data before starting.
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/podcctv/runman-agent/main/install.sh) en --migrate-rust-v2
+```
 
 ### Full component update
 
