@@ -236,12 +236,12 @@ EOF
         install -m 644 "$work/desired.conf" "$conf"
         if ! systemd-analyze cat-config systemd/journald.conf > "$work/effective.conf" \
             || ! awk -F= '
-                $1 == "SystemMaxUse" { system=$2 }
-                $1 == "RuntimeMaxUse" { runtime=$2 }
-                $1 == "SystemKeepFree" { keep=$2 }
-                $1 == "MaxRetentionSec" { retention=$2 }
-                $1 == "MaxFileSec" { file=$2 }
-                END { exit !(system == "512M" && runtime == "128M" && keep == "1G" && retention == "7day" && file == "1day") }
+                $1 == "SystemMaxUse" { system_max=$2 }
+                $1 == "RuntimeMaxUse" { runtime_max=$2 }
+                $1 == "SystemKeepFree" { system_keep_free=$2 }
+                $1 == "MaxRetentionSec" { max_retention=$2 }
+                $1 == "MaxFileSec" { max_file=$2 }
+                END { exit !(system_max == "512M" && runtime_max == "128M" && system_keep_free == "1G" && max_retention == "7day" && max_file == "1day") }
             ' "$work/effective.conf"; then
             if [ "$had_conf" = 1 ]; then cp -a "$work/original.conf" "$conf"; else rm -f "$conf"; fi
             warn "journald rejected the 7-day retention configuration; restored its previous drop-in"
