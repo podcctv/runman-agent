@@ -122,6 +122,10 @@ migration_rollback() {
     fi
     if [ "$failed" = 1 ]; then
         printf 'Automatic rollback could not confirm every restoration. Review %s and systemd/container logs.\n' "$MIGRATION_DIR" >&2
+        if [ -x "$MIGRATION_DIR/diagnose-go-rust-migration.sh" ]; then
+            printf 'Run the read-only diagnostic: bash %q %q\n' \
+                "$MIGRATION_DIR/diagnose-go-rust-migration.sh" "$MIGRATION_DIR" >&2
+        fi
     else
         printf 'Go service state and pre-existing containers were restored.\n' >&2
     fi
@@ -631,7 +635,7 @@ esac
 
 prepare_go_migration() {
     local go_config=/opt/narwhal-agent/config.json go_binary=/opt/narwhal-agent/narwhal-agent
-    local asset go_unit_path host_port
+    local asset go_unit_path host_port diagnostic_asset=diagnose-go-rust-migration.sh
     [ "$MIGRATE_GO" = 1 ] || return 0
     [ -t 0 ] || die "Go -> Rust migration requires an interactive terminal for the destructive confirmation"
     if [ ! -f "$go_config" ] || [ ! -x "$go_binary" ]; then
@@ -656,16 +660,18 @@ prepare_go_migration() {
         || die "cannot fetch the Rust release checksum list; Go remains active"
     curl -fsSL --retry 3 --connect-timeout 20 -o "$WORK/release/migrate-go-state.py" "$RELEASE_URL/migrate-go-state.py" \
         || die "the Rust release has no Go migration helper; Go remains active"
+    curl -fsSL --retry 3 --connect-timeout 20 -o "$WORK/release/$diagnostic_asset" "$RELEASE_URL/$diagnostic_asset" \
+        || die "the Rust release has no migration diagnostic helper; Go remains active"
     asset="runman-agent-linux-$ARCH"
     curl -fsSL --retry 3 --connect-timeout 20 -o "$WORK/release/$asset" "$RELEASE_URL/$asset" \
         || die "cannot fetch the Rust binary; Go remains active"
-    for asset in migrate-go-state.py "runman-agent-linux-$ARCH"; do
+    for asset in migrate-go-state.py "$diagnostic_asset" "runman-agent-linux-$ARCH"; do
         [ "$(grep -Ec "  \*?$asset\$" "$WORK/SHA256SUMS")" = 1 ] \
             || die "release checksum list does not contain exactly one entry for $asset"
         (cd "$WORK/release" && grep -E "  \*?$asset\$" "$WORK/SHA256SUMS" | sha256sum -c --quiet -) \
             || die "Rust release checksum mismatch for $asset"
     done
-    chmod 755 "$WORK/release/migrate-go-state.py" "$WORK/release/runman-agent-linux-$ARCH"
+    chmod 755 "$WORK/release/migrate-go-state.py" "$WORK/release/$diagnostic_asset" "$WORK/release/runman-agent-linux-$ARCH"
     "$WORK/release/runman-agent-linux-$ARCH" --version >/dev/null \
         || die "Rust release binary does not run on this host; Go remains active"
     MIGRATION_HELPER="$WORK/release/migrate-go-state.py"
@@ -673,6 +679,7 @@ prepare_go_migration() {
     install -d -m 700 /var/backups
     MIGRATION_DIR=$(mktemp -d /var/backups/runman-go-to-rust-v2.XXXXXXXX)
     chmod 700 "$MIGRATION_DIR"
+    install -m 700 "$WORK/release/$diagnostic_asset" "$MIGRATION_DIR/$diagnostic_asset"
     cp -a "$go_config" "$MIGRATION_DIR/go-config.json"
     cp -a "$go_binary" "$MIGRATION_DIR/go-agent"
     go_unit_path=$(systemctl show -p FragmentPath --value narwhal-agent.service 2>/dev/null || true)

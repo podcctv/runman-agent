@@ -16,6 +16,11 @@ snapshot, then gracefully stops the old guests. Incus gets up to 120 seconds
 per guest to shut down cleanly; the installer never force-stops a guest after a
 timeout.
 
+The verified, read-only migration diagnostic is also saved in the root-only
+snapshot. If rollback cannot confirm every guest, the installer prints the
+command to run it against that snapshot. It reports service/Incus state and
+relevant logs without reading the saved passwords or changing host state.
+
 A host with no Go instances can use the same migration. The helper permits an
 empty manifest only when both Go instance tables and the complete Podman/Incus
 inventory are empty; if containers exist without database records, it refuses
@@ -100,5 +105,6 @@ implemented.
 - Stable Rust releases: `rust-v*` tags.
 
 The Go menu downloads the Rust installer (`install.sh` release asset), migration
-helper, binary, and checksums from `continuous-rs`. The Rust release workflow
-publishes those assets when Rust source changes land on `main`.
+helper, read-only diagnostic helper, binary, and checksums from `continuous-rs`.
+The Rust release workflow publishes those assets when Rust source changes land
+on `main`.
