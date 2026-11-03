@@ -160,6 +160,7 @@ exit 93
         self.assertEqual(json.loads(network.read_text()), dict(original, dns_enabled=False))
 
     def test_menu_agent_only_upgrade(self):
+        (self.agent / "narwhal-agent").chmod(0o755)
         result = subprocess.run(["bash", str(self.script), "en", "--menu"],
                                 cwd=self.root, env=self.env, input="1\n14\n",
                                 text=True, capture_output=True, timeout=30)
