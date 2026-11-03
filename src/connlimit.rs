@@ -373,8 +373,8 @@ impl Manager {
         if state.is_err() {
             command("iptables", &["-N", CHAIN])
                 .await
-                .or_else(|create_error| {
-                    Err(create_error.context("create managed IPv4 connection-limit chain"))
+                .map_err(|create_error| {
+                    create_error.context("create managed IPv4 connection-limit chain")
                 })?;
             command(
                 "iptables",

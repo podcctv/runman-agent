@@ -830,10 +830,10 @@ async fn apply_abuse(policy: &AbusePolicy) -> Result<()> {
 async fn apply_abuse_family(tool: &str, policy: &AbusePolicy) -> Result<()> {
     let enabled = policy.speedtest || policy.mining || policy.bt;
     let existing = fw_output(tool, &["-S", ABUSE_CHAIN]).await;
-    if let Ok(lines) = &existing {
-        if !lines.contains(ABUSE_MARKER) {
-            bail!("refusing to modify an existing unowned firewall chain");
-        }
+    if let Ok(lines) = &existing
+        && !lines.contains(ABUSE_MARKER)
+    {
+        bail!("refusing to modify an existing unowned firewall chain");
     }
     if !enabled {
         if existing.is_err() {
