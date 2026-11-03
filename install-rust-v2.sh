@@ -117,8 +117,8 @@ PY
             "$name" "${fallback_status^^}" "$fallback_pid"
         printf 'Incus volatile.last_state.power is %s and may be stale.\n' "${last_power^^}"
         while true; do
-            read -r -p "Should the replacement guest start after migration? Enter RUNNING or STOPPED: " answer \
-                || die "could not read the replacement run state for $name"
+            read -r -p "Should the replacement guest start after migration? Enter RUNNING or STOPPED: " answer </dev/tty \
+                || die "could not read the replacement run state for $name; an interactive terminal is required"
             case "${answer^^}" in
                 RUNNING|R) selected=running; break ;;
                 STOPPED|S) selected=stopped; break ;;
