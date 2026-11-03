@@ -574,30 +574,6 @@ fn parse_request_line(raw: &str) -> Result<(String, String)> {
     Ok((method.to_owned(), target.to_owned()))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_request_line;
-
-    #[test]
-    fn accepts_standard_http_1_request_lines() {
-        assert_eq!(
-            parse_request_line("GET /v1/inventory HTTP/1.1").unwrap(),
-            ("GET".to_owned(), "/v1/inventory".to_owned())
-        );
-        assert_eq!(
-            parse_request_line("POST /v1/firewall/policy HTTP/1.0").unwrap(),
-            ("POST".to_owned(), "/v1/firewall/policy".to_owned())
-        );
-    }
-
-    #[test]
-    fn rejects_malformed_or_unsupported_http_request_lines() {
-        assert!(parse_request_line("GET /v1/inventory").is_err());
-        assert!(parse_request_line("GET /v1/inventory HTTP/2").is_err());
-        assert!(parse_request_line("GET /v1/inventory HTTP/1.1 extra").is_err());
-    }
-}
-
 async fn respond_error(stream: &mut UnixStream, status: u16, message: &str) -> Result<()> {
     respond_json(stream, status, &json!({"ok": false, "message": message})).await
 }
@@ -620,4 +596,28 @@ async fn respond_json(stream: &mut UnixStream, status: u16, value: &Value) -> Re
     stream.write_all(&body).await?;
     stream.shutdown().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_request_line;
+
+    #[test]
+    fn accepts_standard_http_1_request_lines() {
+        assert_eq!(
+            parse_request_line("GET /v1/inventory HTTP/1.1").unwrap(),
+            ("GET".to_owned(), "/v1/inventory".to_owned())
+        );
+        assert_eq!(
+            parse_request_line("POST /v1/firewall/policy HTTP/1.0").unwrap(),
+            ("POST".to_owned(), "/v1/firewall/policy".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_or_unsupported_http_request_lines() {
+        assert!(parse_request_line("GET /v1/inventory").is_err());
+        assert!(parse_request_line("GET /v1/inventory HTTP/2").is_err());
+        assert!(parse_request_line("GET /v1/inventory HTTP/1.1 extra").is_err());
+    }
 }
