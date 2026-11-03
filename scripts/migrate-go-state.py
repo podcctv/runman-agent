@@ -28,6 +28,10 @@ def fail(message):
     raise SystemExit(message)
 
 
+def progress(message):
+    print(f"migration: {message}", flush=True)
+
+
 def checked_run(args, *, capture=True, timeout=45):
     try:
         result = subprocess.run(args, check=False, text=True, capture_output=capture, timeout=timeout)
@@ -588,12 +592,14 @@ def mark_rebuild_fallback(row, name, status, init_pid, state_path, rows):
         print(
             f"{name}: Incus became unusable during migration (status={status.upper()}, "
             f"init PID={init_pid or 'missing'}); rebuilding it as a clean Rust guest "
-            f"with the last valid state {target_state}"
+            f"with the last valid state {target_state}",
+            flush=True,
         )
     else:
         print(
-            f"{name}: leaving the pre-existing unusable Incus instance in place "
-            "until the Rust health checks pass"
+            f"{name}: preserving the pre-existing unusable Incus instance during staging; "
+            "it will be force-deleted only after Rust health checks pass",
+            flush=True,
         )
 
 
@@ -610,16 +616,20 @@ def lifecycle(args):
         fail("invalid legacy backend")
     if args.action == "stop":
         failed_name = ""
+        total = len(rows)
+        progress(f"checking and stopping legacy {backend} instances ({total} total)")
         try:
-            for row in rows:
+            for index, row in enumerate(rows, start=1):
                 if backend != "incus" and row.get("was_running") is not True:
                     continue
                 name = str(row.get("name") or "")
                 if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
                     fail(f"unsupported legacy container name {name!r}")
                 failed_name = name
+                progress(f"checking instance {name} ({index}/{total})")
                 if backend == "incus":
                     status, init_pid = incus_instance_state(name)
+                    progress(f"instance {name}: status={status.upper()}, init PID={init_pid or 'missing'}")
                     if incus_state_needs_rebuild(status, init_pid):
                         mark_rebuild_fallback(row, name, status, init_pid, args.state, rows)
                         continue
@@ -634,11 +644,16 @@ def lifecycle(args):
                 # A previous stop may have completed even if its client timed
                 # out. Make this phase idempotent before retrying a stop.
                 if backend == "podman":
+                    progress(f"stopping instance {name} gracefully (timeout=20s)")
                     checked_run(["podman", "stop", "--time", "20", name])
                 else:
                     # Give guests more time for a clean shutdown. Keep the
                     # client timeout longer than Incus's own shutdown timeout.
                     try:
+                        progress(
+                            f"stopping instance {name} gracefully "
+                            f"(Incus timeout={INCUS_STOP_TIMEOUT}s; client timeout={INCUS_STOP_TIMEOUT + 30}s)"
+                        )
                         checked_run(
                             ["incus", "stop", name, "--timeout", str(INCUS_STOP_TIMEOUT)],
                             timeout=INCUS_STOP_TIMEOUT + 30,
@@ -661,6 +676,7 @@ def lifecycle(args):
                             fail(f"{name}: stop failed ({stop_error}); state check failed ({state_error})")
                         if not stopped:
                             raise stop_error
+                progress(f"instance {name}: stop phase complete")
         except SystemExit as exc:
             restore_errors = []
             skipped_error_instances = []
@@ -672,8 +688,12 @@ def lifecycle(args):
                 try:
                     if backend == "incus":
                         if not rollback_should_start(row):
+                            if row.get("rebuild_fallback") is True:
+                                progress(f"rollback: leaving unusable instance {name} untouched; Rust replacement is not committed")
                             continue
+                        progress(f"rollback: checking whether to restart {name}")
                         status, init_pid = incus_instance_state(name)
+                        progress(f"rollback: instance {name}: status={status.upper()}, init PID={init_pid or 'missing'}")
                         if incus_state_needs_rebuild(status, init_pid):
                             mark_rebuild_fallback(row, name, status, init_pid, args.state, rows)
                             skipped_error_instances.append(name)
@@ -684,7 +704,9 @@ def lifecycle(args):
                         if row.get("was_running") is not True or live_state(backend, name):
                             continue
                     command = ["podman", "start", name] if backend == "podman" else ["incus", "start", name]
+                    progress(f"rollback: restarting {name}")
                     checked_run(command)
+                    progress(f"rollback: instance {name} restarted")
                 except SystemExit as restore_exc:
                     restore_errors.append(f"{name}: {restore_exc}")
             if skipped_error_instances:
@@ -710,7 +732,9 @@ def lifecycle(args):
     if args.action == "start":
         errors = []
         skipped_error_instances = []
-        for row in rows:
+        total = len(rows)
+        progress(f"rollback: checking legacy {backend} instances ({total} total)")
+        for index, row in enumerate(rows, start=1):
             name = str(row.get("name") or "")
             if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
                 errors.append(f"invalid saved name {name!r}")
@@ -718,8 +742,12 @@ def lifecycle(args):
             try:
                 if backend == "incus":
                     if not rollback_should_start(row):
+                        if row.get("rebuild_fallback") is True:
+                            progress(f"rollback: leaving unusable instance {name} untouched")
                         continue
+                    progress(f"rollback: checking instance {name} ({index}/{total})")
                     status, init_pid = incus_instance_state(name)
+                    progress(f"rollback: instance {name}: status={status.upper()}, init PID={init_pid or 'missing'}")
                     if incus_state_needs_rebuild(status, init_pid):
                         mark_rebuild_fallback(row, name, status, init_pid, args.state, rows)
                         skipped_error_instances.append(name)
@@ -733,9 +761,12 @@ def lifecycle(args):
                 errors.append(f"{name}: {exc}")
                 continue
             command = ["podman", "start", name] if backend == "podman" else ["incus", "start", name]
+            progress(f"rollback: starting instance {name} ({index}/{total})")
             result = subprocess.run(command, check=False, text=True, capture_output=True, timeout=45)
             if result.returncode != 0:
                 errors.append(f"{name}: {(result.stderr or result.stdout or '').strip()[-300:]}")
+            else:
+                progress(f"rollback: instance {name} started")
         if errors:
             fail("could not restore all previously running Go containers: " + "; ".join(errors))
         if skipped_error_instances:
@@ -746,15 +777,23 @@ def lifecycle(args):
         return
     if args.action == "purge":
         errors = []
-        for row in rows:
+        total = len(rows)
+        print(
+            f"removing {total} legacy {backend} instance(s) after Rust health checks passed",
+            flush=True,
+        )
+        for index, row in enumerate(rows, start=1):
             name = str(row.get("name") or "")
             if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
                 errors.append(f"invalid saved name {name!r}")
                 continue
             command = ["podman", "rm", "--force", name] if backend == "podman" else ["incus", "delete", name, "--force"]
+            progress(f"removing legacy instance {name} ({index}/{total})")
             result = subprocess.run(command, check=False, text=True, capture_output=True, timeout=120)
             if result.returncode != 0:
                 errors.append(f"{name}: {(result.stderr or result.stdout or '').strip()[-300:]}")
+            else:
+                progress(f"removed legacy instance {name}")
         if errors:
             fail("old guest cleanup incomplete: " + "; ".join(errors))
         print(f"removed {len(rows)} legacy guest container(s); images and host volumes were retained")

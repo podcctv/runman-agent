@@ -48,11 +48,32 @@ MIGRATION_MODULES_CONFIG_TOUCHED=0
 MIGRATION_SYSCTL_CONFIG_TOUCHED=0
 MIGRATION_LXCFS_CONFIG_TOUCHED=0
 MIGRATION_LXCFS_STATE_TOUCHED=0
+MIGRATION_GO_STOP_ATTEMPTED=0
+HOST_PACKAGES_INSTALLED=0
 WORK=""
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+apt_get() {
+    # Translation indexes are optional and some Debian mirrors do not publish them.
+    LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get \
+        -o DPkg::Lock::Timeout=600 \
+        -o Dpkg::Use-Pty=0 \
+        -o Acquire::Languages=none \
+        -y "$@"
+}
+
+install_host_packages() {
+    log "updating APT package indexes before changing container state; package-manager lock wait is capped at 10 minutes"
+    apt_get update
+    if [ "$MIGRATION_ACTIVE" = 1 ]; then MIGRATION_LXCFS_STATE_TOUCHED=1; fi
+    log "installing required host packages"
+    apt_get install --no-install-recommends --no-upgrade \
+        ca-certificates curl iproute2 iptables nftables wireguard-tools e2fsprogs tar gzip zstd util-linux kmod lxcfs
+    HOST_PACKAGES_INSTALLED=1
+}
 
 migration_capture_file() {
     local source="$1" saved="$MIGRATION_DIR/host-files$1"
@@ -198,22 +219,26 @@ PY
 
 migration_rollback() {
     local failed=0 record id
-    printf '\nMigration did not commit; restoring the Go service and containers. Snapshot: %s\n' "$MIGRATION_DIR" >&2
-    systemctl disable --now runman-agent.service >/dev/null 2>&1 || true
-    if [ -d "$DATA_DIR/instances" ]; then
-        for record in "$DATA_DIR"/instances/*/instance.json; do
-            [ -f "$record" ] || continue
-            id=$(basename "$(dirname "$record")")
-            systemctl stop "runman-$id.service" >/dev/null 2>&1 || true
-        done
+    if [ "$MIGRATION_GO_STOP_ATTEMPTED" = 1 ]; then
+        printf '\nMigration did not commit; restoring the Go service and containers. Snapshot: %s\n' "$MIGRATION_DIR" >&2
+        systemctl disable --now runman-agent.service >/dev/null 2>&1 || true
+        if [ -d "$DATA_DIR/instances" ]; then
+            for record in "$DATA_DIR"/instances/*/instance.json; do
+                [ -f "$record" ] || continue
+                id=$(basename "$(dirname "$record")")
+                systemctl stop "runman-$id.service" >/dev/null 2>&1 || true
+            done
+        fi
+        nft delete table inet runman >/dev/null 2>&1 || true
+        nft delete table bridge runman >/dev/null 2>&1 || true
+        ip link del rmbr0 >/dev/null 2>&1 || true
+        rm -f "$BIN" /etc/systemd/system/runman-agent.service
+        rm -rf -- "$CONFIG_DIR" "$DATA_DIR" /run/runman-agent
+        rm -f /run/narwhal-agent/connlimit.sock /run/narwhal-agent/firewall.sock
+        rmdir /run/narwhal-agent >/dev/null 2>&1 || true
+    else
+        printf '\nMigration stopped before stopping Go; leaving the Go service and legacy containers untouched. Snapshot: %s\n' "$MIGRATION_DIR" >&2
     fi
-    nft delete table inet runman >/dev/null 2>&1 || true
-    nft delete table bridge runman >/dev/null 2>&1 || true
-    ip link del rmbr0 >/dev/null 2>&1 || true
-    rm -f "$BIN" /etc/systemd/system/runman-agent.service
-    rm -rf -- "$CONFIG_DIR" "$DATA_DIR" /run/runman-agent
-    rm -f /run/narwhal-agent/connlimit.sock /run/narwhal-agent/firewall.sock
-    rmdir /run/narwhal-agent >/dev/null 2>&1 || true
     if [ "$MIGRATION_MODULES_CONFIG_TOUCHED" = 1 ]; then
         migration_restore_file /etc/modules-load.d/runman.conf || failed=1
     fi
@@ -252,17 +277,20 @@ migration_rollback() {
             systemctl disable lxcfs.service >/dev/null 2>&1 || failed=1
         fi
     fi
-    if [ -x "$MIGRATION_HELPER" ] && [ -f "$MIGRATION_DIR/legacy-state.json" ]; then
+    if [ "$MIGRATION_GO_STOP_ATTEMPTED" = 1 ] \
+        && [ -x "$MIGRATION_HELPER" ] && [ -f "$MIGRATION_DIR/legacy-state.json" ]; then
         "$MIGRATION_HELPER" lifecycle start --backend "$MIGRATION_BACKEND" \
             --state "$MIGRATION_DIR/legacy-state.json" || failed=1
     fi
-    if [ "$MIGRATION_GO_WAS_ENABLED" = 1 ]; then
-        systemctl enable narwhal-agent.service >/dev/null 2>&1 || failed=1
-    else
-        systemctl disable narwhal-agent.service >/dev/null 2>&1 || true
-    fi
-    if [ "$MIGRATION_GO_WAS_ACTIVE" = 1 ]; then
-        systemctl start narwhal-agent.service >/dev/null 2>&1 || failed=1
+    if [ "$MIGRATION_GO_STOP_ATTEMPTED" = 1 ]; then
+        if [ "$MIGRATION_GO_WAS_ENABLED" = 1 ]; then
+            systemctl enable narwhal-agent.service >/dev/null 2>&1 || failed=1
+        else
+            systemctl disable narwhal-agent.service >/dev/null 2>&1 || true
+        fi
+        if [ "$MIGRATION_GO_WAS_ACTIVE" = 1 ]; then
+            systemctl start narwhal-agent.service >/dev/null 2>&1 || failed=1
+        fi
     fi
     if [ "$failed" = 1 ]; then
         printf 'Automatic rollback could not confirm every restoration. Review %s and systemd/container logs.\n' "$MIGRATION_DIR" >&2
@@ -271,7 +299,11 @@ migration_rollback() {
                 "$MIGRATION_DIR/diagnose-go-rust-migration.sh" "$MIGRATION_DIR" >&2
         fi
     else
-        printf 'Go service state and recoverable pre-existing containers were restored.\n' >&2
+        if [ "$MIGRATION_GO_STOP_ATTEMPTED" = 1 ]; then
+            printf 'Go service state and recoverable pre-existing containers were restored.\n' >&2
+        else
+            printf 'No Go service or container state was changed by the migration.\n' >&2
+        fi
     fi
 }
 
@@ -799,6 +831,7 @@ prepare_go_migration() {
     command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required to verify Rust release assets"
 
     WORK=$(mktemp -d)
+    trap cleanup_exit EXIT
     mkdir -p "$WORK/release"
     curl -fsSL --retry 3 --connect-timeout 20 -o "$WORK/SHA256SUMS" "$RELEASE_URL/SHA256SUMS" \
         || die "cannot fetch the Rust release checksum list; Go remains active"
@@ -864,7 +897,7 @@ prepare_go_migration() {
     printf '\nThis migration rebuilds clean Alpine/Debian guests and permanently discards their old root filesystems after Rust health checks pass.\n'
     printf 'VM UUIDs, CPU/RAM/disk/bandwidth settings, running/stopped state, and supported TCP/UDP host-to-guest port forwards are retained.\n'
     printf 'Guest data, mounted volumes, installed software, traffic history, WireGuard bindings, custom images, and guest IP addresses are not migrated.\n'
-    printf 'A failed install/import/health check triggers service/config/container rollback before old guests are deleted. Power loss and every host package change cannot be guaranteed reversible.\n'
+    printf 'The installer attempts service/config/container rollback on failure; old guests are force-deleted only after Rust health checks pass. Power loss and host package changes cannot be guaranteed reversible.\n'
     printf 'Rust will create a new rmbr0 bridge on %s (IPv6 mode: %s); old Podman/Incus bridges are not reused.\n' \
         "${migration_ipv4:-unknown}" "${migration_ipv6_mode:-unknown}"
     printf 'Backup and generated root passwords: %s\n' "$MIGRATION_DIR"
@@ -873,6 +906,10 @@ prepare_go_migration() {
 
     MIGRATION_ACTIVE=1
     trap cleanup_exit EXIT
+    # Resolve repositories and install prerequisites while Go and its guests
+    # are still intact, so package failures cannot strand stopped containers.
+    install_host_packages
+    MIGRATION_GO_STOP_ATTEMPTED=1
     log "stopping the Go agent and its managed containers"
     systemctl stop narwhal-agent.service
     systemctl disable narwhal-agent.service >/dev/null
@@ -924,6 +961,7 @@ PY
     cp -a "$MIGRATION_DIR/config.toml" "$MIGRATION_DIR/rust-config.toml"
     printf 'Go -> Rust v2 lossy migration\nCreated: %s\nBackend: %s\n' \
         "$(date -Is)" "$MIGRATION_BACKEND" > "$MIGRATION_DIR/README.txt"
+    log "checking and stopping legacy $MIGRATION_BACKEND instances; unusable Incus instances will be rebuilt after Rust health checks"
     "$MIGRATION_HELPER" lifecycle stop --backend "$MIGRATION_BACKEND" \
         --state "$MIGRATION_DIR/legacy-state.json"
     log "legacy Go configuration, database snapshot, root passwords, and host settings saved at $MIGRATION_DIR"
@@ -1058,13 +1096,11 @@ prepare_go_migration
 
 # ── packages ────────────────────────────────────────────────────────────────
 
-log "installing packages"
-# Wait for other apt/dpkg runs (e.g. unattended-upgrades) instead of killing them.
-apt_get() { LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 -y -q "$@"; }
-apt_get update >/dev/null
-if [ "$MIGRATION_ACTIVE" = 1 ]; then MIGRATION_LXCFS_STATE_TOUCHED=1; fi
-apt_get install --no-install-recommends \
-    ca-certificates curl iproute2 iptables nftables wireguard-tools e2fsprogs tar gzip zstd util-linux kmod lxcfs >/dev/null
+if [ "$HOST_PACKAGES_INSTALLED" = 1 ]; then
+    log "required host packages were installed before stopping Go"
+else
+    install_host_packages
+fi
 
 for mod in wireguard ifb sch_cake tcp_bbr; do
     modprobe "$mod" 2>/dev/null || warn "kernel module $mod is unavailable; related features will fail"
