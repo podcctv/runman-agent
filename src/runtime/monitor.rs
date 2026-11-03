@@ -150,13 +150,14 @@ fn count_tcp(table: impl BufRead, conns: &mut Conns) {
 
 /// Read fresh TCP established/pending counts from one instance network
 /// namespace. `None` means the namespace evidence could not be read completely.
-pub(crate) fn watcher_tcp_counts(init_pid: i32) -> Option<(u64, u64, u64)> {
+pub(crate) fn watcher_tcp_counts(init_pid: i32) -> Option<(u64, u64, u64, u64)> {
     if init_pid <= 0 {
         return None;
     }
     let mut established = 0;
     let mut pending = 0;
     let mut time_wait = 0;
+    let mut udp_sockets = 0;
     for table in ["tcp", "tcp6"] {
         let file = File::open(format!("/proc/{init_pid}/net/{table}")).ok()?;
         let mut lines = BufReader::new(file).lines();
@@ -188,7 +189,37 @@ pub(crate) fn watcher_tcp_counts(init_pid: i32) -> Option<(u64, u64, u64)> {
             }
         }
     }
-    Some((established, pending, time_wait))
+    for table in ["udp", "udp6"] {
+        let file = File::open(format!("/proc/{init_pid}/net/{table}")).ok()?;
+        let mut lines = BufReader::new(file).lines();
+        let header = lines.next()?.ok()?;
+        if !header.split_whitespace().any(|field| field == "inode") {
+            return None;
+        }
+        for line in lines {
+            let line = line.ok()?;
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() < 10 || !fields[1].contains(':') || !fields[2].contains(':') {
+                return None;
+            }
+            udp_sockets += 1;
+        }
+    }
+    Some((established, pending, time_wait, udp_sockets))
+}
+
+#[cfg(test)]
+mod watcher_tests {
+    use super::watcher_tcp_counts;
+    use std::net::UdpSocket;
+
+    #[test]
+    fn watcher_counts_instance_udp_sockets_from_proc() {
+        let _socket = UdpSocket::bind("127.0.0.1:0").expect("bind test UDP socket");
+        let (_, _, _, udp_sockets) = watcher_tcp_counts(std::process::id() as i32)
+            .expect("read the current network namespace socket tables");
+        assert!(udp_sockets >= 1, "the bound UDP socket must be present in /proc/net/udp");
+    }
 }
 
 /// Add UDP flows from `/proc/net/nf_conntrack` to the instance owning either

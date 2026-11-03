@@ -694,6 +694,23 @@ impl Runtime {
                 None
             };
             let summary = self.summary(&rec, running, &schedule.period(rec.created, now));
+            let disk_image = std::fs::metadata(self.dir(&rec.id).join("disk.img"))
+                .ok()
+                .map(|metadata| {
+                    use std::os::unix::fs::MetadataExt;
+                    serde_json::json!({
+                        "source": "runman_disk_image",
+                        "available": true,
+                        "sampled_at": now,
+                        "logical_bytes": metadata.len(),
+                        "allocated_bytes": metadata.blocks().saturating_mul(512)
+                    })
+                })
+                .unwrap_or_else(|| serde_json::json!({
+                    "source": "runman_disk_image",
+                    "available": false,
+                    "sampled_at": now
+                }));
             let mut ips = vec![rec.addrs.ipv4.to_string()];
             if let Some(ip) = rec.addrs.ipv6 {
                 ips.push(ip.to_string());
@@ -701,9 +718,11 @@ impl Runtime {
             ips.extend(self.dedicated_for(&rec.id).iter().map(ToString::to_string));
             ips.sort();
             ips.dedup();
-            let (established, pending, time_wait, valid) = connections
-                .map(|(established, pending, time_wait)| (established, pending, time_wait, true))
-                .unwrap_or((0, 0, 0, false));
+            let (established, pending, time_wait, udp_sockets, valid) = connections
+                .map(|(established, pending, time_wait, udp_sockets)| {
+                    (established, pending, time_wait, udp_sockets, true)
+                })
+                .unwrap_or((0, 0, 0, 0, false));
             let tcp_total = established + pending + time_wait;
             let usage = usage_by_vm.get(&rec.id);
             let usage_valid = usage.is_some_and(|u| {
@@ -728,6 +747,7 @@ impl Runtime {
                 "mem_bytes": summary.ram_used_mb.max(0) as u64 * 1_048_576,
                 "mem_limit_bytes": rec.ram_mb.saturating_mul(1_048_576),
                 "disk_gb": rec.disk_gb,
+                "disk_image": disk_image,
                 "bandwidth_mbps": rec.bandwidth_mbps,
                 "traffic_in_bytes": summary.traffic_in_bytes.max(0) as u64,
                 "traffic_out_bytes": summary.traffic_out_bytes.max(0) as u64,
@@ -766,7 +786,7 @@ impl Runtime {
                     "tcp_established": established,
                     "tcp_pending": pending,
                     "tcp_time_wait": time_wait,
-                    "udp_sockets": 0
+                    "udp_sockets": if valid { udp_sockets } else { 0 }
                 }
             }));
         }
