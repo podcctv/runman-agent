@@ -58,6 +58,7 @@ jobs:
           shellcheck -S style install-rust-v2.sh images/build.sh
           bash install-rust-v2.sh --help >/dev/null
           bash install-rust-v2.sh --help | grep -q -- '--repair-rfw'
+          python3 -m py_compile scripts/patch-rfw-ring-provider.py
 
   # Real containers on the runner VM: needs root, systemd and network.
   integration:

@@ -131,6 +131,10 @@ jobs:
           repository: narwhal-cloud/rfw
           ref: dev
 
+      - uses: actions/checkout@v7
+        with:
+          path: runman-agent
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -149,6 +153,16 @@ jobs:
           rustup toolchain install stable
           rustup toolchain install nightly --component rust-src
           rustup target add --toolchain stable ${{ matrix.target }}
+
+      - name: Use a CPU-compatible Rustls provider
+        run: |
+          python3 runman-agent/scripts/patch-rfw-ring-provider.py "$GITHUB_WORKSPACE"
+          cargo tree -p rfw -e normal | tee /tmp/rfw-dependencies.txt
+          if grep -Eq 'aws-lc(-rs|-sys)? v' /tmp/rfw-dependencies.txt; then
+            echo 'RFW still includes aws-lc-rs; refusing to publish a potentially AVX2-only binary' >&2
+            exit 1
+          fi
+          grep -q 'ring v' /tmp/rfw-dependencies.txt
 
       - name: Install bpf-linker
         run: |
