@@ -476,10 +476,8 @@ mod tests {
     fn upperdir_allocation_counts_entries_without_following_symlinks_and_is_bounded() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join(format!(
-            "runman-upperdir-metric-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("runman-upperdir-metric-{}", uuid::Uuid::new_v4()));
         let outside = root.with_extension("outside");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("payload"), vec![0x5a; 16 * 1024]).unwrap();

@@ -5,6 +5,8 @@
 //! services behind the traits in [`backend`]. The wire protocol is shared with
 //! the platform and must stay byte-compatible with the Go agent it replaces.
 
+#![recursion_limit = "256"]
+
 pub mod backend;
 pub mod config;
 #[cfg(target_os = "linux")]

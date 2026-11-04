@@ -798,8 +798,7 @@ impl Runtime {
                 .flatten()
                 .filter(|_| {
                     self.load(&rec.id).ok().flatten().is_some_and(|current| {
-                        current.generation == rec.generation
-                            && current.desired == Desired::Running
+                        current.generation == rec.generation && current.desired == Desired::Running
                     }) && sys::is_mountpoint(&upper_mount)
                 })
             } else {
