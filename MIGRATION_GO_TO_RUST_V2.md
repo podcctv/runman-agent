@@ -44,6 +44,17 @@ empty manifest only when both Go instance tables and the complete Podman/Incus
 inventory are empty; if containers exist without database records, it refuses
 to proceed because their ownership cannot be proven.
 
+If `vm_configs` contains a core row without a matching selected-backend row,
+the helper checks that no live container with that VM UUID exists (across all
+Incus projects) and that no port-forward rows reference it. Only these verified
+orphan rows are eligible for exclusion. The installer lists their UUID and
+saved settings and requires the operator to type `EXCLUDE ORPHAN GO RECORDS`;
+the rows are then omitted from the Rust manifest, while the original Go
+database remains in the root-only snapshot. A live backend object, a port
+forward, a backend-only database row, or a changed orphan set still aborts
+migration. After Go stops, the helper rechecks the orphan report against the
+pre-confirmation snapshot before it stops or removes any legacy guest.
+
 It rebuilds clean Rust containers and retains:
 
 - the platform host ID and token, panel user/password hash and listen address;
@@ -81,7 +92,8 @@ mounts and other unsupported backend-specific settings are not recreated in
 Rust.
 
 Only standard Alpine and Debian image families are accepted. Unknown images,
-invalid resource settings, unsupported Go config, missing records, occupied
+invalid resource settings, unsupported Go config, backend-only records, live
+containers without proven Go ownership, unconfirmed orphan rows, occupied
 ports, and failed Rust checks abort before normally staged old guests are
 purged.
 

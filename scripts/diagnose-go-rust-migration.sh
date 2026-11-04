@@ -43,6 +43,39 @@ incus list --format csv --columns n,s,p,N 2>&1
 section 'migration snapshot inventory (file names and metadata only)'
 find "$SNAPSHOT_DIR" -maxdepth 1 -type f -printf '%f %s bytes mode=%m\n' | sort
 
+if [ -f "$SNAPSHOT_DIR/orphan-core-candidates.json" ]; then
+    section 'orphan Go core rows reviewed for exclusion'
+    python3 - "$SNAPSHOT_DIR/orphan-core-candidates.json" "$SNAPSHOT_DIR/orphan-core-exclusions.json" <<'PY'
+import json
+import pathlib
+import sys
+
+for path in sys.argv[1:]:
+    try:
+        value = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        value = []
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        print(f"{pathlib.Path(path).name}: cannot read report: {exc}")
+        continue
+    if not isinstance(value, list):
+        print(f"{pathlib.Path(path).name}: invalid report format")
+        continue
+    print(f"{pathlib.Path(path).name}: {len(value)} row(s)")
+    for row in value:
+        if isinstance(row, dict):
+            print(
+                "  {vm_id} status={status} image={image}".format(
+                    vm_id=row.get("vm_id", "?"),
+                    status=row.get("status", "?"),
+                    image=row.get("image", "?"),
+                )
+            )
+        elif isinstance(row, str):
+            print(f"  {row}")
+PY
+fi
+
 if [ -n "$TARGET_NAME" ]; then
     instance_names=("$TARGET_NAME")
 elif [ -f "$SNAPSHOT_DIR/legacy-state.json" ]; then

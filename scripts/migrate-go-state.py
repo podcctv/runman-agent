@@ -192,6 +192,13 @@ def backend_inventory(backend):
     return {line.strip() for line in output.splitlines() if line.strip()}
 
 
+def all_project_backend_inventory(backend):
+    if backend == "podman":
+        return backend_inventory(backend)
+    output = checked_run(["incus", "list", "--all-projects", "--format", "csv", "--columns", "n"])
+    return {line.strip() for line in output.splitlines() if line.strip()}
+
+
 def toml_string(value):
     return json.dumps(str(value), ensure_ascii=False)
 
@@ -360,8 +367,96 @@ def export(args):
         fail(f"Go database has duplicate VM identities in {provider_table}")
     base_by_id = dict(zip(base_ids, base_rows))
     provider_by_id = dict(zip(provider_ids, provider_rows))
-    if set(provider_by_id) != set(base_by_id):
-        fail("Go core instance rows do not exactly match the selected backend rows")
+    core_only_ids = set(base_by_id) - set(provider_by_id)
+    provider_only_ids = set(provider_by_id) - set(base_by_id)
+    if provider_only_ids:
+        fail(
+            "selected backend rows have no matching Go core rows: "
+            + ", ".join(sorted(provider_only_ids))
+        )
+
+    orphan_exclusions_path = getattr(args, "orphan_core_exclusions", None)
+    orphan_exclusions = set()
+    if orphan_exclusions_path is not None and orphan_exclusions_path.exists():
+        try:
+            raw_exclusions = json.loads(orphan_exclusions_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            fail(f"cannot read orphan core-row exclusions: {exc}")
+        if not isinstance(raw_exclusions, list) or any(not isinstance(value, str) for value in raw_exclusions):
+            fail("orphan core-row exclusions must be a JSON list of VM UUID strings")
+        normalized_exclusions = [canonical_uuid(value) for value in raw_exclusions]
+        if len(set(normalized_exclusions)) != len(normalized_exclusions):
+            fail("orphan core-row exclusions contain duplicate VM UUIDs")
+        orphan_exclusions = set(normalized_exclusions)
+
+    orphan_candidates = []
+    if core_only_ids:
+        forward_rows = table_rows(conn, "port_forwards")
+        forward_vm_ids = {
+            canonical_uuid(column(row, "vm_id"))
+            for row in forward_rows
+        }
+        with_live_backend = set()
+        all_backend_names = all_project_backend_inventory(backend)
+        for vm_id in sorted(core_only_ids):
+            if vm_id in all_backend_names:
+                with_live_backend.add(vm_id)
+        if with_live_backend:
+            fail(
+                "Go core-only row(s) have a live backend instance but no backend config row; "
+                "cannot infer ownership safely: " + ", ".join(sorted(with_live_backend))
+            )
+        forwarded = core_only_ids & forward_vm_ids
+        if forwarded:
+            fail(
+                "Go core-only row(s) still have port forwards and cannot be excluded: "
+                + ", ".join(sorted(forwarded))
+            )
+
+        for vm_id in sorted(core_only_ids):
+            row = base_by_id[vm_id]
+            orphan_candidates.append({
+                "vm_id": vm_id,
+                "cpu": column(row, "cpu"),
+                "memory_mb": column(row, "memory_mb"),
+                "disk_gb": column(row, "disk_gb"),
+                "bandwidth_mbps": column(row, "bandwidth_mbps"),
+                "image": column(row, "image"),
+                "status": column(row, "status"),
+            })
+    else:
+        forward_rows = table_rows(conn, "port_forwards")
+
+    candidates_path = args.output / "orphan-core-candidates.json"
+    write_private(
+        candidates_path,
+        json.dumps(orphan_candidates, ensure_ascii=False, separators=(",", ":")) + "\n",
+    )
+    candidate_ids = {row["vm_id"] for row in orphan_candidates}
+    stale_exclusions = orphan_exclusions - candidate_ids
+    if stale_exclusions:
+        fail(
+            "orphan core-row exclusions no longer match the database: "
+            + ", ".join(sorted(stale_exclusions))
+        )
+    unconfirmed_orphans = candidate_ids - orphan_exclusions
+    if unconfirmed_orphans:
+        print(
+            "orphan Go core row(s) have no live backend instance or port forwards; "
+            "review and explicitly confirm exclusion before migration: "
+            + ", ".join(sorted(unconfirmed_orphans)),
+            file=sys.stderr,
+        )
+        raise SystemExit(42)
+    if core_only_ids != orphan_exclusions:
+        fail("orphan core-row exclusion list does not exactly match the verified orphan rows")
+    if orphan_candidates:
+        for vm_id in sorted(core_only_ids):
+            base_by_id.pop(vm_id)
+        print(
+            f"excluding {len(orphan_candidates)} confirmed orphan Go core row(s) from the Rust manifest; "
+            "the original rows remain in the root-only SQLite snapshot"
+        )
 
     managed_names = []
     for row in provider_rows:
@@ -387,8 +482,11 @@ def export(args):
         )
     if set(error_state_overrides) - managed_set:
         fail("Incus ERROR run-state choices contain an instance not managed by the Go database")
-    if not base_rows:
-        print("Go database and backend inventory are empty; proceeding with host-only migration")
+    if not base_by_id:
+        if orphan_candidates:
+            print("all Go core rows were confirmed orphan records; proceeding with host-only migration")
+        else:
+            print("Go database and backend inventory are empty; proceeding with host-only migration")
 
     instances = []
     legacy_state = []
@@ -455,7 +553,7 @@ def export(args):
         passwords.append(f"{vm_id}\t{password}\n")
 
     forwards = []
-    for row in table_rows(conn, "port_forwards"):
+    for row in forward_rows:
         vm_id = canonical_uuid(column(row, "vm_id"))
         if vm_id not in base_by_id:
             fail(f"port forward references unknown VM {vm_id}")
@@ -949,6 +1047,7 @@ def main():
     export_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     export_parser.add_argument("--output", type=Path, required=True)
     export_parser.add_argument("--error-state-overrides", type=Path)
+    export_parser.add_argument("--orphan-core-exclusions", type=Path)
     export_parser.set_defaults(func=export)
     life = sub.add_parser("lifecycle")
     life.add_argument("action", choices=["stop", "start", "purge", "purge-for-space"])

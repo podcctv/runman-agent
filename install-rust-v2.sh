@@ -305,6 +305,7 @@ PY
     if [ "$found" = 1 ]; then
         "$MIGRATION_HELPER" export --config "$1" --output "$MIGRATION_DIR" \
             --error-state-overrides "$MIGRATION_DIR/error-state-overrides.json" \
+            --orphan-core-exclusions "$MIGRATION_DIR/orphan-core-exclusions.json" \
             || die "could not save the selected Incus replacement states"
         if ! python3 - "$MIGRATION_DIR/legacy-state.json" \
             "$MIGRATION_DIR/error-state-overrides.json" <<'PY'
@@ -343,6 +344,85 @@ PY
             die "Incus state changed while selecting replacement states; retry migration to review it"
         fi
     fi
+}
+
+migration_confirm_orphan_core_rows() {
+    local candidates="$MIGRATION_DIR/orphan-core-candidates.json"
+    local exclusions="$MIGRATION_DIR/orphan-core-exclusions.json"
+    local answer
+    [ -s "$candidates" ] || die "migration helper requested orphan-row confirmation without a candidate report"
+    printf '\nGo has core VM record(s) with no matching backend record, live container, or port forwards.\n'
+    printf 'They will be excluded from the Rust manifest; the original records remain in the root-only Go database snapshot.\n'
+    if ! python3 - "$candidates" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    rows = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    print(f"cannot read orphan core-row candidates: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(rows, list) or not rows or any(not isinstance(row, dict) for row in rows):
+    print("orphan core-row candidate report is empty or invalid", file=sys.stderr)
+    raise SystemExit(1)
+for row in rows:
+    print(
+        "  {vm_id} status={status} image={image} cpu={cpu} memory_mb={memory_mb} "
+        "disk_gb={disk_gb} bandwidth_mbps={bandwidth_mbps}".format(
+            vm_id=row.get("vm_id", "?"),
+            status=row.get("status", "?"),
+            image=row.get("image", "?"),
+            cpu=row.get("cpu", "?"),
+            memory_mb=row.get("memory_mb", "?"),
+            disk_gb=row.get("disk_gb", "?"),
+            bandwidth_mbps=row.get("bandwidth_mbps", "?"),
+        )
+    )
+PY
+    then
+        die "could not review orphan core-row candidates"
+    fi
+    read -r -p 'Type EXCLUDE ORPHAN GO RECORDS to confirm: ' answer </dev/tty \
+        || die "could not read orphan-row confirmation; an interactive terminal is required"
+    [ "$answer" = "EXCLUDE ORPHAN GO RECORDS" ] \
+        || die "orphan-row exclusion cancelled; Go remains active"
+    if ! python3 - "$candidates" "$exclusions" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+try:
+    rows = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    print(f"cannot read orphan core-row candidates: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(rows, list) or not rows or any(not isinstance(row, dict) for row in rows):
+    print("orphan core-row candidate report is empty or invalid", file=sys.stderr)
+    raise SystemExit(1)
+ids = [row.get("vm_id") for row in rows]
+if any(not isinstance(value, str) for value in ids) or len(ids) != len(set(ids)):
+    print("orphan core-row candidates contain missing or duplicate UUIDs", file=sys.stderr)
+    raise SystemExit(1)
+path = pathlib.Path(sys.argv[2])
+tmp = path.with_name(path.name + ".tmp")
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as stream:
+    json.dump(sorted(ids), stream, separators=(",", ":"))
+    stream.write("\n")
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+    then
+        die "could not save orphan-row exclusions"
+    fi
+}
+
+migration_export_go_state() {
+    "$MIGRATION_HELPER" export --config "$1" --output "$MIGRATION_DIR" \
+        --error-state-overrides "$MIGRATION_DIR/error-state-overrides.json" \
+        --orphan-core-exclusions "$MIGRATION_DIR/orphan-core-exclusions.json"
 }
 
 migration_rollback() {
@@ -945,7 +1025,7 @@ esac
 
 prepare_go_migration() {
     local go_config=/opt/narwhal-agent/config.json go_binary=/opt/narwhal-agent/narwhal-agent
-    local asset go_unit_path host_port migration_free_after_delete
+    local asset go_unit_path host_port migration_free_after_delete orphan_count
     local diagnostic_asset=diagnose-go-rust-migration.sh
     [ "$MIGRATE_GO" = 1 ] || return 0
     [ -t 0 ] || die "Go -> Rust migration requires an interactive terminal for the destructive confirmation"
@@ -995,6 +1075,8 @@ prepare_go_migration() {
     chmod 700 "$MIGRATION_DIR"
     printf '{}\n' > "$MIGRATION_DIR/error-state-overrides.json"
     chmod 600 "$MIGRATION_DIR/error-state-overrides.json"
+    printf '[]\n' > "$MIGRATION_DIR/orphan-core-exclusions.json"
+    chmod 600 "$MIGRATION_DIR/orphan-core-exclusions.json"
     install -m 700 "$WORK/release/$diagnostic_asset" "$MIGRATION_DIR/$diagnostic_asset"
     cp -a "$go_config" "$MIGRATION_DIR/go-config.json"
     migration_backup_go_agent "$go_binary"
@@ -1015,13 +1097,22 @@ prepare_go_migration() {
     if systemctl is-active --quiet lxcfs.service; then MIGRATION_LXCFS_WAS_ACTIVE=1; fi
     if systemctl is-enabled --quiet lxcfs.service; then MIGRATION_LXCFS_WAS_ENABLED=1; fi
 
-    if ! "$MIGRATION_HELPER" export --config "$go_config" --output "$MIGRATION_DIR" \
-        --error-state-overrides "$MIGRATION_DIR/error-state-overrides.json"; then
-        printf 'Go migration preflight failed; Go remains active. Snapshot: %s\n' "$MIGRATION_DIR" >&2
-        printf 'Read-only diagnostic: bash %q %q\n' \
-            "$MIGRATION_DIR/$diagnostic_asset" "$MIGRATION_DIR" >&2
-        exit 1
+    if migration_export_go_state "$go_config"; then
+        :
+    else
+        local migration_export_status=$?
+        if [ "$migration_export_status" -eq 42 ]; then
+            migration_confirm_orphan_core_rows
+            migration_export_go_state "$go_config" \
+                || die "Go migration preflight failed after orphan-row confirmation; Go remains active"
+        else
+            printf 'Go migration preflight failed; Go remains active. Snapshot: %s\n' "$MIGRATION_DIR" >&2
+            printf 'Read-only diagnostic: bash %q %q\n' \
+                "$MIGRATION_DIR/$diagnostic_asset" "$MIGRATION_DIR" >&2
+            exit 1
+        fi
     fi
+    cp -a "$MIGRATION_DIR/orphan-core-candidates.json" "$MIGRATION_DIR/pre-confirm-orphan-core-candidates.json"
     MIGRATION_BACKEND=$(cat "$MIGRATION_DIR/source-backend")
     migration_choose_error_states "$go_config"
     WEB_LISTEN=$(cat "$MIGRATION_DIR/web-listen")
@@ -1035,6 +1126,11 @@ prepare_go_migration() {
     printf 'VM UUIDs, CPU/RAM/disk/bandwidth settings, running/stopped state, and supported TCP/UDP host-to-guest port forwards are retained.\n'
     printf 'Guest data, mounted volumes, installed software, traffic history, WireGuard bindings, custom images, and guest IP addresses are not migrated.\n'
     printf 'The installer attempts service/config/container rollback on failure. If disk space is below 768 MiB, a second typed confirmation can delete all Go-managed Incus guests before Rust health checks; their parameters/database are backed up, but guest files cannot be restored. Power loss and host package changes cannot be guaranteed reversible.\n'
+    orphan_count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1], encoding="utf-8"))))' \
+        "$MIGRATION_DIR/orphan-core-candidates.json")
+    if [ "$orphan_count" -gt 0 ]; then
+        printf 'Confirmed orphan core records excluded from Rust: %s (original rows retained in go-agent.db).\n' "$orphan_count"
+    fi
     printf 'Rust will create a new rmbr0 bridge on %s (IPv6 mode: %s); old Podman/Incus bridges are not reused.\n' \
         "${migration_ipv4:-unknown}" "${migration_ipv6_mode:-unknown}"
     printf 'Backup and generated root passwords: %s\n' "$MIGRATION_DIR"
@@ -1061,7 +1157,12 @@ prepare_go_migration() {
     cp -a "$MIGRATION_DIR/legacy-state.json" "$MIGRATION_DIR/pre-confirm-legacy-state.json"
     "$MIGRATION_HELPER" export --config "$go_config" --output "$MIGRATION_DIR" \
         --error-state-overrides "$MIGRATION_DIR/error-state-overrides.json" \
+        --orphan-core-exclusions "$MIGRATION_DIR/orphan-core-exclusions.json" \
         || die "final Go snapshot failed; the old guests remain intact and rollback will restart Go"
+    if ! cmp -s "$MIGRATION_DIR/pre-confirm-orphan-core-candidates.json" \
+        "$MIGRATION_DIR/orphan-core-candidates.json"; then
+        die "orphan Go core rows changed after confirmation; retry migration to review the updated snapshot"
+    fi
     if [ "$MIGRATION_BACKEND" = incus ]; then
         if ! python3 - "$MIGRATION_DIR/pre-confirm-legacy-state.json" "$MIGRATION_DIR/legacy-state.json" <<'PY'
 import json
