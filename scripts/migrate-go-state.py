@@ -13,6 +13,7 @@ import secrets
 import shutil
 import sqlite3
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 
