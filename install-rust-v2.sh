@@ -474,7 +474,7 @@ migration_rfw_restore_original() {
 
 migration_rfw_ready_stable() {
     local attempt ready=0 baseline restarts
-    for attempt in $(seq 1 20); do
+    for ((attempt = 1; attempt <= 20; attempt++)); do
         if systemctl is-active --quiet rfw.service \
             && curl -fsS --max-time 2 "$MIGRATION_RFW_API_URL" >/dev/null 2>&1; then
             ready=1
@@ -485,7 +485,7 @@ migration_rfw_ready_stable() {
     [ "$ready" = 1 ] || return 1
     baseline=$(systemctl show -p NRestarts --value rfw.service 2>/dev/null) || return 1
     [[ "$baseline" =~ ^[0-9]+$ ]] || return 1
-    for attempt in $(seq 1 15); do
+    for ((attempt = 1; attempt <= 15; attempt++)); do
         systemctl is-active --quiet rfw.service \
             && curl -fsS --max-time 2 "$MIGRATION_RFW_API_URL" >/dev/null 2>&1 \
             || return 1
@@ -534,11 +534,13 @@ migration_prepare_rfw_repair() {
     api_count=$(printf '%s\n' "$exec_start" | grep -o -- '--api-addr' | wc -l || true)
     path_count=${path_count//[[:space:]]/}
     api_count=${api_count//[[:space:]]/}
-    [ "$path_count" = 1 ] && [ "$api_count" = 1 ] \
-        || die "RFW is in a repeated SIGILL loop, but its systemd ExecStart cannot be parsed safely; Go remains active"
-    [[ "$MIGRATION_RFW_BIN" =~ ^/[A-Za-z0-9._/-]+/rfw$ ]] \
-        && [ -f "$MIGRATION_RFW_BIN" ] && [ -x "$MIGRATION_RFW_BIN" ] && [ ! -L "$MIGRATION_RFW_BIN" ] \
-        || die "RFW is in a repeated SIGILL loop, but its executable path is unsupported; Go remains active"
+    if [ "$path_count" != 1 ] || [ "$api_count" != 1 ]; then
+        die "RFW is in a repeated SIGILL loop, but its systemd ExecStart cannot be parsed safely; Go remains active"
+    fi
+    if [[ ! "$MIGRATION_RFW_BIN" =~ ^/[A-Za-z0-9._/-]+/rfw$ ]] \
+        || [ ! -f "$MIGRATION_RFW_BIN" ] || [ ! -x "$MIGRATION_RFW_BIN" ] || [ -L "$MIGRATION_RFW_BIN" ]; then
+        die "RFW is in a repeated SIGILL loop, but its executable path is unsupported; Go remains active"
+    fi
     MIGRATION_RFW_API_ADDR=$(printf '%s\n' "$exec_start" \
         | sed -n 's/.*argv\[\]=[^;]*--api-addr[[:space:]]\([^ ;}]*\).*/\1/p')
     [[ "$MIGRATION_RFW_API_ADDR" =~ ^(127\.0\.0\.1|\[::1\]|localhost):[0-9]{1,5}$ ]] \
