@@ -99,6 +99,27 @@ cleanup_apt_caches() {
     fi
 }
 
+cleanup_apt_list_indexes_for_low_space() {
+    local lists=/var/lib/apt/lists before after
+    [ "$MIGRATION_GUESTS_PREDELETE_CONFIRMED" = 1 ] || return 0
+    [ -d "$lists" ] || return 0
+    if ps -eo comm= 2>/dev/null | grep -Eq '^(apt|apt-get|apt-cache|dpkg|apt\.systemd.*|unattended.*)$'; then
+        warn "APT started another operation; keeping package-list indexes"
+        return 0
+    fi
+    before=$(du -sb "$lists" 2>/dev/null | awk 'NR == 1 {print $1}')
+    before=${before:-0}
+    find "$lists" -mindepth 1 -maxdepth 1 ! -name lock ! -name partial -exec rm -rf -- {} +
+    if [ -d "$lists/partial" ]; then
+        find "$lists/partial" -mindepth 1 ! -name lock -delete
+    fi
+    after=$(du -sb "$lists" 2>/dev/null | awk 'NR == 1 {print $1}')
+    after=${after:-0}
+    if [[ "$before" =~ ^[0-9]+$ && "$after" =~ ^[0-9]+$ ]] && [ "$before" -gt "$after" ]; then
+        log "cleared regenerable APT package indexes for low-space staging; recovered $((before - after)) bytes"
+    fi
+}
+
 install_host_packages() {
     cleanup_partial_apt_indexes
     log "updating APT package indexes before changing container state; package-manager lock wait is capped at 10 minutes"
@@ -109,6 +130,7 @@ install_host_packages() {
         ca-certificates curl iproute2 iptables nftables wireguard-tools e2fsprogs tar gzip zstd util-linux kmod lxcfs
     HOST_PACKAGES_INSTALLED=1
     cleanup_apt_caches
+    cleanup_apt_list_indexes_for_low_space
 }
 
 migration_available_bytes() {
