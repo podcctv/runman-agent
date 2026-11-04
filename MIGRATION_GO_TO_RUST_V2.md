@@ -116,9 +116,15 @@ every package change cannot be guaranteed reversible. Do not describe this
 process as 100% rollback guaranteed.
 
 The Go agent is stopped and disabled before Rust starts so both agents never
-reconcile the same platform identity concurrently. RFW is not migrated or
-reinstalled by this flow; its existing host service remains outside guest
-cleanup.
+reconcile the same platform identity concurrently. RFW is not part of guest
+migration or cleanup. Before asking for the migration confirmation, the
+installer checks an active x86_64 RFW service for repeated recent SIGILL
+exits on a host without AVX2. When all evidence matches, it verifies and stages
+the published RFW binary. After confirmation it replaces only the executable
+referenced by the service, preserving the unit and its arguments, then requires
+the local RFW status API to remain healthy for 15 seconds. A failed health
+check restores the saved executable and aborts before stopping Go. Other RFW
+installations are left untouched.
 
 ## Podman Watcher compatibility
 

@@ -52,6 +52,16 @@ MIGRATION_GO_STOP_ATTEMPTED=0
 HOST_PACKAGES_INSTALLED=0
 MIGRATION_GUESTS_PREDELETE_CONFIRMED=0
 MIGRATION_GUESTS_PREDELETE_ATTEMPTED=0
+MIGRATION_RFW_REPAIR_REQUIRED=0
+MIGRATION_RFW_REPAIR_ATTEMPTED=0
+MIGRATION_RFW_REPAIRED=0
+MIGRATION_RFW_BIN=""
+MIGRATION_RFW_API_ADDR=""
+MIGRATION_RFW_API_URL=""
+MIGRATION_RFW_CANDIDATE=""
+MIGRATION_RFW_ORIGINAL_SHA256=""
+MIGRATION_RFW_CANDIDATE_SHA256=""
+MIGRATION_RFW_VERSION=""
 MIGRATION_MIN_FREE_BYTES=$((768 * 1024 * 1024))
 WORK=""
 
@@ -425,8 +435,180 @@ migration_export_go_state() {
         --orphan-core-exclusions "$MIGRATION_DIR/orphan-core-exclusions.json"
 }
 
+is_elf_for_arch() { # the file must be a 64-bit ELF for this machine
+    local want
+    want=$([ "$ARCH" = amd64 ] && echo 3e00 || echo b700)
+    [ "$(head -c 6 "$1" | od -An -tx1 | tr -d ' \n')" = 7f454c460201 ] \
+        && [ "$(dd if="$1" bs=1 skip=18 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "$want" ]
+}
+
+migration_cpu_has_avx2() {
+    awk '
+        /^flags[[:space:]]*:/ {
+            seen = 1
+            found = 0
+            for (i = 2; i <= NF; i++) if ($i == "avx2") found = 1
+            if (!found) missing = 1
+        }
+        END { exit !(seen && !missing) }
+    ' /proc/cpuinfo
+}
+
+migration_rfw_restore_original() {
+    local tmp
+    [ -n "$MIGRATION_RFW_BIN" ] \
+        && [ -f "$MIGRATION_DIR/rfw-original" ] \
+        || return 1
+    tmp=$(mktemp "${MIGRATION_RFW_BIN}.runman-restore.XXXXXXXX") || return 1
+    if ! cp -a -- "$MIGRATION_DIR/rfw-original" "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! mv -f -- "$tmp" "$MIGRATION_RFW_BIN"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    systemctl restart rfw.service >/dev/null 2>&1 || return 1
+    [ "$(sha256sum "$MIGRATION_RFW_BIN" | awk '{print $1}')" = "$MIGRATION_RFW_ORIGINAL_SHA256" ]
+}
+
+migration_rfw_ready_stable() {
+    local attempt ready=0 baseline restarts
+    for attempt in $(seq 1 20); do
+        if systemctl is-active --quiet rfw.service \
+            && curl -fsS --max-time 2 "$MIGRATION_RFW_API_URL" >/dev/null 2>&1; then
+            ready=1
+            break
+        fi
+        sleep 1
+    done
+    [ "$ready" = 1 ] || return 1
+    baseline=$(systemctl show -p NRestarts --value rfw.service 2>/dev/null) || return 1
+    [[ "$baseline" =~ ^[0-9]+$ ]] || return 1
+    for attempt in $(seq 1 15); do
+        systemctl is-active --quiet rfw.service \
+            && curl -fsS --max-time 2 "$MIGRATION_RFW_API_URL" >/dev/null 2>&1 \
+            || return 1
+        restarts=$(systemctl show -p NRestarts --value rfw.service 2>/dev/null) || return 1
+        [ "$restarts" = "$baseline" ] || return 1
+        sleep 1
+    done
+}
+
+migration_prepare_rfw_repair() {
+    local active restarts journal_file failures exec_start path_count api_count port
+    local sums_file asset
+    [ "$MIGRATE_GO" = 1 ] && [ "$ARCH" = amd64 ] || return 0
+    [ "$(systemctl show -p LoadState --value rfw.service 2>/dev/null || true)" = loaded ] || return 0
+    active=$(systemctl show -p ActiveState --value rfw.service 2>/dev/null || true)
+    case "$active" in
+        active|activating) ;;
+        *) return 0 ;;
+    esac
+    migration_cpu_has_avx2 && return 0
+
+    restarts=$(systemctl show -p NRestarts --value rfw.service 2>/dev/null || true)
+    [[ "$restarts" =~ ^[0-9]+$ ]] && [ "$restarts" -ge 3 ] || return 0
+    if ! command -v journalctl >/dev/null 2>&1; then
+        warn "RFW has restarted repeatedly on a CPU without AVX2, but journalctl is unavailable; leaving its binary untouched"
+        return 0
+    fi
+    journal_file="$MIGRATION_DIR/rfw-sigill-journal.log"
+    if ! journalctl -u rfw.service --since "24 hours ago" -n 200 --no-pager -o cat \
+        > "$journal_file" 2>/dev/null; then
+        warn "could not read recent RFW restart evidence; leaving its binary untouched"
+        rm -f -- "$journal_file"
+        return 0
+    fi
+    chmod 600 "$journal_file"
+    failures=$(grep -Ec 'status=4/ILL([[:space:]]|$)|status=ILL([[:space:]]|$)' "$journal_file" || true)
+    failures=${failures:-0}
+    if [ "$failures" -lt 3 ]; then
+        warn "RFW has restarted repeatedly on a CPU without AVX2, but fewer than three recent SIGILL exits were found; leaving its binary untouched"
+        return 0
+    fi
+
+    exec_start=$(systemctl show -p ExecStart --value rfw.service 2>/dev/null || true)
+    MIGRATION_RFW_BIN=$(printf '%s\n' "$exec_start" | sed -n 's/.*path=\([^ ;}]*\).*/\1/p')
+    path_count=$(printf '%s\n' "$exec_start" | grep -o 'path=' | wc -l || true)
+    api_count=$(printf '%s\n' "$exec_start" | grep -o -- '--api-addr' | wc -l || true)
+    path_count=${path_count//[[:space:]]/}
+    api_count=${api_count//[[:space:]]/}
+    [ "$path_count" = 1 ] && [ "$api_count" = 1 ] \
+        || die "RFW is in a repeated SIGILL loop, but its systemd ExecStart cannot be parsed safely; Go remains active"
+    [[ "$MIGRATION_RFW_BIN" =~ ^/[A-Za-z0-9._/-]+/rfw$ ]] \
+        && [ -f "$MIGRATION_RFW_BIN" ] && [ -x "$MIGRATION_RFW_BIN" ] && [ ! -L "$MIGRATION_RFW_BIN" ] \
+        || die "RFW is in a repeated SIGILL loop, but its executable path is unsupported; Go remains active"
+    MIGRATION_RFW_API_ADDR=$(printf '%s\n' "$exec_start" \
+        | sed -n 's/.*argv\[\]=[^;]*--api-addr[[:space:]]\([^ ;}]*\).*/\1/p')
+    [[ "$MIGRATION_RFW_API_ADDR" =~ ^(127\.0\.0\.1|\[::1\]|localhost):[0-9]{1,5}$ ]] \
+        || die "RFW is in a repeated SIGILL loop, but its API address is not a supported loopback endpoint; Go remains active"
+    port=${MIGRATION_RFW_API_ADDR##*:}
+    (( 10#$port >= 1 && 10#$port <= 65535 )) \
+        || die "RFW is in a repeated SIGILL loop, but its API port is invalid; Go remains active"
+    MIGRATION_RFW_API_URL="http://$MIGRATION_RFW_API_ADDR/api/status"
+
+    asset=rfw-amd64
+    sums_file="$WORK/rfw-SHA256SUMS"
+    curl -fsSL --retry 3 --connect-timeout 20 -o "$sums_file" "$RFW_URL/SHA256SUMS" \
+        || die "RFW has a confirmed AVX2-related crash loop, but its release checksum list is unavailable; Go remains active"
+    MIGRATION_RFW_CANDIDATE="$WORK/$asset"
+    curl -fsSL --retry 3 --connect-timeout 20 -o "$MIGRATION_RFW_CANDIDATE" "$RFW_URL/$asset" \
+        || die "RFW has a confirmed AVX2-related crash loop, but the compatible RFW release binary is unavailable; Go remains active"
+    [ "$(grep -Ec "  \*?$asset\$" "$sums_file")" = 1 ] \
+        || die "RFW release checksum list does not contain exactly one entry for $asset; Go remains active"
+    (cd "$WORK" && grep -E "  \*?$asset\$" "$sums_file" | sha256sum -c --quiet -) \
+        || die "RFW release checksum mismatch for $asset; Go remains active"
+    is_elf_for_arch "$MIGRATION_RFW_CANDIDATE" \
+        || die "the verified RFW release is not a binary for this host; Go remains active"
+    chmod 755 "$MIGRATION_RFW_CANDIDATE"
+    MIGRATION_RFW_VERSION=$("$MIGRATION_RFW_CANDIDATE" --version 2>&1) \
+        || die "the verified RFW release cannot run on this host; Go remains active"
+    MIGRATION_RFW_ORIGINAL_SHA256=$(sha256sum "$MIGRATION_RFW_BIN" | awk '{print $1}')
+    MIGRATION_RFW_CANDIDATE_SHA256=$(sha256sum "$MIGRATION_RFW_CANDIDATE" | awk '{print $1}')
+    [ "$MIGRATION_RFW_ORIGINAL_SHA256" != "$MIGRATION_RFW_CANDIDATE_SHA256" ] \
+        || die "RFW has a confirmed AVX2-related crash loop, but the published binary is unchanged; migration stopped before changing Go"
+    cp -a -- "$MIGRATION_RFW_BIN" "$MIGRATION_DIR/rfw-original" \
+        || die "could not save the original RFW binary; Go remains active"
+    {
+        printf 'executable=%s\napi_addr=%s\n' "$MIGRATION_RFW_BIN" "$MIGRATION_RFW_API_ADDR"
+        printf 'restart_count=%s\nrecent_sigill_exits=%s\n' "$restarts" "$failures"
+        printf 'original_sha256=%s\ncandidate_sha256=%s\ncandidate_version=%s\n' \
+            "$MIGRATION_RFW_ORIGINAL_SHA256" "$MIGRATION_RFW_CANDIDATE_SHA256" "$MIGRATION_RFW_VERSION"
+    } > "$MIGRATION_DIR/rfw-repair.txt"
+    chmod 600 "$MIGRATION_DIR/rfw-repair.txt"
+    MIGRATION_RFW_REPAIR_REQUIRED=1
+    log "detected repeated RFW SIGILL exits on a CPU without AVX2; verified a replacement and saved the original binary"
+}
+
+migration_apply_rfw_repair() {
+    local tmp mode
+    [ "$MIGRATION_RFW_REPAIR_REQUIRED" = 1 ] || return 0
+    MIGRATION_RFW_REPAIR_ATTEMPTED=1
+    mode=$(stat -c '%a' -- "$MIGRATION_RFW_BIN") || return 1
+    tmp=$(mktemp "${MIGRATION_RFW_BIN}.runman-new.XXXXXXXX") || return 1
+    if ! install -m "$mode" "$MIGRATION_RFW_CANDIDATE" "$tmp" \
+        || ! chown --reference="$MIGRATION_RFW_BIN" "$tmp" \
+        || ! chmod --reference="$MIGRATION_RFW_BIN" "$tmp" \
+        || ! mv -f -- "$tmp" "$MIGRATION_RFW_BIN"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    [ "$(sha256sum "$MIGRATION_RFW_BIN" | awk '{print $1}')" = "$MIGRATION_RFW_CANDIDATE_SHA256" ] \
+        || return 1
+    systemctl restart rfw.service || return 1
+    migration_rfw_ready_stable || return 1
+    MIGRATION_RFW_REPAIRED=1
+    printf 'repair_applied=1\napi_stable_seconds=15\n' >> "$MIGRATION_DIR/rfw-repair.txt"
+    log "RFW replacement passed a 15-second API stability check; its systemd unit and arguments were preserved"
+}
+
 migration_rollback() {
     local failed=0 record id
+    if [ "$MIGRATION_RFW_REPAIR_ATTEMPTED" = 1 ] && [ "$MIGRATION_RFW_REPAIRED" != 1 ]; then
+        printf 'RFW replacement did not pass health checks; restoring the original binary and service.\n' >&2
+        migration_rfw_restore_original || failed=1
+    fi
     if [ "$MIGRATION_GO_STOP_ATTEMPTED" = 1 ]; then
         printf '\nMigration did not commit; restoring the Go service and containers. Snapshot: %s\n' "$MIGRATION_DIR" >&2
         systemctl disable --now runman-agent.service >/dev/null 2>&1 || true
@@ -518,6 +700,9 @@ migration_rollback() {
         else
             printf 'No Go service or container state was changed by the migration.\n' >&2
         fi
+    fi
+    if [ "$MIGRATION_RFW_REPAIRED" = 1 ]; then
+        printf 'The verified CPU-baseline RFW repair remains installed after Go rollback.\n' >&2
     fi
 }
 
@@ -1080,6 +1265,7 @@ prepare_go_migration() {
     install -m 700 "$WORK/release/$diagnostic_asset" "$MIGRATION_DIR/$diagnostic_asset"
     cp -a "$go_config" "$MIGRATION_DIR/go-config.json"
     migration_backup_go_agent "$go_binary"
+    migration_prepare_rfw_repair
     go_unit_path=$(systemctl show -p FragmentPath --value narwhal-agent.service 2>/dev/null || true)
     if [ -n "$go_unit_path" ] && [ -f "$go_unit_path" ]; then
         cp -a "$go_unit_path" "$MIGRATION_DIR/narwhal-agent.service"
@@ -1126,6 +1312,10 @@ prepare_go_migration() {
     printf 'VM UUIDs, CPU/RAM/disk/bandwidth settings, running/stopped state, and supported TCP/UDP host-to-guest port forwards are retained.\n'
     printf 'Guest data, mounted volumes, installed software, traffic history, WireGuard bindings, custom images, and guest IP addresses are not migrated.\n'
     printf 'The installer attempts service/config/container rollback on failure. If disk space is below 768 MiB, a second typed confirmation can delete all Go-managed Incus guests before Rust health checks; their parameters/database are backed up, but guest files cannot be restored. Power loss and host package changes cannot be guaranteed reversible.\n'
+    if [ "$MIGRATION_RFW_REPAIR_REQUIRED" = 1 ]; then
+        printf 'RFW repair detected: the host lacks AVX2 and RFW has repeated recent SIGILL exits. After confirmation, the verified %s binary will replace %s; the systemd unit/arguments remain unchanged. The API must stay healthy for 15 seconds or the original binary will be restored and migration aborted.\n' \
+            "$MIGRATION_RFW_VERSION" "$MIGRATION_RFW_BIN"
+    fi
     orphan_count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1], encoding="utf-8"))))' \
         "$MIGRATION_DIR/orphan-core-candidates.json")
     if [ "$orphan_count" -gt 0 ]; then
@@ -1139,6 +1329,10 @@ prepare_go_migration() {
 
     MIGRATION_ACTIVE=1
     migration_confirm_low_space_cleanup
+    if [ "$MIGRATION_RFW_REPAIR_REQUIRED" = 1 ]; then
+        migration_apply_rfw_repair \
+            || die "RFW replacement failed its 15-second API health check; the original binary will be restored and Go will remain active"
+    fi
     # On a low-space recovery path, first save the migration parameters, stop
     # Go and its guests, and delete only the ERROR guests covered by the second
     # confirmation. Their storage is needed to make room for APT and Rust.
@@ -1408,13 +1602,6 @@ fetch() { # fetch <name> <dest> <base-url>; --from-dir wins when it has the file
     else
         curl -fsSL --retry 3 --connect-timeout 20 -o "$2" "$3/$1"
     fi
-}
-
-is_elf_for_arch() { # the file must be a 64-bit ELF for this machine
-    local want
-    want=$([ "$ARCH" = amd64 ] && echo 3e00 || echo b700)
-    [ "$(head -c 6 "$1" | od -An -tx1 | tr -d ' \n')" = 7f454c460201 ] \
-        && [ "$(dd if="$1" bs=1 skip=18 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "$want" ]
 }
 
 asset="runman-agent-linux-$ARCH"

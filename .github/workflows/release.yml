@@ -167,7 +167,8 @@ jobs:
           if [ "${{ matrix.arch }}" = "arm64" ]; then
             cargo zigbuild --package rfw --release --target ${{ matrix.target }}
           else
-            cargo build --package rfw --release --target ${{ matrix.target }}
+            cargo --config 'target.x86_64-unknown-linux-musl.rustflags=["-C","target-cpu=x86-64"]' \
+              build --package rfw --release --target x86_64-unknown-linux-musl
           fi
           cp target/${{ matrix.target }}/release/rfw rfw-${{ matrix.arch }}
 
@@ -192,6 +193,16 @@ jobs:
         with:
           merge-multiple: true
 
+      - name: Generate release checksums
+        run: |
+          sha256sum \
+            runman-agent-linux-amd64 \
+            runman-agent-linux-arm64 \
+            install.sh \
+            rfw-amd64 \
+            rfw-arm64 \
+            > SHA256SUMS
+
       - name: Create tagged release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
@@ -202,6 +213,7 @@ jobs:
             install.sh
             rfw-amd64
             rfw-arm64
+            SHA256SUMS
           generate_release_notes: true
 
       - name: Create rolling continuous release
@@ -214,7 +226,7 @@ jobs:
           [ -n "$upstream_base" ] || { echo "Unable to resolve upstream release baseline" >&2; exit 1; }
           diy_version="${upstream_base}-diy.${GITHUB_SHA::12}"
           notes="DIY build based on upstream ${upstream_base}; fork commit ${GITHUB_SHA}."
-          assets=(runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh rfw-amd64 rfw-arm64)
+          assets=(runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh rfw-amd64 rfw-arm64 SHA256SUMS)
           if gh release view continuous >/dev/null 2>&1; then
             # Preserve the release URL while replacing completed artifacts.
             # A failed update leaves the prior downloadable release intact.
