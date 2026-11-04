@@ -32,6 +32,7 @@ FROM_DIR=""
 UNINSTALL=0
 PURGE=0
 MIGRATE_GO=0
+RFW_REPAIR_ONLY=0
 CLEANUP_ONLY=0
 CLEANUP_RUNTIMES=0
 MIGRATION_CLEANUP_RUNTIMES=0
@@ -55,9 +56,13 @@ MIGRATION_GUESTS_PREDELETE_ATTEMPTED=0
 MIGRATION_RFW_REPAIR_REQUIRED=0
 MIGRATION_RFW_REPAIR_ATTEMPTED=0
 MIGRATION_RFW_REPAIRED=0
+MIGRATION_RFW_UNIT_TOUCHED=0
 MIGRATION_RFW_BIN=""
+MIGRATION_RFW_UNIT_PATH=""
 MIGRATION_RFW_API_ADDR=""
 MIGRATION_RFW_API_URL=""
+MIGRATION_RFW_SERVICE_CURSOR=""
+MIGRATION_RFW_KERNEL_CURSOR=""
 MIGRATION_RFW_CANDIDATE=""
 MIGRATION_RFW_ORIGINAL_SHA256=""
 MIGRATION_RFW_CANDIDATE_SHA256=""
@@ -495,10 +500,92 @@ migration_rfw_ready_stable() {
     done
 }
 
+migration_mark_rfw_journals() {
+    command -v journalctl >/dev/null 2>&1 || return 0
+    MIGRATION_RFW_SERVICE_CURSOR=$(journalctl -u rfw.service -n 0 --show-cursor --no-pager 2>/dev/null \
+        | sed -n 's/^-- cursor: //p' | tail -n 1)
+    MIGRATION_RFW_KERNEL_CURSOR=$(journalctl -k -n 0 --show-cursor --no-pager 2>/dev/null \
+        | sed -n 's/^-- cursor: //p' | tail -n 1)
+}
+
+migration_capture_rfw_attempt() {
+    local since="$1" mode="$2" service_cursor="$3" kernel_cursor="$4" service_log kernel_log
+    command -v journalctl >/dev/null 2>&1 || return 0
+    service_log="$MIGRATION_DIR/rfw-candidate-$mode-journal.log"
+    kernel_log="$MIGRATION_DIR/rfw-candidate-$mode-kernel.log"
+    {
+        printf 'candidate_%s_active_state=%s\n' "$mode" \
+            "$(systemctl show -p ActiveState --value rfw.service 2>/dev/null || true)"
+        printf 'candidate_%s_exec_main_code=%s\n' "$mode" \
+            "$(systemctl show -p ExecMainCode --value rfw.service 2>/dev/null || true)"
+        printf 'candidate_%s_exec_main_status=%s\n' "$mode" \
+            "$(systemctl show -p ExecMainStatus --value rfw.service 2>/dev/null || true)"
+    } >> "$MIGRATION_DIR/rfw-repair.txt"
+    if [ -n "$service_cursor" ]; then
+        journalctl -u rfw.service --after-cursor="$service_cursor" -n 200 --no-pager -o short-iso-precise \
+            > "$service_log" 2>&1 || true
+    else
+        journalctl -u rfw.service --since "$since" -n 200 --no-pager -o short-iso-precise \
+            > "$service_log" 2>&1 || true
+    fi
+    if [ -n "$kernel_cursor" ]; then
+        journalctl -k --after-cursor="$kernel_cursor" -n 200 --no-pager -o short-iso-precise \
+            > "$kernel_log" 2>&1 || true
+    else
+        journalctl -k --since "$since" -n 200 --no-pager -o short-iso-precise \
+            > "$kernel_log" 2>&1 || true
+    fi
+    chmod 600 "$service_log" "$kernel_log"
+    printf 'candidate_%s_service_journal=%s\ncandidate_%s_kernel_journal=%s\n' \
+        "$mode" "$service_log" "$mode" "$kernel_log" >> "$MIGRATION_DIR/rfw-repair.txt"
+}
+
+migration_rfw_candidate_sigill() {
+    [ "$(systemctl show -p ExecMainStatus --value rfw.service 2>/dev/null || true)" = 4 ] \
+        && return 0
+    grep -Eiq 'status=4/ILL|status=ILL|rfw\[[0-9]+\].*trap invalid opcode|rfw.*SIGILL' \
+        "$MIGRATION_DIR/rfw-candidate-native-journal.log" \
+        "$MIGRATION_DIR/rfw-candidate-native-kernel.log" 2>/dev/null
+}
+
+migration_rfw_enable_skb_mode() {
+    local dropins exec_count
+    MIGRATION_RFW_UNIT_PATH=$(systemctl show -p FragmentPath --value rfw.service 2>/dev/null || true)
+    case "$MIGRATION_RFW_UNIT_PATH" in
+        /etc/systemd/system/*.service) ;;
+        *)
+            warn "RFW uses a non-local systemd unit; cannot safely retry with SKB mode"
+            return 1
+            ;;
+    esac
+    if [ ! -f "$MIGRATION_RFW_UNIT_PATH" ] || [ -L "$MIGRATION_RFW_UNIT_PATH" ]; then
+        warn "RFW systemd unit is not a regular local file; cannot safely retry with SKB mode"
+        return 1
+    fi
+    dropins=$(systemctl show -p DropInPaths --value rfw.service 2>/dev/null || true)
+    if [ -n "$dropins" ]; then
+        warn "RFW has systemd drop-ins; preserving them and skipping the automatic SKB-mode retry"
+        return 1
+    fi
+    exec_count=$(grep -Ec '^ExecStart=' "$MIGRATION_RFW_UNIT_PATH" || true)
+    if [ "$exec_count" != 1 ] || grep -Eq '^ExecStart=.*--xdp-mode([=[:space:]]|$)' "$MIGRATION_RFW_UNIT_PATH" \
+        || grep -Eq '^ExecStart=.*\\[[:space:]]*$' "$MIGRATION_RFW_UNIT_PATH"; then
+        warn "RFW systemd ExecStart is not a simple single command; cannot safely append SKB mode"
+        return 1
+    fi
+
+    migration_capture_file "$MIGRATION_RFW_UNIT_PATH" || return 1
+    MIGRATION_RFW_UNIT_TOUCHED=1
+    sed -i '/^ExecStart=/ s/$/ --xdp-mode skb/' "$MIGRATION_RFW_UNIT_PATH" || return 1
+    systemctl daemon-reload || return 1
+    printf 'unit_path=%s\nxdp_mode=skb\n' "$MIGRATION_RFW_UNIT_PATH" >> "$MIGRATION_DIR/rfw-repair.txt"
+}
+
 migration_prepare_rfw_repair() {
     local active restarts journal_file failures exec_start path_count api_count port
     local sums_file asset
-    [ "$MIGRATE_GO" = 1 ] && [ "$ARCH" = amd64 ] || return 0
+    { [ "$MIGRATE_GO" = 1 ] || [ "$RFW_REPAIR_ONLY" = 1 ]; } \
+        && [ "$ARCH" = amd64 ] || return 0
     [ "$(systemctl show -p LoadState --value rfw.service 2>/dev/null || true)" = loaded ] || return 0
     active=$(systemctl show -p ActiveState --value rfw.service 2>/dev/null || true)
     case "$active" in
@@ -584,7 +671,7 @@ migration_prepare_rfw_repair() {
 }
 
 migration_apply_rfw_repair() {
-    local tmp mode
+    local tmp mode started
     [ "$MIGRATION_RFW_REPAIR_REQUIRED" = 1 ] || return 0
     MIGRATION_RFW_REPAIR_ATTEMPTED=1
     mode=$(stat -c '%a' -- "$MIGRATION_RFW_BIN") || return 1
@@ -598,17 +685,66 @@ migration_apply_rfw_repair() {
     fi
     [ "$(sha256sum "$MIGRATION_RFW_BIN" | awk '{print $1}')" = "$MIGRATION_RFW_CANDIDATE_SHA256" ] \
         || return 1
-    systemctl restart rfw.service || return 1
-    migration_rfw_ready_stable || return 1
+    migration_mark_rfw_journals
+    started=$(date --iso-8601=seconds)
+    systemctl restart rfw.service >/dev/null 2>&1 || true
+    if ! migration_rfw_ready_stable; then
+        migration_capture_rfw_attempt "$started" native \
+            "$MIGRATION_RFW_SERVICE_CURSOR" "$MIGRATION_RFW_KERNEL_CURSOR"
+        if migration_rfw_candidate_sigill; then
+            warn "the replacement RFW still hit SIGILL; captured its service and kernel logs and will restore the original binary"
+            return 1
+        fi
+        log "RFW API did not become healthy in its existing mode; retrying with the compatible SKB XDP mode"
+        migration_rfw_enable_skb_mode || return 1
+        migration_mark_rfw_journals
+        started=$(date --iso-8601=seconds)
+        systemctl restart rfw.service >/dev/null 2>&1 || true
+        if ! migration_rfw_ready_stable; then
+            migration_capture_rfw_attempt "$started" skb \
+                "$MIGRATION_RFW_SERVICE_CURSOR" "$MIGRATION_RFW_KERNEL_CURSOR"
+            return 1
+        fi
+        printf 'repair_applied=1\napi_stable_seconds=15\nxdp_mode=skb\n' >> "$MIGRATION_DIR/rfw-repair.txt"
+        MIGRATION_RFW_REPAIRED=1
+        log "RFW replacement passed a 15-second API stability check in SKB mode"
+        return 0
+    fi
     MIGRATION_RFW_REPAIRED=1
-    printf 'repair_applied=1\napi_stable_seconds=15\n' >> "$MIGRATION_DIR/rfw-repair.txt"
+    printf 'repair_applied=1\napi_stable_seconds=15\nxdp_mode=existing\n' >> "$MIGRATION_DIR/rfw-repair.txt"
     log "RFW replacement passed a 15-second API stability check; its systemd unit and arguments were preserved"
+}
+
+repair_rfw_only() {
+    [ "$RFW_REPAIR_ONLY" = 1 ] || return 0
+    [ "$ARCH" = amd64 ] || die "standalone RFW repair currently supports x86_64 only"
+    [ "$(systemctl show -p LoadState --value rfw.service 2>/dev/null || true)" = loaded ] \
+        || die "rfw.service is not installed; no changes made"
+
+    install -d -m 700 /var/backups
+    MIGRATION_DIR=$(mktemp -d /var/backups/runman-rfw-repair.XXXXXXXX)
+    chmod 700 "$MIGRATION_DIR"
+    WORK=$(mktemp -d /tmp/runman-agent-rfw-repair.XXXXXXXX)
+    trap cleanup_exit EXIT
+    migration_prepare_rfw_repair
+    [ "$MIGRATION_RFW_REPAIR_REQUIRED" = 1 ] \
+        || die "no active non-AVX2 RFW crash loop was confirmed; no changes made"
+
+    MIGRATION_ACTIVE=1
+    migration_apply_rfw_repair \
+        || die "RFW repair failed; the original binary/unit were restored when possible. Snapshot: $MIGRATION_DIR"
+    MIGRATION_COMMITTED=1
+    printf '\nRFW repair succeeded. Backup and candidate logs: %s\n' "$MIGRATION_DIR"
 }
 
 migration_rollback() {
     local failed=0 record id
     if [ "$MIGRATION_RFW_REPAIR_ATTEMPTED" = 1 ] && [ "$MIGRATION_RFW_REPAIRED" != 1 ]; then
         printf 'RFW replacement did not pass health checks; restoring the original binary and service.\n' >&2
+        if [ "$MIGRATION_RFW_UNIT_TOUCHED" = 1 ]; then
+            migration_restore_file "$MIGRATION_RFW_UNIT_PATH" || failed=1
+            systemctl daemon-reload >/dev/null 2>&1 || failed=1
+        fi
         migration_rfw_restore_original || failed=1
     fi
     if [ "$MIGRATION_GO_STOP_ATTEMPTED" = 1 ]; then
@@ -704,7 +840,8 @@ migration_rollback() {
         fi
     fi
     if [ "$MIGRATION_RFW_REPAIRED" = 1 ]; then
-        printf 'The verified CPU-baseline RFW repair remains installed after Go rollback.\n' >&2
+        printf 'The verified RFW repair remains installed after Go rollback; see %s/rfw-repair.txt for its XDP mode and evidence.\n' \
+            "$MIGRATION_DIR" >&2
     fi
 }
 
@@ -1139,6 +1276,7 @@ Usage: install.sh [options]
                           optionally rfw-<arch>) instead of downloading them
   --migrate-go            Lossy clean-rebuild migration from a supported Go Podman/Incus node;
                           keeps a rollback snapshot until Rust health, port, and network checks pass
+  --repair-rfw            Repair a confirmed x86_64 RFW SIGILL loop without migrating Go containers
   --cleanup-only          Apply 7-day log retention and prune dangling/unused images, without installing
   --cleanup-runtimes      With --cleanup-only: remove empty Podman/Incus packages after inventory checks
   --uninstall             Remove the agent; refuses while instances exist
@@ -1161,6 +1299,7 @@ while [ $# -gt 0 ]; do
         --rfw-iface) RFW_IFACE="${2:?--rfw-iface needs a value}"; shift 2 ;;
         --from-dir) FROM_DIR="${2:?--from-dir needs a value}"; shift 2 ;;
         --migrate-go) MIGRATE_GO=1; WITH_RFW=0; shift ;;
+        --repair-rfw) RFW_REPAIR_ONLY=1; shift ;;
         --cleanup-only) CLEANUP_ONLY=1; shift ;;
         --cleanup-runtimes) CLEANUP_RUNTIMES=1; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
@@ -1194,6 +1333,12 @@ if [ "$MIGRATE_GO" = 1 ]; then
         || [ "$PURGE" != 0 ] || [ "$WITH_RFW" != 0 ]; then
         die "--migrate-go cannot be combined with token, local assets, RFW, or uninstall options"
     fi
+fi
+
+if [ "$RFW_REPAIR_ONLY" = 1 ] && { [ "$MIGRATE_GO" = 1 ] || [ -n "$TOKEN" ] \
+    || [ -n "$FROM_DIR" ] || [ "$WITH_RFW" != 1 ] || [ "$CLEANUP_ONLY" = 1 ] \
+    || [ "$CLEANUP_RUNTIMES" = 1 ] || [ "$UNINSTALL" = 1 ] || [ "$PURGE" = 1 ]; }; then
+    die "--repair-rfw must be used alone"
 fi
 
 if [ "$CLEANUP_ONLY" = 1 ] && { [ "$MIGRATE_GO" = 1 ] || [ "$UNINSTALL" = 1 ] \
@@ -1315,7 +1460,7 @@ prepare_go_migration() {
     printf 'Guest data, mounted volumes, installed software, traffic history, WireGuard bindings, custom images, and guest IP addresses are not migrated.\n'
     printf 'The installer attempts service/config/container rollback on failure. If disk space is below 768 MiB, a second typed confirmation can delete all Go-managed Incus guests before Rust health checks; their parameters/database are backed up, but guest files cannot be restored. Power loss and host package changes cannot be guaranteed reversible.\n'
     if [ "$MIGRATION_RFW_REPAIR_REQUIRED" = 1 ]; then
-        printf 'RFW repair detected: the host lacks AVX2 and RFW has repeated recent SIGILL exits. After confirmation, the verified %s binary will replace %s; the systemd unit/arguments remain unchanged. The API must stay healthy for 15 seconds or the original binary will be restored and migration aborted.\n' \
+        printf 'RFW repair detected: the host lacks AVX2 and RFW has repeated recent SIGILL exits. After confirmation, the verified %s binary will replace %s. The API must stay healthy for 15 seconds; if its current XDP mode fails without SIGILL, the installer backs up the unit and retries in SKB mode. A failed retry restores the original binary and unit before Go is stopped.\n' \
             "$MIGRATION_RFW_VERSION" "$MIGRATION_RFW_BIN"
     fi
     orphan_count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1], encoding="utf-8"))))' \
@@ -1510,7 +1655,8 @@ fi
 if { [ -f /opt/narwhal-agent/config.json ] || [ -f /opt/narwhal-agent/agent.db ] \
     || [ -f /var/lib/narwhal-agent/agent.db ] \
     || systemctl is-active --quiet narwhal-agent.service 2>/dev/null; } \
-    && [ "$MIGRATE_GO" != 1 ] && [ "$CLEANUP_ONLY" != 1 ]; then
+    && [ "$MIGRATE_GO" != 1 ] && [ "$CLEANUP_ONLY" != 1 ] \
+    && [ "$RFW_REPAIR_ONLY" != 1 ]; then
     die "a Go Runman Agent installation was detected; v2 requires a planned migration and will not take over its Podman/Incus data"
 fi
 
@@ -1538,6 +1684,11 @@ if [ "$CLEANUP_ONLY" = 1 ]; then
         cleanup_unused_container_runtimes || cleanup_failed=1
     fi
     [ "$cleanup_failed" = 0 ] || die "maintenance cleanup was incomplete; see warnings above"
+    exit 0
+fi
+
+if [ "$RFW_REPAIR_ONLY" = 1 ]; then
+    repair_rfw_only
     exit 0
 fi
 

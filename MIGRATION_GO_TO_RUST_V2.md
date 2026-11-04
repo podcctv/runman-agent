@@ -121,10 +121,24 @@ migration or cleanup. Before asking for the migration confirmation, the
 installer checks an active x86_64 RFW service for repeated recent SIGILL
 exits on a host without AVX2. When all evidence matches, it verifies and stages
 the published RFW binary. After confirmation it replaces only the executable
-referenced by the service, preserving the unit and its arguments, then requires
-the local RFW status API to remain healthy for 15 seconds. A failed health
-check restores the saved executable and aborts before stopping Go. Other RFW
+referenced by the service, then requires the local RFW status API to remain
+healthy for 15 seconds. If the existing XDP mode does not start the API and the
+candidate has no SIGILL evidence, the installer snapshots a simple local
+systemd unit and retries with `--xdp-mode skb`, which is compatible with virtual
+NICs and may have lower throughput than native XDP. It records candidate
+service/kernel journals in the root-only snapshot. If both attempts fail, it
+restores the original executable and unit before stopping Go. Other RFW
 installations are left untouched.
+
+The standalone repair command applies only this RFW check and repair, without
+installing Rust or changing Go containers:
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/podcctv/runman-agent/main/install-rust-v2.sh) --repair-rfw
+```
+
+It creates a root-only backup under `/var/backups/runman-rfw-repair.*` and
+prints that path along with the API verification result.
 
 ## Podman Watcher compatibility
 
