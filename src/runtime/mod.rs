@@ -788,10 +788,10 @@ impl Runtime {
             let spec = self.run_spec(&rec);
             let upper_mount = spec.mnt_upper();
             let upper_path = upper_mount.join("up");
-            let upper_bytes = if running && sys::is_mountpoint(&upper_mount) {
+            let upper_metrics = if running && sys::is_mountpoint(&upper_mount) {
                 let path = upper_path.clone();
                 tokio::task::spawn_blocking(move || {
-                    monitor::upperdir_allocated_bytes(&path, 50_000)
+                    monitor::upperdir_metrics(&path, 50_000)
                 })
                 .await
                 .ok()
@@ -804,7 +804,7 @@ impl Runtime {
             } else {
                 None
             };
-            let writable_layer = upper_bytes.map_or_else(
+            let writable_layer = upper_metrics.map_or_else(
                 || {
                     serde_json::json!({
                         "source": "runman_overlay_upperdir_allocated",
@@ -812,12 +812,14 @@ impl Runtime {
                         "sampled_at": now
                     })
                 },
-                |allocated_bytes| {
+                |metrics| {
                     serde_json::json!({
                         "source": "runman_overlay_upperdir_allocated",
                         "available": true,
                         "sampled_at": now,
-                        "allocated_bytes": allocated_bytes
+                        "allocated_bytes": metrics.allocated_bytes,
+                        "logical_file_bytes": metrics.logical_file_bytes,
+                        "regular_files": metrics.regular_files
                     })
                 },
             );
