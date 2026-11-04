@@ -513,7 +513,10 @@ mod tests {
         assert_eq!(metrics.logical_file_bytes, 16 * 1024);
         assert_eq!(metrics.regular_files, 1, "hard links count once");
         assert!(metrics.allocated_bytes >= 16 * 1024);
-        assert!(metrics.allocated_bytes < 256 * 1024, "symlink target must not be counted");
+        assert!(
+            metrics.allocated_bytes < 256 * 1024,
+            "symlink target must not be counted"
+        );
         assert!(upperdir_metrics(&root, 1).is_none());
 
         std::fs::remove_dir_all(&root).unwrap();

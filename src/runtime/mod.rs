@@ -790,17 +790,16 @@ impl Runtime {
             let upper_path = upper_mount.join("up");
             let upper_metrics = if running && sys::is_mountpoint(&upper_mount) {
                 let path = upper_path.clone();
-                tokio::task::spawn_blocking(move || {
-                    monitor::upperdir_metrics(&path, 50_000)
-                })
-                .await
-                .ok()
-                .flatten()
-                .filter(|_| {
-                    self.load(&rec.id).ok().flatten().is_some_and(|current| {
-                        current.generation == rec.generation && current.desired == Desired::Running
-                    }) && sys::is_mountpoint(&upper_mount)
-                })
+                tokio::task::spawn_blocking(move || monitor::upperdir_metrics(&path, 50_000))
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|_| {
+                        self.load(&rec.id).ok().flatten().is_some_and(|current| {
+                            current.generation == rec.generation
+                                && current.desired == Desired::Running
+                        }) && sys::is_mountpoint(&upper_mount)
+                    })
             } else {
                 None
             };
