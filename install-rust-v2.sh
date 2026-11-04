@@ -103,7 +103,12 @@ cleanup_apt_list_indexes_for_low_space() {
     local lists=/var/lib/apt/lists before after
     [ "$MIGRATION_GUESTS_PREDELETE_CONFIRMED" = 1 ] || return 0
     [ -d "$lists" ] || return 0
-    if ps -eo comm= 2>/dev/null | grep -Eq '^(apt|apt-get|apt-cache|dpkg|apt\.systemd.*|unattended.*)$'; then
+    if pgrep -x apt >/dev/null 2>&1 \
+        || pgrep -x apt-get >/dev/null 2>&1 \
+        || pgrep -x apt-cache >/dev/null 2>&1 \
+        || pgrep -x dpkg >/dev/null 2>&1 \
+        || systemctl is-active --quiet apt-daily.service \
+        || systemctl is-active --quiet apt-daily-upgrade.service; then
         warn "APT started another operation; keeping package-list indexes"
         return 0
     fi
