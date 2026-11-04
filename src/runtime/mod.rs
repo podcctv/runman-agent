@@ -785,6 +785,43 @@ impl Runtime {
                         "sampled_at": now
                     })
                 });
+            let spec = self.run_spec(&rec);
+            let upper_mount = spec.mnt_upper();
+            let upper_path = upper_mount.join("up");
+            let upper_bytes = if running && sys::is_mountpoint(&upper_mount) {
+                let path = upper_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    monitor::upperdir_allocated_bytes(&path, 50_000)
+                })
+                .await
+                .ok()
+                .flatten()
+                .filter(|_| {
+                    self.load(&rec.id).ok().flatten().is_some_and(|current| {
+                        current.generation == rec.generation
+                            && current.desired == Desired::Running
+                    }) && sys::is_mountpoint(&upper_mount)
+                })
+            } else {
+                None
+            };
+            let writable_layer = upper_bytes.map_or_else(
+                || {
+                    serde_json::json!({
+                        "source": "runman_overlay_upperdir_allocated",
+                        "available": false,
+                        "sampled_at": now
+                    })
+                },
+                |allocated_bytes| {
+                    serde_json::json!({
+                        "source": "runman_overlay_upperdir_allocated",
+                        "available": true,
+                        "sampled_at": now,
+                        "allocated_bytes": allocated_bytes
+                    })
+                },
+            );
             let mut ips = vec![rec.addrs.ipv4.to_string()];
             if let Some(ip) = rec.addrs.ipv6 {
                 ips.push(ip.to_string());
@@ -822,6 +859,7 @@ impl Runtime {
                 "mem_limit_bytes": rec.ram_mb.saturating_mul(1_048_576),
                 "disk_gb": rec.disk_gb,
                 "disk_image": disk_image,
+                "writable_layer": writable_layer,
                 "bandwidth_mbps": rec.bandwidth_mbps,
                 "traffic_in_bytes": summary.traffic_in_bytes.max(0) as u64,
                 "traffic_out_bytes": summary.traffic_out_bytes.max(0) as u64,

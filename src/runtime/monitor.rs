@@ -92,6 +92,40 @@ fn disk_used(init_pid: i32) -> Option<u64> {
     Some((st.blocks() as u64).saturating_sub(st.blocks_free() as u64) * block)
 }
 
+/// Allocated bytes below one overlay upper directory, providing a writable-layer
+/// allocation view without conflating it with the sparse backing image size.
+/// Symlinks are counted as links and never followed; hard links count once.
+/// Any unreadable entry or an exceeded traversal bound makes the sample
+/// unavailable instead of returning a misleading partial total.
+pub fn upperdir_allocated_bytes(path: &Path, max_entries: usize) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    if max_entries == 0 {
+        return None;
+    }
+    let mut pending = vec![path.to_path_buf()];
+    let mut seen = HashSet::new();
+    let mut scheduled_entries = 1usize;
+    let mut total = 0u64;
+    while let Some(current) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&current).ok()?;
+        if !seen.insert((metadata.dev(), metadata.ino())) {
+            continue;
+        }
+        total = total.checked_add(metadata.blocks().checked_mul(512)?)?;
+        if metadata.file_type().is_dir() {
+            for entry in std::fs::read_dir(current).ok()? {
+                scheduled_entries = scheduled_entries.checked_add(1)?;
+                if scheduled_entries > max_entries {
+                    return None;
+                }
+                pending.push(entry.ok()?.path());
+            }
+        }
+    }
+    Some(total)
+}
+
 /// Connections of one instance at one moment.
 #[derive(Debug, Default, PartialEq)]
 struct Conns {
@@ -436,6 +470,29 @@ mod tests {
         );
         assert_eq!(rate(10, 4, 2.0), 3.0);
         assert_eq!(rate(4, 10, 2.0), 0.0);
+    }
+
+    #[test]
+    fn upperdir_allocation_counts_entries_without_following_symlinks_and_is_bounded() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "runman-upperdir-metric-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let outside = root.with_extension("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("payload"), vec![0x5a; 16 * 1024]).unwrap();
+        std::fs::write(&outside, vec![0x5a; 2 * 1024 * 1024]).unwrap();
+        symlink(&outside, root.join("outside-link")).unwrap();
+
+        let bytes = upperdir_allocated_bytes(&root, 8).unwrap();
+        assert!(bytes >= 16 * 1024);
+        assert!(bytes < 256 * 1024, "symlink target must not be counted");
+        assert!(upperdir_allocated_bytes(&root, 1).is_none());
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_file(outside).unwrap();
     }
 
     fn ip(s: &str) -> IpAddr {
