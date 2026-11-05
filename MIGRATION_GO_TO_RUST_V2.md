@@ -91,11 +91,13 @@ The old host packages and container images are left in place. Incus host-path
 mounts and other unsupported backend-specific settings are not recreated in
 Rust.
 
-Only standard Alpine and Debian image families are accepted. Unknown images,
-invalid resource settings, unsupported Go config, backend-only records, live
-containers without proven Go ownership, unconfirmed orphan rows, occupied
-ports, and failed Rust checks abort before normally staged old guests are
-purged.
+Only standard Alpine and Debian image families are accepted. The two built-in
+Go Podman image IDs, `docker.io/narwhalcloud/alpine:podman` and
+`docker.io/narwhalcloud/debian:podman`, map to their matching Rust stock image
+families. Unknown or custom images, invalid resource settings, unsupported Go
+config, backend-only records, live containers without proven Go ownership,
+unconfirmed orphan rows, occupied ports, and failed Rust checks abort before
+normally staged old guests are purged.
 
 ## Rollback boundary
 

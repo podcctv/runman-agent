@@ -589,6 +589,12 @@ def export(args):
     legacy_state = []
     rebuild_fallback_instances = []
     passwords = ["VM UUID\tnew root password (root-only; guest data is rebuilt)\n"]
+    # Exact built-in image IDs exposed by the Go Podman backend. These are
+    # stock distro bases, so migrate their OS family to the Rust stock image.
+    podman_image_families = {
+        "docker.io/narwhalcloud/alpine:podman": "alpine",
+        "docker.io/narwhalcloud/debian:podman": "debian",
+    }
     for vm_id, row in base_by_id.items():
         provider = provider_by_id[vm_id]
         name = str(column(provider, "container") or "").strip()
@@ -612,7 +618,9 @@ def export(args):
         else:
             running = live_state(backend, name)
         image = str(column(row, "image") or column(provider, "image") or "").strip().lower()
-        if image == "alpine" or image.startswith("alpine/") or image.startswith("alpine-"):
+        if image in podman_image_families:
+            os_image = podman_image_families[image]
+        elif image == "alpine" or image.startswith("alpine/") or image.startswith("alpine-"):
             os_image = "alpine"
         elif image == "debian" or image.startswith("debian/") or image.startswith("debian-"):
             os_image = "debian"
