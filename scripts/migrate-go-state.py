@@ -187,7 +187,7 @@ def request_incus_guest_poweroff(name):
 
 
 def wait_for_incus_guest_stop(name):
-    """Wait briefly for a guest-side poweroff; never send a force-stop signal."""
+    """Wait briefly for a guest-side poweroff without changing guest state."""
     deadline = time.monotonic() + INCUS_GUEST_STOP_WAIT_TIMEOUT
     while True:
         status, init_pid = incus_instance_state(name)
@@ -199,6 +199,33 @@ def wait_for_incus_guest_stop(name):
         if remaining <= 0:
             return status, init_pid
         time.sleep(min(INCUS_GUEST_STOP_POLL_INTERVAL, remaining))
+
+
+def force_stop_incus_guest_as_last_resort(name, expected_pid):
+    """Force-stop one still-running guest, only after revalidating its init PID."""
+    try:
+        status, init_pid = incus_instance_state(name)
+    except SystemExit as exc:
+        return "unknown", "", f"cannot verify instance before force-stop: {exc}"
+    if status == "stopped" or incus_state_needs_rebuild(status, init_pid):
+        return status, init_pid, ""
+    if status != "running":
+        return status, init_pid, f"force-stop refused because state is {status.upper()}"
+    if str(init_pid) != str(expected_pid):
+        return status, init_pid, f"force-stop refused because init PID changed from {expected_pid}"
+
+    progress(f"instance {name}: graceful shutdown paths failed; using Incus force-stop as the last resort")
+    force_error = ""
+    try:
+        checked_run(["incus", "stop", name, "--force"], timeout=60)
+    except SystemExit as exc:
+        force_error = str(exc)
+    try:
+        status, init_pid = incus_instance_state(name)
+    except SystemExit as exc:
+        detail = f"cannot verify instance after force-stop: {exc}"
+        return "unknown", "", f"{force_error}; {detail}" if force_error else detail
+    return status, init_pid, force_error
 
 
 def incus_running_from_state(status, init_pid, name):
@@ -849,15 +876,24 @@ def lifecycle(args):
                             mark_rebuild_fallback(row, name, status, init_pid, args.state, rows)
                             continue
                         if status != "stopped":
+                            status, init_pid, force_error = force_stop_incus_guest_as_last_resort(
+                                name, init_pid
+                            )
+                            if incus_state_needs_rebuild(status, init_pid):
+                                mark_rebuild_fallback(row, name, status, init_pid, args.state, rows)
+                                continue
+                        if status != "stopped":
                             detail = (
                                 f"{name}: guest init blocks SIGPWR and remained in "
                                 f"{status.upper()} state (init PID={init_pid or 'missing'}) "
-                                "after the guest poweroff request"
+                                "after guest poweroff and force-stop fallbacks"
                             )
                             if poweroff_error:
                                 detail += f"; {poweroff_error}"
+                            if force_error:
+                                detail += f"; {force_error}"
                             fail(detail)
-                        progress(f"instance {name}: stopped after guest poweroff request")
+                        progress(f"instance {name}: stopped after guest poweroff/force-stop fallback")
                         continue
                 elif not live_state(backend, name):
                     continue
@@ -911,15 +947,24 @@ def lifecycle(args):
                                 mark_rebuild_fallback(row, name, status, init_pid, args.state, rows)
                                 continue
                             if status != "stopped":
+                                status, init_pid, force_error = force_stop_incus_guest_as_last_resort(
+                                    name, init_pid
+                                )
+                                if incus_state_needs_rebuild(status, init_pid):
+                                    mark_rebuild_fallback(row, name, status, init_pid, args.state, rows)
+                                    continue
+                            if status != "stopped":
                                 detail = (
                                     f"{name}: Incus stop failed ({stop_error}); guest poweroff "
-                                    f"did not stop the instance (status={status.upper()}, "
-                                    f"init PID={init_pid or 'missing'})"
+                                    "and force-stop fallbacks did not stop the instance "
+                                    f"(status={status.upper()}, init PID={init_pid or 'missing'})"
                                 )
                                 if poweroff_error:
                                     detail += f"; {poweroff_error}"
+                                if force_error:
+                                    detail += f"; {force_error}"
                                 fail(detail)
-                            progress(f"instance {name}: stopped after guest poweroff request")
+                            progress(f"instance {name}: stopped after guest poweroff/force-stop fallback")
                 progress(f"instance {name}: stop phase complete")
         except SystemExit as exc:
             restore_errors = []
