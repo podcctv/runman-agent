@@ -1466,6 +1466,7 @@ prepare_go_migration() {
     printf '\nThis migration rebuilds clean Alpine/Debian guests and permanently discards their old root filesystems after Rust health checks pass.\n'
     printf 'VM UUIDs, CPU/RAM/disk/bandwidth settings, running/stopped state, and supported TCP/UDP host-to-guest port forwards are retained.\n'
     printf 'Guest data, mounted volumes, installed software, traffic history, WireGuard bindings, custom images, and guest IP addresses are not migrated.\n'
+    printf 'If a guest ignores both normal shutdown requests, Incus force-stops that instance as a last resort; unflushed guest writes may be lost.\n'
     printf 'The installer attempts service/config/container rollback on failure. If disk space is below 768 MiB, a second typed confirmation can delete all Go-managed Incus guests before Rust health checks; their parameters/database are backed up, but guest files cannot be restored. Power loss and host package changes cannot be guaranteed reversible.\n'
     if [ "$MIGRATION_RFW_REPAIR_REQUIRED" = 1 ]; then
         printf 'RFW repair detected: the host lacks AVX2 and RFW has repeated recent SIGILL exits. After confirmation, the verified %s binary will replace %s. The API must stay healthy for 15 seconds; if its current XDP mode fails without SIGILL, the installer backs up the unit and retries in SKB mode. A failed retry restores the original binary and unit before Go is stopped.\n' \
