@@ -174,7 +174,8 @@ jobs:
             echo 'RFW still includes aws-lc-rs; refusing to publish a potentially AVX2-only binary' >&2
             exit 1
           fi
-          ring_versions="$(grep -oE 'ring v[0-9]+\.[0-9]+\.[0-9]+' /tmp/rfw-dependencies.txt | sort -u)"
+          ring_versions="$(grep -oE '(^|[[:space:]])ring v[0-9]+\.[0-9]+\.[0-9]+' /tmp/rfw-dependencies.txt \
+            | sed 's/^[[:space:]]*//' | sort -u)"
           if [ "$(printf '%s\n' "$ring_versions" | sed '/^$/d' | wc -l)" -ne 1 ]; then
             echo "RFW must resolve one ring version; found: $ring_versions" >&2
             exit 1
