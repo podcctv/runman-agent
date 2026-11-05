@@ -147,7 +147,12 @@ impl ImageStore {
         std::fs::read(self.settings_path())
             .ok()
             .and_then(|raw| serde_json::from_slice(&raw).ok())
-            .unwrap_or_default()
+            .unwrap_or_else(|| ImageSettings {
+                // On a fresh installation, offer Alpine by default and keep
+                // Debian available to enable explicitly from the image panel.
+                order: vec!["alpine".into(), "debian".into()],
+                disabled: vec!["debian".into()],
+            })
     }
 
     /// Replace the order and disabled set. At least one available image must
