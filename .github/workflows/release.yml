@@ -120,8 +120,19 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             arch: amd64
+            variant: modern
+            ring_version: locked
+            asset: rfw-amd64
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+            variant: legacy
+            ring_version: "0.17.12"
+            asset: rfw-amd64-legacy
           - target: aarch64-unknown-linux-musl
             arch: arm64
+            variant: modern
+            ring_version: locked
+            asset: rfw-arm64
 
     steps:
       - uses: actions/checkout@v7
@@ -156,13 +167,29 @@ jobs:
 
       - name: Use a CPU-compatible Rustls provider
         run: |
-          python3 runman-agent/scripts/patch-rfw-ring-provider.py "$GITHUB_WORKSPACE"
+          python3 runman-agent/scripts/patch-rfw-ring-provider.py "$GITHUB_WORKSPACE" \
+            --ring-version "${{ matrix.ring_version }}"
           cargo tree -p rfw -e normal | tee /tmp/rfw-dependencies.txt
           if grep -Eq 'aws-lc(-rs|-sys)? v' /tmp/rfw-dependencies.txt; then
             echo 'RFW still includes aws-lc-rs; refusing to publish a potentially AVX2-only binary' >&2
             exit 1
           fi
-          grep -q 'ring v' /tmp/rfw-dependencies.txt
+          ring_versions="$(grep -oE 'ring v[0-9]+\.[0-9]+\.[0-9]+' /tmp/rfw-dependencies.txt | sort -u)"
+          if [ "$(printf '%s\n' "$ring_versions" | sed '/^$/d' | wc -l)" -ne 1 ]; then
+            echo "RFW must resolve one ring version; found: $ring_versions" >&2
+            exit 1
+          fi
+          if [ "${{ matrix.ring_version }}" = '0.17.12' ]; then
+            [ "$ring_versions" = 'ring v0.17.12' ] || {
+              echo "legacy RFW must use ring 0.17.12; found: $ring_versions" >&2
+              exit 1
+            }
+          else
+            [ "$ring_versions" != 'ring v0.17.12' ] || {
+              echo 'modern RFW must use the current lockfile ring version' >&2
+              exit 1
+            }
+          fi
 
       - name: Install bpf-linker
         run: |
@@ -184,13 +211,13 @@ jobs:
             cargo --config 'target.x86_64-unknown-linux-musl.rustflags=["-C","target-cpu=x86-64"]' \
               build --package rfw --release --target x86_64-unknown-linux-musl
           fi
-          cp target/${{ matrix.target }}/release/rfw rfw-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/rfw "${{ matrix.asset }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: rfw-${{ matrix.arch }}
-          path: rfw-${{ matrix.arch }}
+          name: rfw-${{ matrix.arch }}-${{ matrix.variant }}
+          path: ${{ matrix.asset }}
           retention-days: 1
 
   release:
@@ -214,6 +241,7 @@ jobs:
             runman-agent-linux-arm64 \
             install.sh \
             rfw-amd64 \
+            rfw-amd64-legacy \
             rfw-arm64 \
             > SHA256SUMS
 
@@ -226,6 +254,7 @@ jobs:
             runman-agent-linux-arm64
             install.sh
             rfw-amd64
+            rfw-amd64-legacy
             rfw-arm64
             SHA256SUMS
           generate_release_notes: true
@@ -240,7 +269,7 @@ jobs:
           [ -n "$upstream_base" ] || { echo "Unable to resolve upstream release baseline" >&2; exit 1; }
           diy_version="${upstream_base}-diy.${GITHUB_SHA::12}"
           notes="DIY build based on upstream ${upstream_base}; fork commit ${GITHUB_SHA}."
-          assets=(runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh rfw-amd64 rfw-arm64 SHA256SUMS)
+          assets=(runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh rfw-amd64 rfw-amd64-legacy rfw-arm64 SHA256SUMS)
           if gh release view continuous >/dev/null 2>&1; then
             # Preserve the release URL while replacing completed artifacts.
             # A failed update leaves the prior downloadable release intact.

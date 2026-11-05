@@ -459,6 +459,14 @@ migration_cpu_has_avx2() {
     ' /proc/cpuinfo
 }
 
+rfw_asset_for_host() {
+    if [ "$ARCH" = amd64 ] && ! migration_cpu_has_avx2; then
+        printf 'rfw-amd64-legacy\n'
+    else
+        printf 'rfw-%s\n' "$ARCH"
+    fi
+}
+
 migration_rfw_restore_original() {
     local tmp
     [ -n "$MIGRATION_RFW_BIN" ] \
@@ -637,7 +645,7 @@ migration_prepare_rfw_repair() {
         || die "RFW is in a repeated SIGILL loop, but its API port is invalid; Go remains active"
     MIGRATION_RFW_API_URL="http://$MIGRATION_RFW_API_ADDR/api/status"
 
-    asset=rfw-amd64
+    asset=$(rfw_asset_for_host)
     sums_file="$WORK/rfw-SHA256SUMS"
     curl -fsSL --retry 3 --connect-timeout 20 -o "$sums_file" "$RFW_URL/SHA256SUMS" \
         || die "RFW has a confirmed AVX2-related crash loop, but its release checksum list is unavailable; Go remains active"
@@ -1273,7 +1281,7 @@ Usage: install.sh [options]
   --no-rfw                Do not install the rfw firewall
   --rfw-iface IFACE       Interface rfw protects (default: IPv4 default route)
   --from-dir DIR          Use binaries from DIR (runman-agent-linux-<arch>, SHA256SUMS,
-                          optionally rfw-<arch>) instead of downloading them
+                          optionally rfw-<arch> and rfw-amd64-legacy) instead of downloading
   --migrate-go            Lossy clean-rebuild migration from a supported Go Podman/Incus node;
                           keeps a rollback snapshot until Rust health, port, and network checks pass
   --repair-rfw            Repair a confirmed x86_64 RFW SIGILL loop without migrating Go containers
@@ -1827,16 +1835,26 @@ rfw_ready() {
 }
 
 install_rfw() {
-    local iface=$RFW_IFACE fresh_rfw=0
+    local iface=$RFW_IFACE fresh_rfw=0 asset sums_file
     [ -n "$iface" ] || iface=$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
     [ -n "$iface" ] || { warn "no IPv4 default route; skipping rfw (use --rfw-iface)"; return 0; }
-    log "installing rfw on $iface"
-    if ! fetch "rfw-$ARCH" "$WORK/rfw" "$RFW_URL"; then
+    asset=$(rfw_asset_for_host)
+    log "installing $asset on $iface"
+    sums_file="$WORK/rfw-SHA256SUMS"
+    if ! fetch SHA256SUMS "$sums_file" "$RFW_URL"; then
+        warn "cannot download RFW checksums; continuing without it"
+        return 0
+    fi
+    if ! fetch "$asset" "$WORK/$asset" "$RFW_URL"; then
         warn "cannot download rfw; continuing without it"
         return 0
     fi
-    is_elf_for_arch "$WORK/rfw" || { warn "rfw download is not a binary for $ARCH; skipping"; return 0; }
-    install -m 755 "$WORK/rfw" "$RFW_BIN.new"
+    [ "$(grep -Ec "  \*?$asset\$" "$sums_file")" = 1 ] \
+        || { warn "RFW release checksum list does not contain exactly one entry for $asset; skipping"; return 0; }
+    (cd "$WORK" && grep -E "  \*?$asset\$" "$sums_file" | sha256sum -c --quiet -) \
+        || { warn "RFW checksum mismatch for $asset; skipping"; return 0; }
+    is_elf_for_arch "$WORK/$asset" || { warn "RFW asset is not a binary for $ARCH; skipping"; return 0; }
+    install -m 755 "$WORK/$asset" "$RFW_BIN.new"
     mv -f "$RFW_BIN.new" "$RFW_BIN"
     install -d -m 700 "$RFW_DIR"
     [ -f /etc/systemd/system/rfw.service ] || fresh_rfw=1
