@@ -633,6 +633,7 @@ def export(args):
             print("Go database and backend inventory are empty; proceeding with host-only migration")
 
     instances = []
+    debian_to_alpine = 0
     legacy_state = []
     rebuild_fallback_instances = []
     passwords = ["VM UUID\tnew root password (root-only; guest data is rebuilt)\n"]
@@ -666,13 +667,19 @@ def export(args):
             running = live_state(backend, name)
         image = str(column(row, "image") or column(provider, "image") or "").strip().lower()
         if image in podman_image_families:
-            os_image = podman_image_families[image]
+            source_family = podman_image_families[image]
         elif image == "alpine" or image.startswith("alpine/") or image.startswith("alpine-"):
-            os_image = "alpine"
+            source_family = "alpine"
         elif image == "debian" or image.startswith("debian/") or image.startswith("debian-"):
-            os_image = "debian"
+            source_family = "debian"
         else:
             fail(f"image {image!r} for {vm_id} is not a supported stock Alpine/Debian family")
+        # Migration deliberately standardizes every replacement guest on
+        # Alpine. In particular, Debian source guests must not depend on the
+        # node's disabled Debian image catalog entry.
+        os_image = "alpine"
+        if source_family == "debian":
+            debian_to_alpine += 1
         password = secrets.token_urlsafe(20)
         instances.append({
             "vm_id": vm_id,
@@ -805,6 +812,9 @@ def export(args):
     except OSError:
         pass
     print(f"exported {len(instances)} instance(s), {len(forwards)} port forward(s), backend={backend}")
+    print(f"migration image policy: all {len(instances)} replacement guest(s) use Alpine")
+    if debian_to_alpine:
+        print(f"converted {debian_to_alpine} Debian source guest(s) to Alpine")
     for name, status, init_pid, last_power_state in rebuild_fallback_instances:
         confirmed = name in error_state_overrides
         state = "confirmed by operator" if confirmed else "requires operator choice"

@@ -62,11 +62,11 @@ forward, a backend-only database row, or a changed orphan set still aborts
 migration. After Go stops, the helper rechecks the orphan report against the
 pre-confirmation snapshot before it stops or removes any legacy guest.
 
-It rebuilds clean Rust containers and retains:
+It rebuilds every migrated guest from the Alpine stock image and retains:
 
 - the platform host ID and token, panel user/password hash and listen address;
 - each VM UUID, CPU, memory, disk and bandwidth limits;
-- Alpine or Debian OS family and whether the guest was running;
+- whether the guest was running; Debian source guests are converted to Alpine;
 - supported TCP/UDP host-to-guest port forwards;
 - the supported host IPv6 mode/prefix and RFW API address.
 
@@ -98,13 +98,14 @@ The old host packages and container images are left in place. Incus host-path
 mounts and other unsupported backend-specific settings are not recreated in
 Rust.
 
-Only standard Alpine and Debian image families are accepted. The two built-in
-Go Podman image IDs, `docker.io/narwhalcloud/alpine:podman` and
-`docker.io/narwhalcloud/debian:podman`, map to their matching Rust stock image
-families. Unknown or custom images, invalid resource settings, unsupported Go
-config, backend-only records, live containers without proven Go ownership,
-unconfirmed orphan rows, occupied ports, and failed Rust checks abort before
-normally staged old guests are purged.
+Only standard Alpine and Debian source image families are accepted. The two
+built-in Go Podman image IDs, `docker.io/narwhalcloud/alpine:podman` and
+`docker.io/narwhalcloud/debian:podman`, are recognized; every accepted source
+family is rebuilt as Alpine so migration works while Debian is disabled for
+normal instance creation. Unknown or custom images, invalid resource settings,
+unsupported Go config, backend-only records, live containers without proven Go
+ownership, unconfirmed orphan rows, occupied ports, and failed Rust checks
+abort before normally staged old guests are purged.
 
 ## Rollback boundary
 

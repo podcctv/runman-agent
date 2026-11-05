@@ -1460,10 +1460,10 @@ prepare_go_migration() {
     migration_ipv4=$(sed -n 's/^ipv4_subnet = "\([^"]*\)"$/\1/p' "$MIGRATION_DIR/config.toml")
     migration_ipv6_mode=$(sed -n 's/^ipv6_mode = "\([^"]*\)"$/\1/p' "$MIGRATION_DIR/config.toml")
     cp -a "$MIGRATION_DIR/config.toml" "$MIGRATION_DIR/rust-config.toml"
-    printf 'Go -> Rust v2 lossy migration\nCreated: %s\nBackend: %s\n' \
+    printf 'Go -> Rust v2 lossy migration\nCreated: %s\nBackend: %s\nImage policy: all guests are rebuilt as Alpine; Debian source guests are converted to Alpine.\n' \
         "$(date -Is)" "$MIGRATION_BACKEND" > "$MIGRATION_DIR/README.txt"
 
-    printf '\nThis migration rebuilds clean Alpine/Debian guests and permanently discards their old root filesystems after Rust health checks pass.\n'
+    printf '\nThis migration rebuilds every guest as clean Alpine and permanently discards the old root filesystems after Rust health checks pass. Debian source guests are converted to Alpine.\n'
     printf 'VM UUIDs, CPU/RAM/disk/bandwidth settings, running/stopped state, and supported TCP/UDP host-to-guest port forwards are retained.\n'
     printf 'Guest data, mounted volumes, installed software, traffic history, WireGuard bindings, custom images, and guest IP addresses are not migrated.\n'
     printf 'If a Podman container or Incus guest will not stop cleanly, the installer force-stops it as a last resort; unflushed guest writes may be lost.\n'
