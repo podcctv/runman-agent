@@ -10,10 +10,12 @@ import json
 import os
 import re
 import secrets
+import signal
 import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -22,6 +24,9 @@ DEFAULT_CONFIG = Path("/opt/narwhal-agent/config.json")
 DEFAULT_DB = Path("/opt/narwhal-agent/agent.db")
 MAX_DB_BYTES = 2 * 1024 * 1024 * 1024
 INCUS_STOP_TIMEOUT = 120
+INCUS_GUEST_POWEROFF_TIMEOUT = 30
+INCUS_GUEST_STOP_WAIT_TIMEOUT = 45
+INCUS_GUEST_STOP_POLL_INTERVAL = 2
 DEFAULT_SNAT6_PREFIX = "fd91:cafe:cafe:10::/64"
 
 
@@ -130,6 +135,70 @@ def incus_state_needs_rebuild(status, init_pid):
         return int(init_pid) <= 1
     except ValueError:
         return True
+
+
+def incus_init_blocks_halt_signal(name, init_pid):
+    """Detect a live Incus init that blocks LXC's default SIGPWR halt request."""
+    try:
+        pid = int(init_pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 1 or not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
+        return False
+    try:
+        proc_status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+        proc_cgroup = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    fields = {}
+    for line in proc_status.splitlines():
+        key, separator, value = line.partition(":")
+        if separator:
+            fields[key] = value.strip()
+    namespace_pids = fields.get("NSpid", "").split()
+    if not namespace_pids or namespace_pids[-1] != "1":
+        return False
+    if name not in proc_cgroup:
+        return False
+    try:
+        blocked_signals = int(fields.get("SigBlk", ""), 16)
+    except ValueError:
+        return False
+    return bool(blocked_signals & (1 << (signal.SIGPWR - 1)))
+
+
+def request_incus_guest_poweroff(name):
+    """Ask a still-running guest to shut itself down after Incus stop times out."""
+    try:
+        result = subprocess.run(
+            ["incus", "exec", name, "--", "/sbin/poweroff"],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=INCUS_GUEST_POWEROFF_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"could not complete the guest poweroff request: {exc}"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[-300:]
+        suffix = f": {detail}" if detail else ""
+        return f"guest poweroff request exited with status {result.returncode}{suffix}"
+    return ""
+
+
+def wait_for_incus_guest_stop(name):
+    """Wait briefly for a guest-side poweroff; never send a force-stop signal."""
+    deadline = time.monotonic() + INCUS_GUEST_STOP_WAIT_TIMEOUT
+    while True:
+        status, init_pid = incus_instance_state(name)
+        if status == "stopped" or incus_state_needs_rebuild(status, init_pid):
+            return status, init_pid
+        if status not in {"running", "stopping"}:
+            return status, init_pid
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return status, init_pid
+        time.sleep(min(INCUS_GUEST_STOP_POLL_INTERVAL, remaining))
 
 
 def incus_running_from_state(status, init_pid, name):
@@ -763,6 +832,33 @@ def lifecycle(args):
                         write_state_file(args.state, rows)
                     if not running:
                         continue
+                    if incus_init_blocks_halt_signal(name, init_pid):
+                        progress(
+                            f"instance {name}: init blocks SIGPWR, Incus's graceful-stop signal; "
+                            "requesting poweroff from inside the guest"
+                        )
+                        poweroff_error = request_incus_guest_poweroff(name)
+                        try:
+                            status, init_pid = wait_for_incus_guest_stop(name)
+                        except SystemExit as state_error:
+                            fail(
+                                f"{name}: guest init blocks SIGPWR; state check after the "
+                                f"poweroff request failed ({state_error})"
+                            )
+                        if incus_state_needs_rebuild(status, init_pid):
+                            mark_rebuild_fallback(row, name, status, init_pid, args.state, rows)
+                            continue
+                        if status != "stopped":
+                            detail = (
+                                f"{name}: guest init blocks SIGPWR and remained in "
+                                f"{status.upper()} state (init PID={init_pid or 'missing'}) "
+                                "after the guest poweroff request"
+                            )
+                            if poweroff_error:
+                                detail += f"; {poweroff_error}"
+                            fail(detail)
+                        progress(f"instance {name}: stopped after guest poweroff request")
+                        continue
                 elif not live_state(backend, name):
                     continue
                 # A previous stop may have completed even if its client timed
@@ -799,7 +895,31 @@ def lifecycle(args):
                         except SystemExit as state_error:
                             fail(f"{name}: stop failed ({stop_error}); state check failed ({state_error})")
                         if not stopped:
-                            raise stop_error
+                            progress(
+                                f"Incus graceful stop timed out for {name}; requesting poweroff "
+                                "from inside the guest and checking its state"
+                            )
+                            poweroff_error = request_incus_guest_poweroff(name)
+                            try:
+                                status, init_pid = wait_for_incus_guest_stop(name)
+                            except SystemExit as state_error:
+                                fail(
+                                    f"{name}: Incus stop failed ({stop_error}); guest poweroff "
+                                    f"state check failed ({state_error})"
+                                )
+                            if incus_state_needs_rebuild(status, init_pid):
+                                mark_rebuild_fallback(row, name, status, init_pid, args.state, rows)
+                                continue
+                            if status != "stopped":
+                                detail = (
+                                    f"{name}: Incus stop failed ({stop_error}); guest poweroff "
+                                    f"did not stop the instance (status={status.upper()}, "
+                                    f"init PID={init_pid or 'missing'})"
+                                )
+                                if poweroff_error:
+                                    detail += f"; {poweroff_error}"
+                                fail(detail)
+                            progress(f"instance {name}: stopped after guest poweroff request")
                 progress(f"instance {name}: stop phase complete")
         except SystemExit as exc:
             restore_errors = []
