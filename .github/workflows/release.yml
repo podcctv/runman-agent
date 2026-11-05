@@ -234,6 +234,11 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
+          if [ "${{ matrix.variant }}" = "legacy" ]; then
+            # Rust's target-cpu setting does not constrain Ring's C sources.
+            # Keep every C dependency at the x86-64 baseline for CPUs without AVX2.
+            export CFLAGS="-march=x86-64 -mtune=generic -mno-avx -mno-avx2 -mno-avx512f"
+          fi
           if [ "${{ matrix.arch }}" = "arm64" ]; then
             cargo zigbuild --package rfw --release --target ${{ matrix.target }}
           else
@@ -247,15 +252,39 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
+          export CFLAGS="-march=x86-64 -mtune=generic -mno-avx -mno-avx2 -mno-avx512f"
           cargo --config 'profile.release.strip=false' \
             --config 'target.x86_64-unknown-linux-musl.rustflags=["-C","target-cpu=x86-64"]' \
             build --package rfw --release --target x86_64-unknown-linux-musl
           python3 - <<'PY'
+          import re
           import subprocess
+
+          binary = "target/x86_64-unknown-linux-musl/release/rfw"
+          symbol = "ring_core_0_17_12__x25519_ge_scalarmult_base"
+          disassembly = subprocess.check_output(
+              ["objdump", "-d", f"--disassemble={symbol}", binary],
+              text=True,
+          )
+          if f"<{symbol}>:" not in disassembly:
+              raise SystemExit(f"could not disassemble {symbol}; refusing to publish legacy RFW")
+          avx_instructions = []
+          for line in disassembly.splitlines():
+              if ":" not in line:
+                  continue
+              assembly = line.split(":", 1)[1].strip().split("\t")[-1].strip()
+              mnemonic = assembly.split(None, 1)[0] if assembly else ""
+              if mnemonic.startswith("v") or re.search(r"\b[yz]mm[0-9]+\b", assembly):
+                  avx_instructions.append(line.strip())
+          if avx_instructions:
+              print("Unexpected AVX instructions in the legacy X25519 implementation:")
+              print("\n".join(avx_instructions[:20]))
+              raise SystemExit("legacy RFW must keep Ring's X25519 code at the x86-64 baseline")
+          print(f"Verified {symbol} contains no AVX/VEX instructions")
 
           offset = 0x320017
           output = subprocess.check_output(
-              ["nm", "-S", "-n", "--defined-only", "target/x86_64-unknown-linux-musl/release/rfw"],
+              ["nm", "-S", "-n", "--defined-only", binary],
               text=True,
           )
           symbols = []

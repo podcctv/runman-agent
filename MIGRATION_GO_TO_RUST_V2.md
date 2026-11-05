@@ -121,10 +121,14 @@ migration or cleanup. Before asking for the migration confirmation, the
 installer checks an active x86_64 RFW service for repeated recent SIGILL
 exits on a host without AVX2. When all evidence matches, it verifies and stages
 the published RFW binary. The installer selects `rfw-amd64-legacy`, pinned to
-ring 0.17.12 with AVX2 runtime dispatch and P-256 AVX2 paths disabled, when the
-host lacks AVX2; AVX2-capable amd64 hosts use the lockfile-selected current
-ring build, and arm64 hosts use their lockfile build. All variants are checked
-against the release checksum. After confirmation it
+ring 0.17.12 with AVX2 runtime dispatch and P-256 AVX2 paths disabled when the
+host lacks AVX2. Its C dependencies are also compiled for the x86-64 baseline
+with AVX-family code generation disabled; Rust's `target-cpu` setting does not
+constrain Ring's separate C build. AVX2-capable amd64 hosts use the
+lockfile-selected current ring build, and arm64 hosts use their lockfile build.
+All variants are checked against the release checksum, and CI checks that the
+legacy X25519 implementation contains no AVX/VEX instructions. After
+confirmation it
 replaces only the executable
 referenced by the service, then requires the local RFW status API to remain
 healthy for 15 seconds. If the existing XDP mode does not start the API and the
