@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use runman_agent::backend::{Instances, PortForwards};
 use runman_agent::config::{DEFAULT_IMAGE_BASE_URL, NetworkConfig};
-use runman_agent::model::{ConsoleSize, InstanceSpec, L4Proto, PortForward, VmId};
+use runman_agent::model::{ConsoleSize, ImageSettings, InstanceSpec, L4Proto, PortForward, VmId};
 use runman_agent::proto::VmStatus;
 use runman_agent::runtime::{Options, Runtime};
 
@@ -136,6 +136,7 @@ async fn instance_lifecycle() {
     .with_helper(env!("CARGO_BIN_EXE_runman-agent").into());
     rt.init().await.expect("init");
     rt.refresh_images().await;
+    enable_test_images(&rt);
     let images: Vec<String> = rt.images().ready().into_iter().map(|i| i.id).collect();
     assert!(images.contains(&"debian".to_string()), "{images:?}");
     assert!(images.contains(&"alpine".to_string()), "{images:?}");
@@ -505,6 +506,15 @@ async fn vms(rt: &Runtime) -> Vec<runman_agent::proto::VmSummary> {
     Instances::list(rt).await.unwrap_or_default()
 }
 
+fn enable_test_images(rt: &Runtime) {
+    rt.images()
+        .set_settings(ImageSettings {
+            order: vec!["alpine".into(), "debian".into()],
+            disabled: Vec::new(),
+        })
+        .expect("enable the images used by runtime tests");
+}
+
 /// A runtime with its own data dir and bridge, sharing the image cache.
 async fn side_runtime(name: &str, network: NetworkConfig) -> Runtime {
     let data = format!("/var/lib/runman-agent-{name}");
@@ -532,6 +542,7 @@ async fn side_runtime(name: &str, network: NetworkConfig) -> Runtime {
         rt.delete(&VmId::parse(&s.vm_id).unwrap()).await.unwrap();
     }
     rt.refresh_images().await;
+    enable_test_images(&rt);
     rt
 }
 
