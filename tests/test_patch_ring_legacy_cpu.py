@@ -28,6 +28,21 @@ class PatchRingLegacyCpuTests(unittest.TestCase):
             "  OPENSSL_ia32cap_P[2] = extended_features[0];\n",
             encoding="utf-8",
         )
+        p256 = root / "crypto" / "fipsmodule" / "ec" / "p256-nistz.c"
+        p256.parent.mkdir(parents=True)
+        p256.write_text(
+            "  if (avx2_available) {\n"
+            "    ecp_nistz256_select_w5_avx2(val, in_t, index);\n"
+            "  } else {\n"
+            "    ecp_nistz256_select_w5_nohw(val, in_t, index);\n"
+            "  }\n"
+            "  if (avx2_available) {\n"
+            "    ecp_nistz256_select_w7_avx2(val, in_t, index);\n"
+            "  } else {\n"
+            "    ecp_nistz256_select_w7_nohw(val, in_t, index);\n"
+            "  }\n",
+            encoding="utf-8",
+        )
         return root, source
 
     def test_masks_avx2_before_exporting_cpu_features_and_is_idempotent(self):
@@ -40,6 +55,10 @@ class PatchRingLegacyCpuTests(unittest.TestCase):
             patched.index("extended_features[0] &= ~(1u << 5);"),
             patched.index("OPENSSL_ia32cap_P[2] = extended_features[0];"),
         )
+        p256 = (root / "crypto" / "fipsmodule" / "ec" / "p256-nistz.c").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(p256.count("if (avx2_available && 0) {"), 2)
         self.assertFalse(PATCHER.patch_ring_source(root))
 
     def test_rejects_other_ring_versions(self):
