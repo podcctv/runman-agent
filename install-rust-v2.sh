@@ -2028,13 +2028,42 @@ PY
     done
     [ "$health_ok" = 1 ] || die "Rust migration inventory or port-forward verification failed"
     if [ -s "$network_targets" ]; then
-        network_test_pid=""
+        dns_probe="$MIGRATION_DIR/dns-probe.py"
+        cat > "$dns_probe" <<'PY'
+import ipaddress
+import secrets
+import socket
+import struct
+import sys
+
+name = "one.one.one.one"
+transaction_id = int.from_bytes(secrets.token_bytes(2), "big")
+question = b"".join(bytes([len(label)]) + label.encode("ascii") for label in name.split(".")) + b"\0\0\1\0\1"
+query = struct.pack("!HHHHHH", transaction_id, 0x0100, 1, 0, 0, 0) + question
+server = ipaddress.ip_address(sys.argv[1].split("%", 1)[0])
+family = socket.AF_INET if server.version == 4 else socket.AF_INET6
+destination = (str(server), 53) if server.version == 4 else (str(server), 53, 0, 0)
+with socket.socket(family, socket.SOCK_DGRAM) as client:
+    client.settimeout(3)
+    client.sendto(query, destination)
+    response, _ = client.recvfrom(2048)
+if len(response) < 12:
+    raise SystemExit("short DNS response")
+reply_id, flags, _, answers, _, _ = struct.unpack("!HHHHHH", response[:12])
+if reply_id != transaction_id or flags & 0x000F or answers < 1:
+    raise SystemExit("invalid DNS response")
+PY
+        chmod 600 "$dns_probe"
         while IFS=$'\t' read -r vm_id guest_pid guest_ipv4 guest_ipv6; do
             if [ -z "$vm_id" ] || ! [[ "$guest_pid" =~ ^[0-9]+$ ]]; then
                 die "Rust migration network inventory is invalid; Go rollback will run"
             fi
             [ -r "/proc/$guest_pid/ns/net" ] \
                 || die "migrated guest $vm_id has no live network namespace; Go rollback will run"
+            resolv_conf="/proc/$guest_pid/root/etc/resolv.conf"
+            [ -r "$resolv_conf" ] \
+                || die "migrated guest $vm_id has no readable /etc/resolv.conf; Go rollback will run"
+            log "checking route, configured DNS, and IPv4 HTTPS for migrated guest $vm_id"
             route_ok=0
             for _ in $(seq 1 20); do
                 host_route=$(ip -4 route get "$guest_ipv4" 2>/dev/null || true)
@@ -2059,71 +2088,57 @@ PY
             done
             [ "$route_ok" = 1 ] \
                 || die "migrated guest $vm_id does not route through rmbr0/eth0 (host: ${host_route:-missing}; guest: ${guest_route:-missing}; IPv6 host: ${host_route6:-skipped}; IPv6 guest: ${guest_route6:-skipped}); Go rollback will run"
-            [ -n "$network_test_pid" ] || network_test_pid=$guest_pid
-        done < "$network_targets"
 
-        egress_ok=0
-        for _ in $(seq 1 10); do
-            if nsenter --target "$network_test_pid" --net -- env \
+            guest_dns_servers=$(awk '$1 == "nameserver" && NF >= 2 {print $2}' "$resolv_conf" | awk '!seen[$0]++')
+            [ -n "$guest_dns_servers" ] \
+                || die "migrated guest $vm_id has no nameserver in /etc/resolv.conf; Go rollback will run"
+            dns_ok=0
+            dns_server_ok=""
+            while IFS= read -r dns_server; do
+                [ -n "$dns_server" ] || continue
+                if nsenter --target "$guest_pid" --net -- python3 "$dns_probe" "$dns_server" >/dev/null 2>&1; then
+                    dns_ok=1
+                    dns_server_ok=$dns_server
+                    break
+                fi
+            done <<< "$guest_dns_servers"
+            [ "$dns_ok" = 1 ] \
+                || die "migrated guest $vm_id cannot resolve via any configured DNS server (${guest_dns_servers//$'\n'/, }); Go rollback will run"
+            log "migrated guest $vm_id resolved through configured DNS server $dns_server_ok"
+
+            egress_ok=0
+            for _ in $(seq 1 10); do
+                if nsenter --target "$guest_pid" --net -- env \
                 -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy \
                 curl -4 -fsS --connect-timeout 2 --max-time 4 \
                     --resolve one.one.one.one:443:1.1.1.1 \
                     https://one.one.one.one/ -o /dev/null 2>/dev/null; then
-                egress_ok=1
-                break
-            fi
-            sleep 1
-        done
-        [ "$egress_ok" = 1 ] \
-            || die "migrated guest cannot reach IPv4 HTTPS through rmbr0; Go rollback will run"
-        dns_probe="$MIGRATION_DIR/dns-probe.py"
-        cat > "$dns_probe" <<'PY'
-import secrets
-import socket
-import struct
-import sys
-
-name = "one.one.one.one"
-transaction_id = int.from_bytes(secrets.token_bytes(2), "big")
-question = b"".join(bytes([len(label)]) + label.encode("ascii") for label in name.split(".")) + b"\0\0\1\0\1"
-query = struct.pack("!HHHHHH", transaction_id, 0x0100, 1, 0, 0, 0) + question
-with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
-    client.settimeout(3)
-    client.sendto(query, (sys.argv[1], 53))
-    response, _ = client.recvfrom(2048)
-if len(response) < 12:
-    raise SystemExit("short DNS response")
-reply_id, flags, _, answers, _, _ = struct.unpack("!HHHHHH", response[:12])
-if reply_id != transaction_id or flags & 0x000F or answers < 1:
-    raise SystemExit("invalid DNS response")
-PY
-        chmod 600 "$dns_probe"
-        dns_ok=0
-        for dns_server in 1.1.1.1 8.8.8.8; do
-            if nsenter --target "$network_test_pid" --net -- python3 "$dns_probe" "$dns_server" >/dev/null 2>&1; then
-                dns_ok=1
-                break
-            fi
-        done
-        [ "$dns_ok" = 1 ] \
-            || die "migrated guest cannot resolve through the configured DNS servers; Go rollback will run"
-        if [ "$migration_ipv6_mode" != none ]; then
-            ipv6_egress_ok=0
-            for _ in $(seq 1 10); do
-                if nsenter --target "$network_test_pid" --net -- env \
-                    -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy \
-                    curl -6 -fsS --connect-timeout 2 --max-time 4 \
-                        --resolve 'one.one.one.one:443:[2606:4700:4700::1111]' \
-                        https://one.one.one.one/ -o /dev/null 2>/dev/null; then
-                    ipv6_egress_ok=1
+                    egress_ok=1
                     break
                 fi
                 sleep 1
             done
-            [ "$ipv6_egress_ok" = 1 ] \
-                || die "migrated guest cannot reach IPv6 HTTPS in $migration_ipv6_mode mode; Go rollback will run"
-        fi
-        log "verified host routes to all running guests, DNS, and IPv4 HTTPS egress from a migrated guest"
+            [ "$egress_ok" = 1 ] \
+                || die "migrated guest $vm_id cannot reach IPv4 HTTPS through rmbr0; Go rollback will run"
+
+            if [ "$migration_ipv6_mode" != none ]; then
+                ipv6_egress_ok=0
+                for _ in $(seq 1 10); do
+                    if nsenter --target "$guest_pid" --net -- env \
+                    -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy \
+                    curl -6 -fsS --connect-timeout 2 --max-time 4 \
+                        --resolve 'one.one.one.one:443:[2606:4700:4700::1111]' \
+                        https://one.one.one.one/ -o /dev/null 2>/dev/null; then
+                        ipv6_egress_ok=1
+                        break
+                    fi
+                    sleep 1
+                done
+                [ "$ipv6_egress_ok" = 1 ] \
+                    || die "migrated guest $vm_id cannot reach IPv6 HTTPS in $migration_ipv6_mode mode; Go rollback will run"
+            fi
+        done < "$network_targets"
+        log "verified routes, configured DNS, and IPv4 HTTPS egress for every running migrated guest"
     else
         log "no guests were running before migration; guest egress probe skipped"
     fi
