@@ -1196,6 +1196,38 @@ def lifecycle(args):
             command = ["podman", "rm", "--force", name] if backend == "podman" else ["incus", "delete", name, "--force"]
             progress(f"removing legacy instance {name} ({index}/{total})")
             result = subprocess.run(command, check=False, text=True, capture_output=True, timeout=120)
+            if backend == "incus":
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout or "").strip()[-300:]
+                    if "container is not running" in detail.lower():
+                        try:
+                            status, init_pid = incus_instance_state(name)
+                        except SystemExit as state_error:
+                            errors.append(f"{name}: {detail}; state check failed: {state_error}")
+                            continue
+                        if status == "stopped" and not init_pid:
+                            progress(
+                                f"instance {name}: Incus reports the container is already stopped; "
+                                "retrying ordinary delete to clear its record"
+                            )
+                            result = subprocess.run(
+                                ["incus", "delete", name],
+                                check=False,
+                                text=True,
+                                capture_output=True,
+                                timeout=120,
+                            )
+                try:
+                    still_exists = incus_instance_exists(name)
+                except SystemExit as check_error:
+                    errors.append(f"{name}: delete result could not be verified: {check_error}")
+                    continue
+                if still_exists:
+                    detail = (result.stderr or result.stdout or "Incus still lists the instance").strip()[-300:]
+                    errors.append(f"{name}: {detail}")
+                    continue
+                progress(f"removed legacy instance {name}")
+                continue
             if result.returncode != 0:
                 errors.append(f"{name}: {(result.stderr or result.stdout or '').strip()[-300:]}")
             else:
