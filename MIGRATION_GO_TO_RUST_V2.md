@@ -21,6 +21,13 @@ running guest to shut down cleanly; a guest that reports an invalid PID or
 becomes `ERROR` during shutdown is marked for clean rebuild and is preserved in
 the normal rollback-safe staging path.
 
+Podman containers receive a 20-second graceful stop. If that command fails, the
+helper first rechecks live state; it uses `podman kill --signal KILL` only when
+the container is still confirmed running, then waits for Podman to report it
+stopped. If state cannot be confirmed or the container remains running, the
+migration aborts and attempts rollback. A forced stop can lose unflushed guest
+writes.
+
 If less than 768 MiB is available on the Runman data filesystem, the installer
 asks for a second typed confirmation to delete every Go-managed Incus guest
 listed in the confirmed snapshot. It first saves VM settings, port forwards, the

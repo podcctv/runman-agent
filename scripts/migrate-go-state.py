@@ -27,6 +27,8 @@ INCUS_STOP_TIMEOUT = 120
 INCUS_GUEST_POWEROFF_TIMEOUT = 30
 INCUS_GUEST_STOP_WAIT_TIMEOUT = 45
 INCUS_GUEST_STOP_POLL_INTERVAL = 2
+PODMAN_FORCE_STOP_WAIT_TIMEOUT = 30
+PODMAN_FORCE_STOP_POLL_INTERVAL = 2
 DEFAULT_SNAT6_PREFIX = "fd91:cafe:cafe:10::/64"
 
 
@@ -269,14 +271,59 @@ def canonical_uuid(value):
         fail(f"invalid VM UUID in Go database: {value!r}")
 
 
-def live_state(backend, name):
+def podman_running_state(name, *, timeout=45):
     if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", name):
         fail(f"unsupported legacy container name {name!r}")
+    result = checked_run(
+        ["podman", "inspect", "--format", "{{.State.Running}}", name],
+        timeout=timeout,
+    )
+    if result not in {"true", "false"}:
+        fail(f"Podman returned an unrecognized state for {name}")
+    return result == "true"
+
+
+def force_stop_podman_container_as_last_resort(name):
+    """Kill one verified-running Podman container after graceful stop fails."""
+    try:
+        running = podman_running_state(name, timeout=15)
+    except SystemExit as exc:
+        return False, f"cannot verify container before force-kill: {exc}"
+    if not running:
+        return True, ""
+
+    progress(f"instance {name}: graceful stop failed; using Podman force-kill as the last resort")
+    kill_error = ""
+    try:
+        checked_run(["podman", "kill", "--signal", "KILL", name], timeout=30)
+    except SystemExit as exc:
+        # Podman can return an error after the container has already exited.
+        # Verify live state before deciding whether the kill actually failed.
+        kill_error = str(exc)
+
+    deadline = time.monotonic() + PODMAN_FORCE_STOP_WAIT_TIMEOUT
+    while True:
+        try:
+            running = podman_running_state(name, timeout=15)
+        except SystemExit as exc:
+            detail = f"cannot verify container after force-kill: {exc}"
+            if kill_error:
+                detail = f"{kill_error}; {detail}"
+            return False, detail
+        if not running:
+            return True, ""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            detail = "container still reports running after Podman force-kill"
+            if kill_error:
+                detail = f"{kill_error}; {detail}"
+            return False, detail
+        time.sleep(min(PODMAN_FORCE_STOP_POLL_INTERVAL, remaining))
+
+
+def live_state(backend, name):
     if backend == "podman":
-        result = checked_run(["podman", "inspect", "--format", "{{.State.Running}}", name])
-        if result not in {"true", "false"}:
-            fail(f"Podman returned an unrecognized state for {name}")
-        return result == "true"
+        return podman_running_state(name)
     status, init_pid = incus_instance_state(name)
     return incus_running_from_state(status, init_pid, name)
 
@@ -909,7 +956,16 @@ def lifecycle(args):
                 # out. Make this phase idempotent before retrying a stop.
                 if backend == "podman":
                     progress(f"stopping instance {name} gracefully (timeout=20s)")
-                    checked_run(["podman", "stop", "--time", "20", name])
+                    try:
+                        checked_run(["podman", "stop", "--time", "20", name])
+                    except SystemExit as stop_error:
+                        stopped, force_error = force_stop_podman_container_as_last_resort(name)
+                        if not stopped:
+                            fail(
+                                f"{name}: Podman graceful stop failed ({stop_error}); "
+                                f"force-stop fallback failed ({force_error})"
+                            )
+                        progress(f"instance {name}: stopped after Podman graceful-stop recovery")
                 else:
                     # Give guests more time for a clean shutdown. Keep the
                     # client timeout longer than Incus's own shutdown timeout.
