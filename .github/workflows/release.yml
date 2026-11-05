@@ -191,6 +191,34 @@ jobs:
               exit 1
             }
           fi
+          if [ "${{ matrix.ring_version }}" = '0.17.12' ]; then
+            ring_source="$(find "$HOME/.cargo/registry/src" -mindepth 2 -maxdepth 2 \
+              -type d -name ring-0.17.12 -print -quit)"
+            [ -n "$ring_source" ] || {
+              echo 'Cargo did not unpack ring 0.17.12; refusing to build the legacy artifact' >&2
+              exit 1
+            }
+            mkdir -p "$RUNNER_TEMP/runman-ring-legacy"
+            cp -a "$ring_source"/. "$RUNNER_TEMP/runman-ring-legacy/"
+            python3 runman-agent/scripts/patch-ring-legacy-cpu.py \
+              "$RUNNER_TEMP/runman-ring-legacy"
+            if grep -Fq '[patch.crates-io]' Cargo.toml; then
+              echo 'RFW workspace already defines [patch.crates-io]; refusing to override it' >&2
+              exit 1
+            fi
+            cat >> Cargo.toml <<EOF
+
+          [patch.crates-io]
+          ring = { path = "$RUNNER_TEMP/runman-ring-legacy" }
+          EOF
+            cargo tree -p rfw -e normal | tee /tmp/rfw-dependencies-legacy.txt
+            ring_versions="$(grep -oE '(^|[[:space:]])ring v[0-9]+\.[0-9]+\.[0-9]+' \
+              /tmp/rfw-dependencies-legacy.txt | sed 's/^[[:space:]]*//' | sort -u)"
+            [ "$ring_versions" = 'ring v0.17.12' ] || {
+              echo "patched legacy build resolved an unexpected ring: $ring_versions" >&2
+              exit 1
+            }
+          fi
 
       - name: Install bpf-linker
         run: |
