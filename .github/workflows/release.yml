@@ -242,6 +242,38 @@ jobs:
           fi
           cp target/${{ matrix.target }}/release/rfw "${{ matrix.asset }}"
 
+      - name: Map legacy SIGILL offset to a symbol
+        if: matrix.variant == 'legacy'
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          cargo --config 'profile.release.strip=false' \
+            --config 'target.x86_64-unknown-linux-musl.rustflags=["-C","target-cpu=x86-64"]' \
+            build --package rfw --release --target x86_64-unknown-linux-musl
+          python3 - <<'PY'
+          import subprocess
+
+          offset = 0x320017
+          output = subprocess.check_output(
+              ["nm", "-S", "-n", "--defined-only", "target/x86_64-unknown-linux-musl/release/rfw"],
+              text=True,
+          )
+          symbols = []
+          for line in output.splitlines():
+              fields = line.split()
+              if len(fields) == 4 and fields[2] in {"T", "t"}:
+                  address, size = int(fields[0], 16), int(fields[1], 16)
+                  symbols.append((address, size, fields[3]))
+          matches = [s for s in symbols if s[0] <= offset < s[0] + s[1]]
+          for address, size, name in matches:
+              print(f"SIGILL offset {offset:#x} is in {name} at {address:#x} (size {size:#x})")
+          if not matches:
+              preceding = [s for s in symbols if s[0] <= offset]
+              if preceding:
+                  address, size, name = max(preceding)
+                  print(f"No exact symbol range; nearest preceding symbol is {name} at {address:#x}")
+          PY
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
