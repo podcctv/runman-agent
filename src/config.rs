@@ -161,9 +161,8 @@ impl Config {
         if !(self.update_url.starts_with("https://") || self.update_url.starts_with("http://")) {
             bail!("update_url must be an http(s) URL");
         }
-        if !(self.image_base_url.starts_with("https://")
-            || self.image_base_url.starts_with("http://"))
-        {
+        let image_base_url = self.image_base_url.as_str();
+        if !(image_base_url.starts_with("https://") || image_base_url.starts_with("http://")) {
             bail!("image_base_url must be an http(s) URL");
         }
         if self.image_base_url.chars().any(char::is_whitespace) {
