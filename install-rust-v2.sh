@@ -1799,7 +1799,9 @@ log "installed $("$BIN" --version)"
 
 configure_image_base_url() {
     local key_count current="" stamp backup tmp current_normalized
-    [ -f "$CONFIG" ] && [ ! -L "$CONFIG" ] || die "configuration is not a regular file: $CONFIG"
+    if [ ! -f "$CONFIG" ] || [ -L "$CONFIG" ]; then
+        die "configuration is not a regular file: $CONFIG"
+    fi
     key_count=$(grep -Ec '^[[:space:]]*image_base_url[[:space:]]*=' "$CONFIG" || true)
     [ "$key_count" -le 1 ] || die "config.toml contains duplicate image_base_url keys"
     if [ "$key_count" = 1 ]; then
