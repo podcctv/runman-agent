@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use runman_agent::backend::{Instances, PortForwards};
-use runman_agent::config::{DEFAULT_IMAGE_BASE_URL, NetworkConfig};
+use runman_agent::config::NetworkConfig;
 use runman_agent::model::{ConsoleSize, ImageSettings, InstanceSpec, L4Proto, PortForward, VmId};
 use runman_agent::proto::VmStatus;
 use runman_agent::runtime::{Options, Runtime};
@@ -962,5 +962,7 @@ async fn concurrent_creates_get_distinct_slots() {
 /// Image source for tests: `RUNMAN_TEST_IMAGE_URL` (e.g. a local build) or the
 /// published images.
 fn image_url() -> String {
-    std::env::var("RUNMAN_TEST_IMAGE_URL").unwrap_or_else(|_| DEFAULT_IMAGE_BASE_URL.into())
+    std::env::var("RUNMAN_TEST_IMAGE_URL").unwrap_or_else(|_| {
+        "https://github.com/narwhal-cloud/runman-agent-rs/releases/download/images".into()
+    })
 }

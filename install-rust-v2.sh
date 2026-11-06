@@ -10,6 +10,11 @@ set -euo pipefail
 
 RELEASE_URL="${RUNMAN_RELEASE_URL:-https://github.com/podcctv/runman-agent/releases/download/continuous-rs}"
 RFW_URL="${RUNMAN_RFW_URL:-https://github.com/podcctv/runman-agent/releases/download/continuous}"
+DEFAULT_IMAGE_BASE_URL="https://alpine-incus-base.428048.xyz/runman"
+LEGACY_IMAGE_BASE_URL="https://github.com/narwhal-cloud/runman-agent-rs/releases/download/images"
+IMAGE_BASE_URL_EXPLICIT=0
+if [ "${RUNMAN_IMAGE_BASE_URL+x}" = x ]; then IMAGE_BASE_URL_EXPLICIT=1; fi
+IMAGE_BASE_URL="${RUNMAN_IMAGE_BASE_URL:-$DEFAULT_IMAGE_BASE_URL}"
 PLATFORM_URL="https://hosting.fuckip.me:443"
 CONFIG_DIR=/etc/runman-agent
 CONFIG="$CONFIG_DIR/config.toml"
@@ -1264,6 +1269,9 @@ usage() {
     cat <<'EOF'
 Usage: install.sh [options]
 
+  RUNMAN_IMAGE_BASE_URL=URL may override the default Rust image feed
+  (https://alpine-incus-base.428048.xyz/runman). Existing custom feeds are kept.
+
   --token TOKEN           Token issued by the platform. Without one the node runs
                           standalone: it never contacts the platform and is
                           managed entirely from its own panel
@@ -1322,6 +1330,15 @@ done
 # ── validation ──────────────────────────────────────────────────────────────
 
 [[ "$PLATFORM_URL" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?/?$ ]] || die "invalid --platform-url"
+case "$IMAGE_BASE_URL" in
+    http://*|https://*) ;;
+    *) die "RUNMAN_IMAGE_BASE_URL must start with http:// or https://" ;;
+esac
+[[ "$IMAGE_BASE_URL" != *[[:space:]]* ]] || die "RUNMAN_IMAGE_BASE_URL must not contain whitespace"
+case "$IMAGE_BASE_URL" in
+    *'"'*|*\\*) die "RUNMAN_IMAGE_BASE_URL must not contain quotes or backslashes" ;;
+esac
+IMAGE_BASE_URL="${IMAGE_BASE_URL%/}"
 [ -z "$WEB_LISTEN" ] || [[ "$WEB_LISTEN" =~ ^[0-9.]+:[0-9]{1,5}$|^\[[0-9a-fA-F:]+\]:[0-9]{1,5}$ ]] \
     || die "invalid --web-listen (expected ip:port)"
 [[ "$BANDWIDTH" =~ ^[0-9]{1,7}$ ]] || die "invalid --bandwidth"
@@ -1780,6 +1797,54 @@ log "installed $("$BIN" --version)"
 
 # ── configuration ───────────────────────────────────────────────────────────
 
+configure_image_base_url() {
+    local key_count current="" stamp backup tmp current_normalized
+    [ -f "$CONFIG" ] && [ ! -L "$CONFIG" ] || die "configuration is not a regular file: $CONFIG"
+    key_count=$(grep -Ec '^[[:space:]]*image_base_url[[:space:]]*=' "$CONFIG" || true)
+    [ "$key_count" -le 1 ] || die "config.toml contains duplicate image_base_url keys"
+    if [ "$key_count" = 1 ]; then
+        current=$(awk -F '"' '/^[[:space:]]*image_base_url[[:space:]]*=/ { if (NF < 3) exit 2; print $2; exit }' "$CONFIG") \
+            || die "cannot safely read image_base_url from config.toml"
+    fi
+
+    # Migrate only the prior built-in value or a missing key. Keep an
+    # operator's custom feed unless RUNMAN_IMAGE_BASE_URL was explicitly set.
+    current_normalized=$(printf '%s' "$current" | sed 's:/*$::')
+    if [ "$IMAGE_BASE_URL_EXPLICIT" = 0 ] && [ -n "$current" ] \
+        && [ "$current_normalized" != "$LEGACY_IMAGE_BASE_URL" ]; then
+        return 0
+    fi
+    [ "$current" != "$IMAGE_BASE_URL" ] || return 0
+
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    backup="$CONFIG.before-image-source.$stamp"
+    [ ! -e "$backup" ] || die "refusing to overwrite config backup: $backup"
+    cp -a -- "$CONFIG" "$backup"
+    chmod 600 "$backup"
+    tmp=$(mktemp "$CONFIG_DIR/.config.toml.runman-tmp.XXXXXXXX") \
+        || die "could not create a temporary config file"
+    if ! awk -v desired="$IMAGE_BASE_URL" '
+        BEGIN { updated = 0 }
+        /^[[:space:]]*image_base_url[[:space:]]*=/ {
+            if (!updated) { print "image_base_url = \"" desired "\""; updated = 1 }
+            next
+        }
+        !updated && /^[[:space:]]*\[/ {
+            print "image_base_url = \"" desired "\""
+            updated = 1
+        }
+        { print }
+        END { if (!updated) print "image_base_url = \"" desired "\"" }
+    ' "$CONFIG" > "$tmp"; then
+        rm -f -- "$tmp"
+        die "could not safely update image_base_url"
+    fi
+    chmod --reference="$CONFIG" "$tmp"
+    chown --reference="$CONFIG" "$tmp"
+    mv -f -- "$tmp" "$CONFIG"
+    log "updated image_base_url to $IMAGE_BASE_URL; prior config saved at $backup"
+}
+
 FRESH=0
 PASSWORD=""
 if [ "$MIGRATE_GO" = 1 ]; then
@@ -1806,6 +1871,7 @@ elif [ ! -f "$CONFIG" ]; then
 platform_url = "$PLATFORM_URL"
 data_dir = "$DATA_DIR"
 backend = "container"
+image_base_url = "$IMAGE_BASE_URL"
 web_listen = "$WEB_LISTEN"
 bandwidth_mbps = $BANDWIDTH
 rfw_addr = "$RFW_API"
@@ -1819,6 +1885,7 @@ EOF
 else
     log "keeping existing $CONFIG"
 fi
+configure_image_base_url || die "could not safely configure the Rust image feed"
 # Tokens are only ever issued by the platform; none means standalone mode.
 if [ -n "$TOKEN" ]; then
     "$BIN" --config "$CONFIG" set-token "$TOKEN" >/dev/null

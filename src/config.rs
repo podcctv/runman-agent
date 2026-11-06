@@ -14,7 +14,7 @@ pub const DEFAULT_MAX_FORWARDS: u32 = 20;
 /// Highest `max_forwards`: more than a host has ports to give.
 pub const MAX_FORWARDS_LIMIT: u32 = 65535;
 pub const DEFAULT_IMAGE_BASE_URL: &str =
-    "https://github.com/narwhal-cloud/runman-agent-rs/releases/download/images";
+    "https://alpine-incus-base.428048.xyz/runman";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -160,6 +160,14 @@ impl Config {
         }
         if !(self.update_url.starts_with("https://") || self.update_url.starts_with("http://")) {
             bail!("update_url must be an http(s) URL");
+        }
+        if !(self.image_base_url.starts_with("https://")
+            || self.image_base_url.starts_with("http://"))
+        {
+            bail!("image_base_url must be an http(s) URL");
+        }
+        if self.image_base_url.chars().any(char::is_whitespace) {
+            bail!("image_base_url must not contain whitespace");
         }
         if !(1..=28).contains(&self.traffic_reset_day) {
             bail!("traffic_reset_day must be 1-28");

@@ -776,7 +776,7 @@ def export(args):
         'virt_label = "container"',
         'data_dir = "/var/lib/runman-agent"',
         'backend = "container"',
-        'image_base_url = "https://github.com/narwhal-cloud/runman-agent-rs/releases/download/images"',
+        'image_base_url = "https://alpine-incus-base.428048.xyz/runman"',
         "tun = true",
         'traffic_reset_mode = "fixed"',
         f"traffic_reset_day = {day}",

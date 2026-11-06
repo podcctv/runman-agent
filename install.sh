@@ -451,6 +451,8 @@ Runman Agent installer
   bash install.sh --update-only           Back up and update Agent only; require an existing installation
   bash install.sh --migrate-rust-v2       Lossy clean rebuild from Go Podman/Incus to Rust v2
   bash install.sh --rust-update           Install/update Rust v2
+  RUNMAN_IMAGE_BASE_URL=URL bash install.sh --rust-update
+                                          Override the Rust container image feed
   bash install.sh --rust-status           Show Rust v2 service/version status
   bash install.sh --rust-restart-agent    Restart Rust Agent and installed RFW
   bash install.sh --rust-reset-panel-password

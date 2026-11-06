@@ -42,6 +42,7 @@ bash install.sh --token '<平台下发的 Token>'      # 接入平台
 | `--ipv6-prefix CIDR --ipv6-uplink IFACE` | 手工指定 `subnet` 前缀 |
 | `--bandwidth MBPS` | 修正上报给平台的带宽（默认上报测速结果，见下文） |
 | `--no-rfw` / `--rfw-iface IFACE` | 不安装 rfw / 指定 rfw 保护的网卡 |
+| `RUNMAN_IMAGE_BASE_URL=URL` | 安装/升级时覆盖默认 Runman feed；已有的自定义地址会保留 |
 
 - **升级**：重新运行 `install.sh` 即可，配置保持不变；默认也会自动更新。
 - **卸载**：`bash install.sh --uninstall`（节点上还有实例时拒绝执行）；`--uninstall --purge` 会连同全部实例和数据一起删除。
@@ -73,9 +74,28 @@ Rust v2 源码现已合入 `main`。Rust 代码更新会发布到独立的 `cont
 
 ## 实例镜像
 
-官方镜像由本仓库自己构建，不依赖其他仓库或第三方现成镜像：`images/build.sh` 直接从 Debian 官方源（mmdebstrap，最小安装、不带推荐包和文档）和 Alpine 官方 minirootfs 构建根文件系统。`.github/workflows/images.yml` 每周一（以及 `images/` 有改动时）构建 amd64 和 arm64，生成 `images.json` 清单，发布到滚动更新的 `images` Release。
+默认镜像源为 `https://alpine-incus-base.428048.xyz/runman`。它由本项目配套的
+`alpine-base` 镜像站发布，供 Rust v2 新装、Go→Rust 迁移和后续新实例使用。该路径提供
+Runman feed：`images.json` 和带版本号的 `rootfs-alpine-<arch>-<serial>.tar.zst`；Incus
+使用的 `streams/v1` / `rootfs.squashfs` 继续保留，两种格式共存。不要把 Incus 的
+`streams/v1` 子目录直接配置为 `image_base_url`。
 
-节点启动时以及每 6 小时同步一次：校验每个文件的大小和 SHA-256，有新版本就下载并作为新实例的默认版本；已有实例继续使用它们创建时的版本，没有实例使用的旧版本会被自动删除。
+Runman 节点启动时和每 6 小时同步一次镜像。每个镜像校验文件大小与 SHA-256；清单中的
+`serial` 每次 rootfs 内容变化都必须变化。新实例使用同步到节点的最新 Alpine 版本，已有
+实例仍使用创建时的 rootfs。面板当前不提供镜像源编辑入口；重装或升级时可通过环境变量覆盖：
+
+```bash
+export RUNMAN_IMAGE_BASE_URL=https://mirror.example.com/runman
+bash install.sh
+```
+
+安装器会把旧的内置 GitHub 镜像源迁移到当前默认源，保留已配置的其他自定义源；迁移前会将
+原配置备份为 `config.toml.before-image-source.<UTC时间>`。显式设置
+`RUNMAN_IMAGE_BASE_URL` 时，该值优先应用。配置修改后 Agent 重启并立即同步。
+
+默认 Runman feed 由配套 `alpine-base` 发布流水线从经过 OpenSSH 版本门禁的 Alpine rootfs 生成，支持 amd64 和 arm64；默认 feed 只发布 Alpine，Debian 不会出现在新装节点的镜像列表中。Rust 仓库里的 `images/build.sh` 和 `.github/workflows/images.yml` 仍保留，可生成包含 Alpine 与 Debian 的通用 Runman feed；需要时可用 `RUNMAN_IMAGE_BASE_URL` 将节点指向该 feed。
+
+通用 feed 中的 Debian / Alpine 镜像包大小如下；默认自建 feed 目前只发布 Alpine：
 
 | 镜像 | 压缩包 | 解压后 | 128 MB 实例开机后的内存 |
 |---|---|---|---|
