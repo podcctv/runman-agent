@@ -196,6 +196,23 @@ pub fn prepare(root: &RootFs, cfg: &FirstBoot<'_>) -> Result<()> {
 const NETWORKD_FILE: &str = "/etc/systemd/network/05-runman-eth0.network";
 const NET_SCRIPT: &str = "/usr/local/sbin/runman-network";
 const NET_UNIT_PATH: &str = "/etc/systemd/system/runman-network.service";
+const OPENRC_NET_SERVICE_PATH: &str = "/etc/init.d/runman-network";
+const OPENRC_NET_SERVICE: &str = r##"#!/sbin/openrc-run
+description="Configure the static instance network"
+
+depend() {
+    need localmount
+    before networking
+}
+
+start() {
+    ebegin "Configuring static instance network"
+    /usr/local/sbin/runman-network
+    eend $?
+}
+"##;
+const MANAGED_INTERFACES: &str =
+    "# Runman configures loopback and eth0 with /usr/local/sbin/runman-network.\n";
 const NET_UNIT: &str = "[Unit]
 Description=Instance network (static, managed by runman)
 DefaultDependencies=no
@@ -244,7 +261,7 @@ fn net_script(n: &NetFiles) -> String {
     f
 }
 
-/// systemd-networkd when the image uses it, ifupdown otherwise (Alpine).
+/// systemd-networkd for systemd guests, or a Runman OpenRC service for Alpine.
 pub fn write_network(root: &RootFs, n: &NetFiles) -> Result<()> {
     if root.exists("/etc/systemd/system") {
         // A oneshot unit applies a static configuration with `ip` and exits:
@@ -265,10 +282,23 @@ pub fn write_network(root: &RootFs, n: &NetFiles) -> Result<()> {
         // the DNS servers directly (replaces the stub-resolver symlink).
         root.write("/etc/resolv.conf", resolv_conf(n).as_bytes(), 0o644)?;
     } else {
+        root.mkdir_all("/usr/local/sbin")?;
+        root.write(NET_SCRIPT, net_script(n).as_bytes(), 0o755)?;
+        root.mkdir_all("/etc/init.d")?;
+        root.write(
+            OPENRC_NET_SERVICE_PATH,
+            OPENRC_NET_SERVICE.as_bytes(),
+            0o755,
+        )?;
+        root.mkdir_all("/etc/runlevels/boot")?;
+        root.symlink(
+            "/etc/runlevels/boot/runman-network",
+            OPENRC_NET_SERVICE_PATH,
+        )?;
         root.mkdir_all("/etc/network")?;
         root.write(
             "/etc/network/interfaces",
-            interfaces_file(n).as_bytes(),
+            MANAGED_INTERFACES.as_bytes(),
             0o644,
         )?;
         root.write("/etc/resolv.conf", resolv_conf(n).as_bytes(), 0o644)?;
@@ -277,7 +307,7 @@ pub fn write_network(root: &RootFs, n: &NetFiles) -> Result<()> {
 }
 
 /// Shell script (for `sh -s` inside a running instance) that installs the
-/// same configuration and makes the network manager apply it now.
+/// same configuration and applies it immediately.
 pub fn network_update_script(n: &NetFiles) -> String {
     format!(
         "set -e\n\
@@ -293,14 +323,23 @@ pub fn network_update_script(n: &NetFiles) -> String {
          networkctl reload\n\
          networkctl reconfigure eth0\n\
          else\n\
+         mkdir -p /usr/local/sbin /etc/init.d /etc/runlevels/boot /etc/network\n\
+         cat > {NET_SCRIPT}.tmp <<'RUNMAN_EOF'\n{}RUNMAN_EOF\n\
+         chmod 755 {NET_SCRIPT}.tmp\n\
+         mv {NET_SCRIPT}.tmp {NET_SCRIPT}\n\
+         cat > {OPENRC_NET_SERVICE_PATH}.tmp <<'RUNMAN_EOF'\n{}RUNMAN_EOF\n\
+         chmod 755 {OPENRC_NET_SERVICE_PATH}.tmp\n\
+         mv {OPENRC_NET_SERVICE_PATH}.tmp {OPENRC_NET_SERVICE_PATH}\n\
+         ln -sf {OPENRC_NET_SERVICE_PATH} /etc/runlevels/boot/runman-network\n\
          cat > /etc/network/interfaces.tmp <<'RUNMAN_EOF'\n{}RUNMAN_EOF\n\
          mv /etc/network/interfaces.tmp /etc/network/interfaces\n\
-         ifdown -f eth0 >/dev/null 2>&1 || true\n\
-         ifup eth0\n\
+         {NET_SCRIPT}\n\
          fi\n",
         net_script(n),
         networkd_file(n),
-        interfaces_file(n)
+        net_script(n),
+        OPENRC_NET_SERVICE,
+        MANAGED_INTERFACES
     )
 }
 
@@ -348,39 +387,6 @@ fn networkd_file(n: &NetFiles) -> String {
         if let Some(src) = x6.first() {
             f.push_str(&format!("PreferredSource={src}\n"));
         }
-    }
-    f
-}
-
-fn interfaces_file(n: &NetFiles) -> String {
-    let (x4, x6) = split_extra(n);
-    let mut f = format!(
-        "auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet static\n\taddress {}/{}\n",
-        n.ipv4, n.prefix4
-    );
-    for a in &x4 {
-        f.push_str(&format!("\taddress {a}/32\n"));
-    }
-    match x4.first() {
-        Some(src) => f.push_str(&format!(
-            "\tpost-up ip route replace default via {} dev eth0 src {src}\n",
-            n.gateway4
-        )),
-        None => f.push_str(&format!("\tgateway {}\n", n.gateway4)),
-    }
-    let v6: Vec<_> = n.ipv6.iter().chain(&x6).collect();
-    if let Some((first, rest)) = v6.split_first() {
-        f.push_str(&format!(
-            "\niface eth0 inet6 static\n\taddress {first}/128\n"
-        ));
-        for a in rest {
-            f.push_str(&format!("\taddress {a}/128\n"));
-        }
-        let src = x6.first().map(|s| format!(" src {s}")).unwrap_or_default();
-        f.push_str(&format!(
-            "\tpost-up ip -6 route replace default via {} dev eth0{src}\n",
-            n.gateway6
-        ));
     }
     f
 }

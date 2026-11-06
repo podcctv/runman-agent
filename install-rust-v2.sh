@@ -2203,10 +2203,10 @@ PY
                     route_recovery_attempted=1
                     if [[ "$guest_pid" =~ ^[0-9]+$ ]] \
                         && [ -r "/proc/$guest_pid/ns/net" ]; then
-                        log "migrated guest $vm_id has no default route after 10s; retrying its Alpine static network configuration once"
+                        log "migrated guest $vm_id has no default route after 10s; retrying Runman's direct Alpine network configuration once"
                         if route_recovery_output=$(nsenter --target "$guest_pid" --mount --net \
                             --root --wd=/ -- /bin/sh -c \
-                            'command -v ifup >/dev/null 2>&1 || { echo "ifup is unavailable"; exit 127; }; exec ifup -f eth0' \
+                            '[ -x /usr/local/sbin/runman-network ] || { echo "Runman network script is unavailable"; exit 127; }; exec /usr/local/sbin/runman-network' \
                             2>&1); then
                             route_recovery_status=0
                             log "migrated guest $vm_id static network configuration was reapplied"
