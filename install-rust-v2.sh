@@ -2096,8 +2096,35 @@ PY
         sleep 1
     done
     [ "$health_ok" = 1 ] || die "Rust migration inventory or port-forward verification failed"
+    migration_live_guest_pid() {
+        local vm_id="$1" inventory
+        inventory=$(curl --silent --fail --max-time 2 \
+            --unix-socket /run/narwhal-agent/connlimit.sock \
+            http://localhost/v1/inventory 2>/dev/null) || return 1
+        printf '%s' "$inventory" | python3 -c '
+import json, sys
+
+vm_id = sys.argv[1]
+try:
+    inventory = json.load(sys.stdin)
+except (TypeError, ValueError):
+    raise SystemExit(1)
+if not isinstance(inventory, dict) or not isinstance(inventory.get("items"), list):
+    raise SystemExit(1)
+matches = [item for item in inventory["items"]
+           if isinstance(item, dict) and item.get("id") == vm_id and item.get("running") is True]
+if len(matches) != 1:
+    raise SystemExit(1)
+pid = matches[0].get("init_pid")
+if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+    raise SystemExit(1)
+print(pid)
+' "$vm_id"
+    }
+
     if [ -s "$network_targets" ]; then
         dns_probe="$MIGRATION_DIR/dns-probe.py"
+        network_route_wait_seconds=90
         cat > "$dns_probe" <<'PY'
 import ipaddress
 import secrets
@@ -2127,36 +2154,120 @@ PY
             if [ -z "$vm_id" ] || ! [[ "$guest_pid" =~ ^[0-9]+$ ]]; then
                 die "Rust migration network inventory is invalid; Go rollback will run"
             fi
-            [ -r "/proc/$guest_pid/ns/net" ] \
-                || die "migrated guest $vm_id has no live network namespace; Go rollback will run"
-            resolv_conf="/proc/$guest_pid/root/etc/resolv.conf"
-            [ -r "$resolv_conf" ] \
-                || die "migrated guest $vm_id has no readable /etc/resolv.conf; Go rollback will run"
             log "checking route, configured DNS, and IPv4 HTTPS for migrated guest $vm_id"
             route_ok=0
-            for _ in $(seq 1 20); do
-                host_route=$(ip -4 route get "$guest_ipv4" 2>/dev/null || true)
-                guest_route=$(nsenter --target "$guest_pid" --net -- ip -4 route get 1.1.1.1 2>/dev/null || true)
-                if [[ " $host_route " == *" dev rmbr0 "* \
-                    && " $guest_route " == *" via "* && " $guest_route " == *" dev eth0 "* ]]; then
-                    if [ "$migration_ipv6_mode" = none ]; then
-                        route_ok=1
-                    elif [ -n "$guest_ipv6" ]; then
-                        host_route6=$(ip -6 route get "$guest_ipv6" 2>/dev/null || true)
-                        guest_route6=$(nsenter --target "$guest_pid" --net -- \
-                            ip -6 route get 2606:4700:4700::1111 2>/dev/null || true)
-                        if [[ " $host_route6 " == *" dev rmbr0 "* \
-                            && " $guest_route6 " == *" via "* \
-                            && " $guest_route6 " == *" dev eth0 "* ]]; then
-                            route_ok=1
-                        fi
+            route_attempt=0
+            route_recovery_attempted=0
+            route_recovery_status="not-attempted"
+            route_recovery_output=""
+            host_route=""
+            guest_route=""
+            host_route6=""
+            guest_route6=""
+            while [ "$route_attempt" -lt "$network_route_wait_seconds" ]; do
+                route_attempt=$((route_attempt + 1))
+                if [ "$route_attempt" = 1 ] \
+                    || [ "$((route_attempt % 5))" = 0 ] \
+                    || [ ! -r "/proc/$guest_pid/ns/net" ]; then
+                    refreshed_guest_pid=$(migration_live_guest_pid "$vm_id" 2>/dev/null || true)
+                    if [[ "$refreshed_guest_pid" =~ ^[0-9]+$ ]] \
+                        && [ -r "/proc/$refreshed_guest_pid/ns/net" ]; then
+                        guest_pid="$refreshed_guest_pid"
                     fi
-                    if [ "$route_ok" = 1 ]; then break; fi
+                fi
+
+                if [[ "$guest_pid" =~ ^[0-9]+$ ]] && [ -r "/proc/$guest_pid/ns/net" ]; then
+                    host_route=$(ip -4 route get "$guest_ipv4" 2>&1 || true)
+                    guest_route=$(nsenter --target "$guest_pid" --net -- \
+                        ip -4 route get 1.1.1.1 2>&1 || true)
+                    if [[ " $host_route " == *" dev rmbr0 "* \
+                        && " $guest_route " == *" via "* && " $guest_route " == *" dev eth0 "* ]]; then
+                        if [ "$migration_ipv6_mode" = none ]; then
+                            route_ok=1
+                        elif [ -n "$guest_ipv6" ]; then
+                            host_route6=$(ip -6 route get "$guest_ipv6" 2>&1 || true)
+                            guest_route6=$(nsenter --target "$guest_pid" --net -- \
+                                ip -6 route get 2606:4700:4700::1111 2>&1 || true)
+                            if [[ " $host_route6 " == *" dev rmbr0 "* \
+                                && " $guest_route6 " == *" via "* \
+                                && " $guest_route6 " == *" dev eth0 "* ]]; then
+                                route_ok=1
+                            fi
+                        fi
+                        if [ "$route_ok" = 1 ]; then break; fi
+                    fi
+                else
+                    guest_route="current guest network namespace unavailable"
+                fi
+                if [ "$route_attempt" -eq 10 ] && [ "$route_ok" != 1 ]; then
+                    route_recovery_attempted=1
+                    if [[ "$guest_pid" =~ ^[0-9]+$ ]] \
+                        && [ -r "/proc/$guest_pid/ns/net" ]; then
+                        log "migrated guest $vm_id has no default route after 10s; retrying its Alpine static network configuration once"
+                        if route_recovery_output=$(nsenter --target "$guest_pid" --mount --net \
+                            --root --wd=/ -- /bin/sh -c \
+                            'command -v ifup >/dev/null 2>&1 || { echo "ifup is unavailable"; exit 127; }; exec ifup -f eth0' \
+                            2>&1); then
+                            route_recovery_status=0
+                            log "migrated guest $vm_id static network configuration was reapplied"
+                        else
+                            route_recovery_status=$?
+                            warn "migrated guest $vm_id could not reapply its static network configuration (status $route_recovery_status)"
+                        fi
+                    else
+                        route_recovery_status="no-live-guest-namespace"
+                        route_recovery_output="current guest network namespace unavailable"
+                    fi
                 fi
                 sleep 1
             done
-            [ "$route_ok" = 1 ] \
-                || die "migrated guest $vm_id does not route through rmbr0/eth0 (host: ${host_route:-missing}; guest: ${guest_route:-missing}; IPv6 host: ${host_route6:-skipped}; IPv6 guest: ${guest_route6:-skipped}); Go rollback will run"
+            if [ "$route_ok" != 1 ]; then
+                route_diagnostic="$MIGRATION_DIR/network-failure-$vm_id.txt"
+                (
+                    umask 077
+                    {
+                        printf 'vm_id=%s\ninit_pid=%s\nipv4=%s\nipv6=%s\n' \
+                            "$vm_id" "${guest_pid:-missing}" "$guest_ipv4" "${guest_ipv6:-none}"
+                        printf 'host_ipv4_route=%s\nguest_ipv4_route=%s\n' \
+                            "${host_route:-missing}" "${guest_route:-missing}"
+                        printf 'host_ipv6_route=%s\nguest_ipv6_route=%s\n' \
+                            "${host_route6:-skipped}" "${guest_route6:-skipped}"
+                        printf 'network_recovery_attempted=%s\nnetwork_recovery_status=%s\n' \
+                            "$route_recovery_attempted" "$route_recovery_status"
+                        if [ -n "$route_recovery_output" ]; then
+                            printf '\n--- static network recovery output ---\n%s\n' "$route_recovery_output"
+                        fi
+                        if [[ "$guest_pid" =~ ^[0-9]+$ ]] && [ -r "/proc/$guest_pid/ns/net" ]; then
+                            printf '\n--- guest eth0 link ---\n'
+                            nsenter --target "$guest_pid" --net -- ip -o link show dev eth0 2>&1 || true
+                            printf '\n--- guest IPv4 addresses ---\n'
+                            nsenter --target "$guest_pid" --net -- ip -o -4 address show dev eth0 2>&1 || true
+                            printf '\n--- guest IPv4 routes ---\n'
+                            nsenter --target "$guest_pid" --net -- ip -4 route show table all 2>&1 || true
+                            printf '\n--- guest IPv6 routes ---\n'
+                            nsenter --target "$guest_pid" --net -- ip -6 route show table all 2>&1 || true
+                            if [ -r "/proc/$guest_pid/root/etc/network/interfaces" ]; then
+                                printf '\n--- /etc/network/interfaces ---\n'
+                                sed -n '1,120p' "/proc/$guest_pid/root/etc/network/interfaces" || true
+                            fi
+                        else
+                            printf '\nNo live guest network namespace was available for further inspection.\n'
+                        fi
+                    } > "$route_diagnostic"
+                ) || true
+                chmod 600 "$route_diagnostic" 2>/dev/null || true
+                warn "migrated guest $vm_id route diagnostics saved at $route_diagnostic"
+                die "migrated guest $vm_id did not acquire the required route through rmbr0/eth0 within ${network_route_wait_seconds}s; Go rollback will run"
+            fi
+
+            refreshed_guest_pid=$(migration_live_guest_pid "$vm_id" 2>/dev/null || true)
+            if [[ "$refreshed_guest_pid" =~ ^[0-9]+$ ]] \
+                && [ -r "/proc/$refreshed_guest_pid/ns/net" ]; then
+                guest_pid="$refreshed_guest_pid"
+            fi
+            resolv_conf="/proc/$guest_pid/root/etc/resolv.conf"
+            [ -r "$resolv_conf" ] \
+                || die "migrated guest $vm_id has no readable /etc/resolv.conf; Go rollback will run"
 
             guest_dns_servers=$(awk '$1 == "nameserver" && NF >= 2 {print $2}' "$resolv_conf" | awk '!seen[$0]++')
             [ -n "$guest_dns_servers" ] \
