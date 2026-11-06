@@ -13,8 +13,7 @@ pub const DEFAULT_UPDATE_URL: &str =
 pub const DEFAULT_MAX_FORWARDS: u32 = 20;
 /// Highest `max_forwards`: more than a host has ports to give.
 pub const MAX_FORWARDS_LIMIT: u32 = 65535;
-pub const DEFAULT_IMAGE_BASE_URL: &str =
-    "https://alpine-incus-base.428048.xyz/runman";
+pub const DEFAULT_IMAGE_BASE_URL: &str = "https://alpine-incus-base.428048.xyz/runman";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
