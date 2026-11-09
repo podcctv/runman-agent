@@ -57,7 +57,10 @@ pub fn run(filesystem_dir: &Path) -> Result<()> {
         sys::umount_if_mounted(&target).context("unmount idmapped probe")?;
     }
     result?;
-    println!("idmapped bind-mount probe passed on {}", filesystem_dir.display());
+    println!(
+        "idmapped bind-mount probe passed on {}",
+        filesystem_dir.display()
+    );
     Ok(())
 }
 
@@ -83,10 +86,8 @@ fn probe_mount(source: &Path, target: &Path) -> Result<()> {
                 );
 
                 let map = format!("0 {ID_BASE} {ID_RANGE}\n");
-                fs::write(format!("/proc/{child}/uid_map"), &map)
-                    .context("write probe uid_map")?;
-                fs::write(format!("/proc/{child}/gid_map"), &map)
-                    .context("write probe gid_map")?;
+                fs::write(format!("/proc/{child}/uid_map"), &map).context("write probe uid_map")?;
+                fs::write(format!("/proc/{child}/gid_map"), &map).context("write probe gid_map")?;
                 let userns = File::open(format!("/proc/{child}/ns/user"))
                     .context("open probe user namespace")?;
                 sys::idmapped_bind(source, target, &userns)
@@ -94,9 +95,8 @@ fn probe_mount(source: &Path, target: &Path) -> Result<()> {
                 Ok(())
             })();
 
-            if result.is_ok() && release.write_all(b"X").is_ok() {
-                // The child is released and will be reaped below.
-            } else {
+            let released = result.is_ok() && release.write_all(b"X").is_ok();
+            if !released {
                 let _ = kill(child, Signal::SIGKILL);
             }
             let _ = waitpid(child, None);
