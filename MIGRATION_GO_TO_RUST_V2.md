@@ -51,6 +51,17 @@ empty manifest only when both Go instance tables and the complete Podman/Incus
 inventory are empty; if containers exist without database records, it refuses
 to proceed because their ownership cannot be proven.
 
+Before migration, the installer probes idmapped-mount support on the filesystem
+that will hold Rust data. If `/var/lib/runman-agent` resolves to **ext3**, and
+`/data` is already mounted as XFS and configured in `/etc/fstab`, the installer
+offers to bind `/data/runman-agent` onto `/var/lib/runman-agent` after the typed
+migration confirmation. It backs up `/etc/fstab` before adding the persistent
+bind entry. Other filesystems do not trigger this fallback or any `/data`/fstab
+changes. The `/data` capacity becomes the effective Rust data limit; check it
+before migrating, especially when `/data` is a small loop-backed filesystem.
+`--uninstall --purge` removes this managed bind entry and its data; a regular
+uninstall retains both.
+
 If `port_forwards` contains a rule whose UUID has no `vm_configs` row, the
 installer lists the VM UUID and host-to-guest ports and requires the operator
 to type `EXCLUDE STALE GO PORT FORWARDS`. The rule is omitted from the Rust

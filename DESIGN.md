@@ -69,7 +69,7 @@ rfw (独立进程, 127.0.0.1:7734)   eBPF/XDP 防火墙，由 agent 安装与反
 **磁盘与 30 s 约束**（已实现，创建实测约 0.25 s）
 - 镜像由本仓库的 `images/build.sh` 从发行版官方源构建（Debian 用 mmdebstrap 最小安装，Alpine 用 minirootfs 加 apk），由 `images.yml` 每周发布到 `images` Release。节点按 `images.json` 清单同步，校验大小和 SHA-256 后解压到 `images/<id>/<serial>/rootfs`，**保持原始属主**，所有实例共用、只读。已有实例保留它们创建时的版本，无人使用的旧版本自动删除。
 - 每个实例一个稀疏 ext4 文件 `disk.img`（`mkfs.ext4 -E lazy_itable_init` 不到 0.1 s），放 overlay 的 upper/work，容量就是套餐磁盘大小，容器里 `df` 显示正确，不依赖宿主机是 XFS。
-- supervisor 对**镜像层和磁盘层分别**做 idmapped bind，再由容器在自己的 user namespace 里挂 overlay（`userxattr`）。承载 Runman 数据目录的宿主机文件系统必须支持 idmapped mounts。Go 迁移会在停止 Go 服务前，用实际的 `open_tree`、`mount_setattr(MOUNT_ATTR_IDMAP)` 和 `move_mount` 流程探测该文件系统；失败时保留 Go 服务和实例并报告存储信息。磁盘上的文件始终是未偏移的属主，宿主机离线编辑无需换算。
+- supervisor 对**镜像层和磁盘层分别**做 idmapped bind，再由容器在自己的 user namespace 里挂 overlay（`userxattr`）。承载 Runman 数据目录的宿主机文件系统必须支持 idmapped mounts。Go 迁移会在停止 Go 服务前，用实际的 `open_tree`、`mount_setattr(MOUNT_ATTR_IDMAP)` 和 `move_mount` 流程探测该文件系统；失败时保留 Go 服务和实例并报告存储信息。仅当 Go 迁移检测到 `/var/lib/runman-agent` 位于 ext3，且 `/data` 已持久挂载为 XFS 时，才会在用户确认迁移后将 `/data/runman-agent` 绑定到 Rust 数据目录；其他文件系统不触发此回退。磁盘上的文件始终是未偏移的属主，宿主机离线编辑无需换算。
 - 首次启动前由 agent 离线挂载 rootfs，写入主机名、root 密码哈希，清空 machine-id，删除镜像自带的 SSH host key（首启时重新生成），屏蔽容器里无法工作的 `sys-kernel-*.mount` 等单元，并禁用 cloud-init。所有写入都经 `openat2(RESOLVE_IN_ROOT)`，容器内的符号链接无法把宿主机 root 的写操作引到外面。
 - 重装 = 删除实例后按新命令重新创建。
 

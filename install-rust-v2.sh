@@ -19,6 +19,10 @@ PLATFORM_URL="https://hosting.fuckip.me:443"
 CONFIG_DIR=/etc/runman-agent
 CONFIG="$CONFIG_DIR/config.toml"
 DATA_DIR=/var/lib/runman-agent
+EXT3_DATA_DIR_SOURCE=/data/runman-agent
+EXT3_DATA_DIR_FSTAB_ENTRY="$EXT3_DATA_DIR_SOURCE $DATA_DIR none bind,x-systemd.requires-mounts-for=/data 0 0"
+MIGRATION_EXT3_DATA_DIR_FALLBACK=0
+MIGRATION_EXT3_DATA_FSTAB_BACKUP=""
 BIN=/usr/local/bin/runman-agent
 RFW_BIN=/usr/local/bin/rfw
 RFW_DIR=/var/lib/rfw
@@ -542,6 +546,223 @@ migration_export_go_state() {
         --error-state-overrides "$MIGRATION_DIR/error-state-overrides.json" \
         --orphan-core-exclusions "$MIGRATION_DIR/orphan-core-exclusions.json" \
         --orphan-port-forward-exclusions "$MIGRATION_DIR/orphan-port-forward-exclusions.json"
+}
+
+migration_fstab_has_mountpoint() {
+    local mountpoint=$1
+    [ -f /etc/fstab ] && [ ! -L /etc/fstab ] || return 1
+    awk -v wanted="$mountpoint" '
+        /^[[:space:]]*#/ { next }
+        NF >= 2 && $2 == wanted { found = 1 }
+        END { exit !found }
+    ' /etc/fstab
+}
+
+migration_fstab_mountpoint_count() {
+    local mountpoint=$1
+    [ -f /etc/fstab ] && [ ! -L /etc/fstab ] || return 1
+    awk -v wanted="$mountpoint" '
+        /^[[:space:]]*#/ { next }
+        NF >= 2 && $2 == wanted { count++ }
+        END { print count + 0 }
+    ' /etc/fstab
+}
+
+migration_ext3_data_fallback_configured() {
+    [ -f /etc/fstab ] && [ ! -L /etc/fstab ] \
+        && [ "$(grep -Fxc -- "$EXT3_DATA_DIR_FSTAB_ENTRY" /etc/fstab || true)" = 1 ] \
+        && [ "$(migration_fstab_mountpoint_count "$DATA_DIR")" = 1 ]
+}
+
+migration_ext3_data_fallback_active() {
+    local data_target data_fstype target target_fstype
+    migration_ext3_data_fallback_configured || return 1
+    [ "$(migration_fstab_mountpoint_count /data)" = 1 ] || return 1
+    data_target=$(findmnt -n -M /data -o TARGET 2>/dev/null || true)
+    data_fstype=$(findmnt -n -M /data -o FSTYPE 2>/dev/null || true)
+    [ "$data_target" = /data ] && [ "$data_fstype" = xfs ] || return 1
+    target=$(findmnt -n -M "$DATA_DIR" -o TARGET 2>/dev/null || true)
+    target_fstype=$(findmnt -n -M "$DATA_DIR" -o FSTYPE 2>/dev/null || true)
+    [ "$target" = "$DATA_DIR" ] && [ "$target_fstype" = xfs ]
+}
+
+migration_data_dir_fstype() {
+    local probe="$DATA_DIR" fstype
+    while [ ! -e "$probe" ] && [ "$probe" != / ]; do probe=$(dirname -- "$probe"); done
+    fstype=$(findmnt -n -T "$probe" -o FSTYPE 2>/dev/null || true)
+    printf '%s\n' "$fstype"
+}
+
+migration_data_dir_is_empty_ext3_directory() {
+    local first_child
+    [ -d "$DATA_DIR" ] && [ ! -L "$DATA_DIR" ] || return 1
+    [ "$(migration_data_dir_fstype)" = ext3 ] || return 1
+    first_child=$(find "$DATA_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null) || return 1
+    [ -z "$first_child" ]
+}
+
+migration_write_fstab_with_ext3_data_fallback() {
+    local backup tmp
+    backup=$(mktemp /etc/fstab.runman-backup.XXXXXXXX) || die "could not create an /etc/fstab backup"
+    cp -a -- /etc/fstab "$backup" || die "could not back up /etc/fstab"
+    tmp=$(mktemp /etc/.fstab.runman-tmp.XXXXXXXX) || die "could not create a temporary /etc/fstab"
+    if ! cat /etc/fstab > "$tmp" || ! printf '\n%s\n' "$EXT3_DATA_DIR_FSTAB_ENTRY" >> "$tmp"; then
+        rm -f -- "$tmp"
+        die "could not prepare the persistent ext3 data-directory fallback mount"
+    fi
+    chmod --reference=/etc/fstab "$tmp" || die "could not preserve /etc/fstab permissions"
+    chown --reference=/etc/fstab "$tmp" || die "could not preserve /etc/fstab ownership"
+    mv -f -- "$tmp" /etc/fstab || die "could not install the persistent ext3 data-directory fallback mount"
+    MIGRATION_EXT3_DATA_FSTAB_BACKUP=$backup
+}
+
+migration_prepare_ext3_data_dir_fallback() {
+    local current_fstype configured=0 data_target data_fstype mounted_target source_target source_fstype source_probe
+    [ "$MIGRATE_GO" = 1 ] || return 0
+    if migration_ext3_data_fallback_configured; then configured=1; fi
+    current_fstype=$(migration_data_dir_fstype)
+
+    if [ "$configured" != 1 ] && [ "$current_fstype" != ext3 ]; then
+        return 0
+    fi
+    if migration_ext3_data_fallback_active; then
+        MIGRATION_EXT3_DATA_DIR_FALLBACK=1
+        log "using the existing persistent XFS bind mount at $DATA_DIR"
+        return 0
+    fi
+    [ "$current_fstype" = ext3 ] \
+        || die "the managed XFS fallback is configured but inactive and $DATA_DIR is not on ext3; refusing to change storage"
+    [ -L "$DATA_DIR" ] && die "refusing the ext3 fallback because $DATA_DIR is a symlink"
+    [ -L "$EXT3_DATA_DIR_SOURCE" ] && die "refusing the ext3 fallback because $EXT3_DATA_DIR_SOURCE is a symlink"
+    [ ! -e "$DATA_DIR" ] || [ -d "$DATA_DIR" ] \
+        || die "refusing the ext3 fallback because $DATA_DIR is not a directory"
+    [ ! -e "$EXT3_DATA_DIR_SOURCE" ] || [ -d "$EXT3_DATA_DIR_SOURCE" ] \
+        || die "refusing the ext3 fallback because $EXT3_DATA_DIR_SOURCE is not a directory"
+
+    mounted_target=$(findmnt -n -M "$DATA_DIR" -o TARGET 2>/dev/null || true)
+    [ -z "$mounted_target" ] \
+        || die "$DATA_DIR is already mounted but is not the configured XFS fallback; refusing to replace it"
+    if [ -d "$DATA_DIR" ]; then
+        migration_data_dir_is_empty_ext3_directory \
+            || die "refusing the ext3 fallback because $DATA_DIR is not an empty ext3 directory"
+    fi
+    if [ "$configured" != 1 ] && [ -d "$EXT3_DATA_DIR_SOURCE" ]; then
+        local first_child
+        first_child=$(find "$EXT3_DATA_DIR_SOURCE" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null) \
+            || die "could not inspect $EXT3_DATA_DIR_SOURCE before configuring the ext3 fallback"
+        [ -z "$first_child" ] \
+            || die "refusing the ext3 fallback because $EXT3_DATA_DIR_SOURCE already contains data"
+    fi
+    if [ "$configured" != 1 ]; then
+        migration_fstab_has_mountpoint "$DATA_DIR" \
+            && die "an existing /etc/fstab entry already targets $DATA_DIR; refusing to replace it"
+    fi
+
+    data_target=$(findmnt -n -M /data -o TARGET 2>/dev/null || true)
+    data_fstype=$(findmnt -n -M /data -o FSTYPE 2>/dev/null || true)
+    [ "$data_target" = /data ] \
+        || die "the Rust data path is on ext3 and no persistent /data mount is active; Go remains active"
+    [ "$data_fstype" = xfs ] \
+        || die "the Rust data path is on ext3, but /data is ${data_fstype:-not mounted} rather than XFS; Go remains active"
+    [ "$(migration_fstab_mountpoint_count /data)" = 1 ] \
+        || die "the Rust data path is on ext3, but /data is not configured in /etc/fstab; Go remains active"
+    source_target=$(findmnt -n -M "$EXT3_DATA_DIR_SOURCE" -o TARGET 2>/dev/null || true)
+    [ -z "$source_target" ] \
+        || die "$EXT3_DATA_DIR_SOURCE is already a mountpoint; refusing to use it as the XFS data source"
+    source_probe=/data
+    if [ -d "$EXT3_DATA_DIR_SOURCE" ]; then source_probe=$EXT3_DATA_DIR_SOURCE; fi
+    source_fstype=$(findmnt -n -T "$source_probe" -o FSTYPE 2>/dev/null || true)
+    [ "$source_fstype" = xfs ] \
+        || die "$EXT3_DATA_DIR_SOURCE resolves to ${source_fstype:-an unknown filesystem}, not XFS; Go remains active"
+
+    MIGRATION_EXT3_DATA_DIR_FALLBACK=1
+    log "ext3 detected: migration will use XFS $EXT3_DATA_DIR_SOURCE for $DATA_DIR after confirmation"
+}
+
+migration_activate_ext3_data_dir_fallback() {
+    local data_target data_fstype mounted_target
+    [ "$MIGRATION_EXT3_DATA_DIR_FALLBACK" = 1 ] || return 0
+    migration_ext3_data_fallback_active && return 0
+
+    data_target=$(findmnt -n -M /data -o TARGET 2>/dev/null || true)
+    data_fstype=$(findmnt -n -M /data -o FSTYPE 2>/dev/null || true)
+    [ "$data_target" = /data ] && [ "$data_fstype" = xfs ] \
+        || die "the XFS /data mount is no longer active; Go remains active"
+    migration_fstab_has_mountpoint /data \
+        || die "/data is no longer configured in /etc/fstab; Go remains active"
+    mounted_target=$(findmnt -n -M "$DATA_DIR" -o TARGET 2>/dev/null || true)
+    [ -z "$mounted_target" ] \
+        || die "$DATA_DIR is already mounted but is not the configured XFS fallback; refusing to replace it"
+    if [ -d "$DATA_DIR" ]; then
+        migration_data_dir_is_empty_ext3_directory \
+            || die "refusing the ext3 fallback because $DATA_DIR is no longer an empty ext3 directory"
+    fi
+    [ -d "$EXT3_DATA_DIR_SOURCE" ] || install -d -m 0711 "$EXT3_DATA_DIR_SOURCE"
+    [ -d "$DATA_DIR" ] || install -d -m 0711 "$DATA_DIR"
+    if ! migration_ext3_data_fallback_configured; then
+        migration_write_fstab_with_ext3_data_fallback
+    fi
+    systemctl daemon-reload || die "could not reload systemd after configuring the ext3 XFS data fallback"
+    mount --bind "$EXT3_DATA_DIR_SOURCE" "$DATA_DIR" \
+        || die "could not bind the persistent XFS data directory to $DATA_DIR"
+    migration_ext3_data_fallback_active \
+        || die "the XFS fallback bind mount did not become active at $DATA_DIR"
+
+    log "ext3 fallback mounted: $DATA_DIR now uses $EXT3_DATA_DIR_SOURCE on XFS"
+    [ -z "$MIGRATION_EXT3_DATA_FSTAB_BACKUP" ] \
+        || log "original /etc/fstab backup: $MIGRATION_EXT3_DATA_FSTAB_BACKUP"
+}
+
+migration_remove_ext3_data_dir_fallback() {
+    local mounted_target data_target data_fstype current_fstype first_child backup tmp
+    mounted_target=$(findmnt -n -M "$DATA_DIR" -o TARGET 2>/dev/null || true)
+    if ! migration_ext3_data_fallback_configured; then
+        [ -z "$mounted_target" ] \
+            || die "$DATA_DIR has an unrecognized mount; refusing to purge data"
+        return 0
+    fi
+
+    data_target=$(findmnt -n -M /data -o TARGET 2>/dev/null || true)
+    data_fstype=$(findmnt -n -M /data -o FSTYPE 2>/dev/null || true)
+    [ "$data_target" = /data ] && [ "$data_fstype" = xfs ] \
+        || die "the managed XFS data fallback cannot be safely purged while /data is not mounted as XFS"
+    migration_fstab_has_mountpoint /data \
+        || die "the managed XFS data fallback cannot be safely purged because /data is not configured in /etc/fstab"
+
+    if [ "$mounted_target" = "$DATA_DIR" ]; then
+        migration_ext3_data_fallback_active \
+            || die "refusing to purge $DATA_DIR because its mount is not the configured XFS fallback"
+        umount "$DATA_DIR" || die "could not unmount the Rust XFS data fallback before purge"
+    elif [ -n "$mounted_target" ]; then
+        die "$DATA_DIR resolves to an unexpected mount target; refusing to purge data"
+    else
+        current_fstype=$(migration_data_dir_fstype)
+        [ "$current_fstype" = ext3 ] \
+            || die "$DATA_DIR has no active fallback mount and is not on ext3; refusing to purge storage"
+        first_child=$(find "$DATA_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+        [ -z "$first_child" ] \
+            || die "$DATA_DIR has data on ext3 while the XFS fallback is inactive; refusing to delete it"
+    fi
+    [ -L "$EXT3_DATA_DIR_SOURCE" ] \
+        && die "refusing to purge the XFS fallback because $EXT3_DATA_DIR_SOURCE is a symlink"
+    [ -z "$(findmnt -n -M "$EXT3_DATA_DIR_SOURCE" -o TARGET 2>/dev/null || true)" ] \
+        || die "$EXT3_DATA_DIR_SOURCE is an unexpected mountpoint; refusing to purge it"
+
+    backup=$(mktemp /etc/fstab.runman-backup.XXXXXXXX) || die "could not create an /etc/fstab backup"
+    cp -a -- /etc/fstab "$backup" || die "could not back up /etc/fstab before removing the fallback"
+    tmp=$(mktemp /etc/.fstab.runman-tmp.XXXXXXXX) || die "could not create a temporary /etc/fstab"
+    awk -v entry="$EXT3_DATA_DIR_FSTAB_ENTRY" '
+        $0 == entry { found = 1; next }
+        { print }
+        END { if (!found) exit 2 }
+    ' /etc/fstab > "$tmp" || die "could not remove the managed XFS fallback entry from /etc/fstab"
+    chmod --reference=/etc/fstab "$tmp" || die "could not preserve /etc/fstab permissions"
+    chown --reference=/etc/fstab "$tmp" || die "could not preserve /etc/fstab ownership"
+    mv -f -- "$tmp" /etc/fstab || die "could not update /etc/fstab after removing the fallback"
+    rm -rf -- "$EXT3_DATA_DIR_SOURCE"
+    rmdir "$DATA_DIR" 2>/dev/null || true
+    systemctl daemon-reload || die "could not reload systemd after removing the XFS fallback"
+    log "removed the persistent XFS data fallback; /etc/fstab backup: $backup"
 }
 
 is_elf_for_arch() { # the file must be a 64-bit ELF for this machine
@@ -1543,16 +1764,19 @@ PY
 
 prepare_go_migration() {
     local go_config=/opt/narwhal-agent/config.json go_binary=/opt/narwhal-agent/narwhal-agent
-    local asset go_unit_path host_port migration_free_after_delete orphan_count orphan_forward_count
+    local asset go_unit_path host_port migration_free_after_delete orphan_count orphan_forward_count probe_path
     local diagnostic_asset=diagnose-go-rust-migration.sh
     [ "$MIGRATE_GO" = 1 ] || return 0
     [ -t 0 ] || die "Go -> Rust migration requires an interactive terminal for the destructive confirmation"
     if [ ! -f "$go_config" ] || [ ! -x "$go_binary" ]; then
         die "standard Go config/binary not found; no host changes made"
     fi
+    migration_prepare_ext3_data_dir_fallback
     # Go and Rust intentionally share these control API sockets, so their
     # presence is normal on a running Go node and does not identify Rust v2.
-    if [ -e "$CONFIG_DIR" ] || [ -e "$DATA_DIR" ] || [ -e "$BIN" ] \
+    if [ -e "$CONFIG_DIR" ] \
+        || { [ -e "$DATA_DIR" ] && [ "$MIGRATION_EXT3_DATA_DIR_FALLBACK" != 1 ]; } \
+        || [ -e "$BIN" ] \
         || [ -e /etc/systemd/system/runman-agent.service ] || [ -e /run/runman-agent ] \
         || systemctl is-active --quiet runman-agent.service 2>/dev/null; then
         die "a Rust v2 installation already exists; migration will not overwrite it"
@@ -1586,10 +1810,15 @@ prepare_go_migration() {
     chmod 755 "$WORK/release/migrate-go-state.py" "$WORK/release/$diagnostic_asset" "$WORK/release/runman-agent-linux-$ARCH"
     "$WORK/release/runman-agent-linux-$ARCH" --version >/dev/null \
         || die "Rust release binary does not run on this host; Go remains active"
+    if [ "$MIGRATION_EXT3_DATA_DIR_FALLBACK" = 1 ]; then
+        probe_path=/data
+    else
+        probe_path=$(dirname "$DATA_DIR")
+    fi
     log "checking idmapped-mount support on the Rust data filesystem before migration"
-    if ! "$WORK/release/runman-agent-linux-$ARCH" __probe-idmap "$(dirname "$DATA_DIR")"; then
+    if ! "$WORK/release/runman-agent-linux-$ARCH" __probe-idmap "$probe_path"; then
         local storage
-        storage=$(findmnt -T "$(dirname "$DATA_DIR")" -n -o TARGET,SOURCE,FSTYPE 2>/dev/null || true)
+        storage=$(findmnt -T "$probe_path" -n -o TARGET,SOURCE,FSTYPE 2>/dev/null || true)
         die "Rust guest idmapped-mount preflight failed on $DATA_DIR (filesystem: ${storage:-unknown}); the migration stopped before changing Go. Resolve the probe error above, then retry"
     fi
     MIGRATION_HELPER="$WORK/release/migrate-go-state.py"
@@ -1681,10 +1910,24 @@ prepare_go_migration() {
     fi
     printf 'Rust will create a new rmbr0 bridge on %s (IPv6 mode: %s); old Podman/Incus bridges are not reused.\n' \
         "${migration_ipv4:-unknown}" "${migration_ipv6_mode:-unknown}"
+    if [ "$MIGRATION_EXT3_DATA_DIR_FALLBACK" = 1 ]; then
+        printf 'Storage: ext3 was detected at %s. After confirmation, the installer will back up /etc/fstab and persistently bind the XFS filesystem at /data via %s.\n' \
+            "$DATA_DIR" "$EXT3_DATA_DIR_SOURCE"
+        df -hP /data | tail -n 1 | sed 's/^/XFS data capacity: /'
+    fi
     printf 'Backup and generated root passwords: %s\n' "$MIGRATION_DIR"
     read -r -p 'Type MIGRATE TO RUST to continue: ' _migration_confirm
     [ "$_migration_confirm" = "MIGRATE TO RUST" ] || die "migration cancelled; Go remains active"
 
+    migration_activate_ext3_data_dir_fallback
+    if [ "$MIGRATION_EXT3_DATA_DIR_FALLBACK" = 1 ]; then
+        log "verifying idmapped-mount support on the active Rust data directory"
+        if ! "$WORK/release/runman-agent-linux-$ARCH" __probe-idmap "$DATA_DIR"; then
+            local storage
+            storage=$(findmnt -T "$DATA_DIR" -n -o TARGET,SOURCE,FSTYPE 2>/dev/null || true)
+            die "Rust guest idmapped-mount preflight failed on $DATA_DIR (filesystem: ${storage:-unknown}); the migration stopped before changing Go. The persistent XFS fallback remains configured; resolve the probe error, then retry"
+        fi
+    fi
     MIGRATION_ACTIVE=1
     migration_confirm_low_space_cleanup
     if [ "$MIGRATION_RFW_REPAIR_REQUIRED" = 1 ]; then
@@ -1855,6 +2098,7 @@ uninstall() {
         for dir in "$DATA_DIR"/instances/*/mnt/*; do
             if [ -d "$dir" ]; then umount -l "$dir" 2>/dev/null || true; fi
         done
+        migration_remove_ext3_data_dir_fallback
         rm -rf "$DATA_DIR" "$RFW_DIR"
     fi
     systemctl daemon-reload
