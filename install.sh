@@ -853,8 +853,8 @@ run_rust_v2_installer() (
     release="${RUNMAN_RUST_V2_RELEASE_URL:-https://github.com/podcctv/runman-agent/releases/download/continuous-rs}"
     work=$(mktemp -d)
     trap 'rm -rf -- "$work"' EXIT
-    curl -fsSL --retry 3 --connect-timeout 20 -o "$work/SHA256SUMS" "$release/SHA256SUMS"
-    curl -fsSL --retry 3 --connect-timeout 20 -o "$work/install.sh" "$release/install.sh"
+    curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$work/SHA256SUMS" "$release/SHA256SUMS"
+    curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$work/install.sh" "$release/install.sh"
     [ "$(grep -Ec '  \*?install\.sh$' "$work/SHA256SUMS")" = 1 ] || die "Rust release checksum list is invalid"
     (cd "$work" && grep -E '  \*?install\.sh$' SHA256SUMS | sha256sum -c --quiet -) || die "Rust installer checksum mismatch"
     for arg in "$@"; do
@@ -888,8 +888,8 @@ run_go_runtime_cleanup() (
     release="${RUNMAN_RUST_V2_RELEASE_URL:-https://github.com/podcctv/runman-agent/releases/download/continuous-rs}"
     work=$(mktemp -d)
     trap 'rm -rf -- "$work"' EXIT
-    curl -fsSL --retry 3 --connect-timeout 20 -o "$work/SHA256SUMS" "$release/SHA256SUMS"
-    curl -fsSL --retry 3 --connect-timeout 20 -o "$work/install.sh" "$release/install.sh"
+    curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$work/SHA256SUMS" "$release/SHA256SUMS"
+    curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$work/install.sh" "$release/install.sh"
     [ "$(grep -Ec '  \*?install\.sh$' "$work/SHA256SUMS")" = 1 ] \
         || die "Rust 清理脚本校验清单无效。"
     (cd "$work" && grep -E '  \*?install\.sh$' SHA256SUMS | sha256sum -c --quiet -) \
@@ -1377,7 +1377,7 @@ download_with_retry() {
     local url=$1 dest=$2 max=3 attempt=1 curl_status
     while [ $attempt -le $max ]; do
         log "$(t "Downloading $url (attempt $attempt)..." "下载 $url (第 $attempt 次)...")"
-        if curl -fsSL -o "$dest" "$url"; then
+        if curl -4 -fsSL -o "$dest" "$url"; then
             return 0
         else
             curl_status=$?

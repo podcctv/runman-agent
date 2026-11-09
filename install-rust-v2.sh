@@ -652,10 +652,10 @@ migration_prepare_rfw_repair() {
 
     asset=$(rfw_asset_for_host)
     sums_file="$WORK/rfw-SHA256SUMS"
-    curl -fsSL --retry 3 --connect-timeout 20 -o "$sums_file" "$RFW_URL/SHA256SUMS" \
+    curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$sums_file" "$RFW_URL/SHA256SUMS" \
         || die "RFW has a confirmed AVX2-related crash loop, but its release checksum list is unavailable; Go remains active"
     MIGRATION_RFW_CANDIDATE="$WORK/$asset"
-    curl -fsSL --retry 3 --connect-timeout 20 -o "$MIGRATION_RFW_CANDIDATE" "$RFW_URL/$asset" \
+    curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$MIGRATION_RFW_CANDIDATE" "$RFW_URL/$asset" \
         || die "RFW has a confirmed AVX2-related crash loop, but the compatible RFW release binary is unavailable; Go remains active"
     [ "$(grep -Ec "  \*?$asset\$" "$sums_file")" = 1 ] \
         || die "RFW release checksum list does not contain exactly one entry for $asset; Go remains active"
@@ -1407,14 +1407,14 @@ prepare_go_migration() {
     # can fail. Rollback is gated by MIGRATION_ACTIVE inside cleanup_exit.
     trap cleanup_exit EXIT
     mkdir -p "$WORK/release"
-    curl -fsSL --retry 3 --connect-timeout 20 -o "$WORK/SHA256SUMS" "$RELEASE_URL/SHA256SUMS" \
+    curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$WORK/SHA256SUMS" "$RELEASE_URL/SHA256SUMS" \
         || die "cannot fetch the Rust release checksum list; Go remains active"
-    curl -fsSL --retry 3 --connect-timeout 20 -o "$WORK/release/migrate-go-state.py" "$RELEASE_URL/migrate-go-state.py" \
+    curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$WORK/release/migrate-go-state.py" "$RELEASE_URL/migrate-go-state.py" \
         || die "the Rust release has no Go migration helper; Go remains active"
-    curl -fsSL --retry 3 --connect-timeout 20 -o "$WORK/release/$diagnostic_asset" "$RELEASE_URL/$diagnostic_asset" \
+    curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$WORK/release/$diagnostic_asset" "$RELEASE_URL/$diagnostic_asset" \
         || die "the Rust release has no migration diagnostic helper; Go remains active"
     asset="runman-agent-linux-$ARCH"
-    curl -fsSL --retry 3 --connect-timeout 20 -o "$WORK/release/$asset" "$RELEASE_URL/$asset" \
+    curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$WORK/release/$asset" "$RELEASE_URL/$asset" \
         || die "cannot fetch the Rust binary; Go remains active"
     for asset in migrate-go-state.py "$diagnostic_asset" "runman-agent-linux-$ARCH"; do
         [ "$(grep -Ec "  \*?$asset\$" "$WORK/SHA256SUMS")" = 1 ] \
@@ -1779,7 +1779,7 @@ fetch() { # fetch <name> <dest> <base-url>; --from-dir wins when it has the file
     if [ -n "$FROM_DIR" ] && [ -f "$FROM_DIR/$1" ]; then
         cp "$FROM_DIR/$1" "$2"
     else
-        curl -fsSL --retry 3 --connect-timeout 20 -o "$2" "$3/$1"
+        curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$2" "$3/$1"
     fi
 }
 
