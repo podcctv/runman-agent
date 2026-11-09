@@ -1377,7 +1377,7 @@ download_with_retry() {
     local url=$1 dest=$2 max=3 attempt=1 curl_status
     while [ $attempt -le $max ]; do
         log "$(t "Downloading $url (attempt $attempt)..." "下载 $url (第 $attempt 次)...")"
-        if curl -4 -fsSL -o "$dest" "$url"; then
+        if curl -fsSL -o "$dest" "$url"; then
             return 0
         else
             curl_status=$?
