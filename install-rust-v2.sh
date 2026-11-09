@@ -686,8 +686,9 @@ migration_activate_ext3_data_dir_fallback() {
 
     data_target=$(findmnt -n -M /data -o TARGET 2>/dev/null || true)
     data_fstype=$(findmnt -n -M /data -o FSTYPE 2>/dev/null || true)
-    [ "$data_target" = /data ] && [ "$data_fstype" = xfs ] \
-        || die "the XFS /data mount is no longer active; Go remains active"
+    if [ "$data_target" != /data ] || [ "$data_fstype" != xfs ]; then
+        die "the XFS /data mount is no longer active; Go remains active"
+    fi
     migration_fstab_has_mountpoint /data \
         || die "/data is no longer configured in /etc/fstab; Go remains active"
     mounted_target=$(findmnt -n -M "$DATA_DIR" -o TARGET 2>/dev/null || true)
@@ -724,8 +725,9 @@ migration_remove_ext3_data_dir_fallback() {
 
     data_target=$(findmnt -n -M /data -o TARGET 2>/dev/null || true)
     data_fstype=$(findmnt -n -M /data -o FSTYPE 2>/dev/null || true)
-    [ "$data_target" = /data ] && [ "$data_fstype" = xfs ] \
-        || die "the managed XFS data fallback cannot be safely purged while /data is not mounted as XFS"
+    if [ "$data_target" != /data ] || [ "$data_fstype" != xfs ]; then
+        die "the managed XFS data fallback cannot be safely purged while /data is not mounted as XFS"
+    fi
     migration_fstab_has_mountpoint /data \
         || die "the managed XFS data fallback cannot be safely purged because /data is not configured in /etc/fstab"
 
