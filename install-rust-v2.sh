@@ -1479,6 +1479,68 @@ case "$(uname -m)" in
     *) die "unsupported architecture $(uname -m)" ;;
 esac
 
+download_rust_release_asset() { # asset destination [source path in repository]
+    local asset=$1 destination=$2 source_path=${3:-} release=${RELEASE_URL%/}
+    local tag api_json asset_id source_ref target_commit
+
+    if curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$destination" "$release/$asset"; then
+        return 0
+    fi
+
+    log "Direct GitHub release download failed for $asset; trying the GitHub API"
+    case "$release" in
+        https://github.com/podcctv/runman-agent/releases/download/*) ;;
+        *) return 1 ;;
+    esac
+    tag=${release##*/}
+    api_json="$WORK/github-release.json"
+    if [ ! -s "$api_json" ]; then
+        curl -4 -fsSL --retry 3 --connect-timeout 20 \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            -o "$api_json" \
+            "https://api.github.com/repos/podcctv/runman-agent/releases/tags/$tag" \
+            || true
+    fi
+    if [ -s "$api_json" ]; then
+        asset_id=$(python3 - "$api_json" "$asset" 2>/dev/null <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    release = json.load(source)
+matches = [item for item in release.get("assets", []) if item.get("name") == sys.argv[2]]
+if len(matches) == 1 and isinstance(matches[0].get("id"), int):
+    print(matches[0]["id"])
+PY
+        ) || asset_id=""
+        if [[ "$asset_id" =~ ^[0-9]+$ ]] && curl -4 -fsSL --retry 3 --connect-timeout 20 \
+            -H 'Accept: application/octet-stream' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            -o "$destination" \
+            "https://api.github.com/repos/podcctv/runman-agent/releases/assets/$asset_id"; then
+            return 0
+        fi
+    fi
+
+    [ -n "$source_path" ] || return 1
+    source_ref="$tag"
+    if [ -s "$api_json" ]; then
+        target_commit=$(python3 - "$api_json" 2>/dev/null <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    print(json.load(source).get("target_commitish", ""))
+PY
+        ) || target_commit=""
+        [[ "$target_commit" =~ ^[[:xdigit:]]{40}$ ]] && source_ref="$target_commit"
+    fi
+    log "GitHub release download failed for $asset; trying the pinned source mirror"
+    curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$destination" \
+        "https://cdn.jsdelivr.net/gh/podcctv/runman-agent@$source_ref/$source_path"
+}
+
 prepare_go_migration() {
     local go_config=/opt/narwhal-agent/config.json go_binary=/opt/narwhal-agent/narwhal-agent
     local asset go_unit_path host_port migration_free_after_delete orphan_count orphan_forward_count
@@ -1506,14 +1568,14 @@ prepare_go_migration() {
     # can fail. Rollback is gated by MIGRATION_ACTIVE inside cleanup_exit.
     trap cleanup_exit EXIT
     mkdir -p "$WORK/release"
-    curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$WORK/SHA256SUMS" "$RELEASE_URL/SHA256SUMS" \
+    download_rust_release_asset SHA256SUMS "$WORK/SHA256SUMS" \
         || die "cannot fetch the Rust release checksum list; Go remains active"
-    curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$WORK/release/migrate-go-state.py" "$RELEASE_URL/migrate-go-state.py" \
+    download_rust_release_asset migrate-go-state.py "$WORK/release/migrate-go-state.py" scripts/migrate-go-state.py \
         || die "the Rust release has no Go migration helper; Go remains active"
-    curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$WORK/release/$diagnostic_asset" "$RELEASE_URL/$diagnostic_asset" \
+    download_rust_release_asset "$diagnostic_asset" "$WORK/release/$diagnostic_asset" "scripts/$diagnostic_asset" \
         || die "the Rust release has no migration diagnostic helper; Go remains active"
     asset="runman-agent-linux-$ARCH"
-    curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$WORK/release/$asset" "$RELEASE_URL/$asset" \
+    download_rust_release_asset "$asset" "$WORK/release/$asset" \
         || die "cannot fetch the Rust binary; Go remains active"
     for asset in migrate-go-state.py "$diagnostic_asset" "runman-agent-linux-$ARCH"; do
         [ "$(grep -Ec "  \*?$asset\$" "$WORK/SHA256SUMS")" = 1 ] \
@@ -1900,6 +1962,8 @@ trap cleanup_exit EXIT
 fetch() { # fetch <name> <dest> <base-url>; --from-dir wins when it has the file
     if [ -n "$FROM_DIR" ] && [ -f "$FROM_DIR/$1" ]; then
         cp "$FROM_DIR/$1" "$2"
+    elif [ "${3%/}" = "${RELEASE_URL%/}" ]; then
+        download_rust_release_asset "$1" "$2"
     else
         curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$2" "$3/$1"
     fi
