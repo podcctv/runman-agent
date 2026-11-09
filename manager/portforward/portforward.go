@@ -271,8 +271,47 @@ func (m *Manager) reconcileLoop(ctx context.Context) {
 		if err != nil {
 			continue
 		}
+		// The Incus cleanup path can remove stale DB rows without holding this
+		// manager's lock. Reconcile in the other direction too, releasing any
+		// listener whose persisted rule disappeared or changed owner/target.
+		m.mu.Lock()
+		persistedRows, persistedErr := m.db.ListAllPortForwards()
+		if persistedErr == nil {
+			all = persistedRows
+			persisted := make(map[string]*db.PortForward, len(persistedRows))
+			for _, pf := range persistedRows {
+				if pf == nil {
+					continue
+				}
+				persisted[fmt.Sprintf("%s/%d", pf.Protocol, pf.HostPort)] = pf
+			}
+			for vmID, entries := range m.mappings {
+				for _, entry := range append([]*Entry(nil), entries...) {
+					key := fmt.Sprintf("%s/%d", entry.Protocol, entry.HostPort)
+					rule := persisted[key]
+					if rule != nil &&
+						rule.VMID == vmID &&
+						rule.GuestPort == entry.GuestPort &&
+						rule.Description == entry.Description {
+						continue
+					}
+					log.Printf(
+						"[PortForward] reconcile: removing stale in-memory rule %s %s :%d->%d",
+						vmID, entry.Protocol, entry.HostPort, entry.GuestPort,
+					)
+					m.removeEntryLocked(vmID, entry.Protocol, entry.HostPort, false)
+				}
+			}
+		} else {
+			log.Printf("[PortForward] reconcile: failed to reload persisted rules before pruning: %v", persistedErr)
+		}
+		m.mu.Unlock()
+
 		active := make(map[string]bool)
 		for _, pf := range all {
+			if pf == nil {
+				continue
+			}
 			key := fmt.Sprintf("%s/%d", pf.Protocol, pf.HostPort)
 			active[key] = true
 			if m.hasMapping(pf.VMID, pf.Protocol, pf.HostPort) {

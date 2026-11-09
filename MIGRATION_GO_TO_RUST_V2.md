@@ -51,6 +51,15 @@ empty manifest only when both Go instance tables and the complete Podman/Incus
 inventory are empty; if containers exist without database records, it refuses
 to proceed because their ownership cannot be proven.
 
+If `port_forwards` contains a rule whose UUID has no `vm_configs` row, the
+installer lists the VM UUID and host-to-guest ports and requires the operator
+to type `EXCLUDE STALE GO PORT FORWARDS`. The rule is omitted from the Rust
+manifest; its original row stays in the root-only Go database snapshot. This
+does not remove any live host firewall rule. A rule for a VM that still has a
+core Go record but no backend record remains an error, because that VM's
+ownership or forwarding state cannot be inferred safely. After Go stops, the
+helper rechecks the stale-rule report against the pre-confirmation snapshot.
+
 If `vm_configs` contains a core row without a matching selected-backend row,
 the helper checks that no live container with that VM UUID exists (across all
 Incus projects) and that no port-forward rows reference it. Only these verified
@@ -104,8 +113,8 @@ built-in Go Podman image IDs, `docker.io/narwhalcloud/alpine:podman` and
 family is rebuilt as Alpine so migration works while Debian is disabled for
 normal instance creation. Unknown or custom images, invalid resource settings,
 unsupported Go config, backend-only records, live containers without proven Go
-ownership, unconfirmed orphan rows, occupied ports, and failed Rust checks
-abort before normally staged old guests are purged.
+ownership, unconfirmed orphan rows or stale port forwards, occupied ports, and
+failed Rust checks abort before normally staged old guests are purged.
 
 ## Rollback boundary
 

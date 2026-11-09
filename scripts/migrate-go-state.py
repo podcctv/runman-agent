@@ -624,6 +624,104 @@ def export(args):
         fail(
             f"Go database references {len(missing)} {backend} container(s) missing from the live inventory"
         )
+
+    orphan_forward_exclusions_path = getattr(args, "orphan_port_forward_exclusions", None)
+    orphan_forward_exclusions = set()
+    if orphan_forward_exclusions_path is not None and orphan_forward_exclusions_path.exists():
+        try:
+            raw_exclusions = json.loads(
+                orphan_forward_exclusions_path.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            fail(f"cannot read orphan port-forward exclusions: {exc}")
+        if not isinstance(raw_exclusions, list) or any(
+            not isinstance(value, dict) for value in raw_exclusions
+        ):
+            fail("orphan port-forward exclusions must be a JSON list of rule identities")
+        for value in raw_exclusions:
+            vm_id = canonical_uuid(value.get("vm_id"))
+            protocol = str(value.get("protocol") or "").strip().lower()
+            host_port = bounded_int(value.get("host_port"), "orphan forward host_port", 1, 65535)
+            guest_port = bounded_int(value.get("guest_port"), "orphan forward guest_port", 1, 65535)
+            if protocol not in {"tcp", "udp"}:
+                fail(f"unsupported protocol in orphan port-forward exclusion for {vm_id}")
+            orphan_forward_exclusions.add((vm_id, protocol, host_port, guest_port))
+        if len(orphan_forward_exclusions) != len(raw_exclusions):
+            fail("orphan port-forward exclusions contain duplicate rule identities")
+
+    normalized_forwards = []
+    orphan_forward_candidates = []
+    for row in forward_rows:
+        vm_id = canonical_uuid(column(row, "vm_id"))
+        protocol = str(column(row, "protocol") or "").strip().lower()
+        host_port = bounded_int(column(row, "host_port", 0), "port-forward host_port", 1, 65535)
+        guest_port = bounded_int(column(row, "guest_port", 0), "port-forward guest_port", 1, 65535)
+        if protocol not in {"tcp", "udp"}:
+            fail(f"unsupported port-forward protocol {protocol!r} for {vm_id}")
+        rule = {
+            "vm_id": vm_id,
+            "protocol": protocol,
+            "host_port": host_port,
+            "guest_port": guest_port,
+            "description": str(column(row, "description") or "")[:200],
+        }
+        if vm_id in base_by_id:
+            normalized_forwards.append(rule)
+        else:
+            orphan_forward_candidates.append({
+                "vm_id": vm_id,
+                "protocol": protocol,
+                "host_port": host_port,
+                "guest_port": guest_port,
+            })
+
+    orphan_forward_keys = {
+        (row["vm_id"], row["protocol"], row["host_port"], row["guest_port"])
+        for row in orphan_forward_candidates
+    }
+    if len(orphan_forward_keys) != len(orphan_forward_candidates):
+        fail("Go database has duplicate orphan port-forward rule identities")
+    orphan_forward_candidates.sort(
+        key=lambda row: (row["vm_id"], row["protocol"], row["host_port"], row["guest_port"])
+    )
+    stale_forward_exclusions = orphan_forward_exclusions - orphan_forward_keys
+    if stale_forward_exclusions:
+        fail(
+            "orphan port-forward exclusions no longer match the database: "
+            + ", ".join(
+                f"{vm_id} {protocol} {host_port}->{guest_port}"
+                for vm_id, protocol, host_port, guest_port in sorted(stale_forward_exclusions)
+            )
+        )
+    unconfirmed_forwards = orphan_forward_keys - orphan_forward_exclusions
+    if unconfirmed_forwards:
+        print(
+            "orphan Go port-forward rule(s) reference no core VM record; "
+            "review and explicitly confirm exclusion: "
+            + ", ".join(
+                f"{vm_id} {protocol} {host_port}->{guest_port}"
+                for vm_id, protocol, host_port, guest_port in sorted(unconfirmed_forwards)
+            ),
+            file=sys.stderr,
+        )
+        write_private(
+            args.output / "orphan-port-forward-candidates.json",
+            json.dumps(orphan_forward_candidates, separators=(",", ":")) + "\n",
+        )
+        raise SystemExit(43)
+    if orphan_forward_keys != orphan_forward_exclusions:
+        fail("orphan port-forward exclusion list does not exactly match the verified stale rules")
+    if orphan_forward_candidates:
+        print(
+            f"excluding {len(orphan_forward_candidates)} confirmed orphan Go port-forward "
+            "rule(s) from the Rust manifest; the original rows remain in the root-only "
+            "SQLite snapshot"
+        )
+    write_private(
+        args.output / "orphan-port-forward-candidates.json",
+        json.dumps(orphan_forward_candidates, separators=(",", ":")) + "\n",
+    )
+
     if set(error_state_overrides) - managed_set:
         fail("Incus ERROR run-state choices contain an instance not managed by the Go database")
     if not base_by_id:
@@ -711,23 +809,7 @@ def export(args):
         legacy_state.append(legacy_row)
         passwords.append(f"{vm_id}\t{password}\n")
 
-    forwards = []
-    for row in forward_rows:
-        vm_id = canonical_uuid(column(row, "vm_id"))
-        if vm_id not in base_by_id:
-            fail(f"port forward references unknown VM {vm_id}")
-        protocol = str(column(row, "protocol") or "").lower()
-        host_port = int(column(row, "host_port", 0) or 0)
-        guest_port = int(column(row, "guest_port", 0) or 0)
-        if protocol not in {"tcp", "udp"} or not (1 <= host_port <= 65535 and 1 <= guest_port <= 65535):
-            fail(f"unsupported port-forward row for {vm_id}")
-        forwards.append({
-            "vm_id": vm_id,
-            "protocol": protocol,
-            "host_port": host_port,
-            "guest_port": guest_port,
-            "description": str(column(row, "description") or "")[:200],
-        })
+    forwards = normalized_forwards
     conn.close()
 
     manifest = {"schema": 1, "source_backend": backend, "instances": instances, "port_forwards": forwards}
@@ -1320,6 +1402,7 @@ def main():
     export_parser.add_argument("--output", type=Path, required=True)
     export_parser.add_argument("--error-state-overrides", type=Path)
     export_parser.add_argument("--orphan-core-exclusions", type=Path)
+    export_parser.add_argument("--orphan-port-forward-exclusions", type=Path)
     export_parser.set_defaults(func=export)
     life = sub.add_parser("lifecycle")
     life.add_argument("action", choices=["stop", "start", "purge", "purge-for-space"])

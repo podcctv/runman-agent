@@ -297,7 +297,9 @@ func main() {
 	// 启动定期清理幽灵实例服务 (每小时一次，启动时先运行一次)
 	go func() {
 		log.Println("[Main] Initial ghost VM cleanup at startup...")
-		_ = svc.Cleanup(context.Background())
+		if err := svc.Cleanup(context.Background()); err != nil {
+			log.Printf("[Main] Initial ghost VM cleanup failed: %v", err)
+		}
 
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
@@ -305,7 +307,9 @@ func main() {
 			select {
 			case <-ticker.C:
 				log.Println("[Main] Running periodic ghost VM cleanup...")
-				_ = svc.Cleanup(context.Background())
+				if err := svc.Cleanup(context.Background()); err != nil {
+					log.Printf("[Main] Periodic ghost VM cleanup failed: %v", err)
+				}
 			}
 		}
 	}()

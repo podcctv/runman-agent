@@ -1154,6 +1154,10 @@ func (m *Manager) Cleanup(ctx context.Context) error {
 	for _, c := range configs {
 		registered[c.VMID] = true
 	}
+	live := make(map[string]bool, len(instances))
+	for _, inst := range instances {
+		live[inst.Name] = true
+	}
 
 	// 统计平台管理的 Incus 实例数（排除构建器）
 	var managedCount int
@@ -1165,7 +1169,9 @@ func (m *Manager) Cleanup(ctx context.Context) error {
 	// 安全检查：DB 为空但 Incus 有实例，放弃本次清理。
 	if len(configs) == 0 && managedCount > 0 {
 		log.Printf("[Incus] Cleanup: DB has 0 configs but %d instances exist, skipping to avoid false deletions", managedCount)
-		return nil
+		// Still prune forwarding records whose guest is absent from both
+		// inventories. The live guests that caused this safety guard stay intact.
+		return m.cleanupOrphanPortForwards(registered, live)
 	}
 
 	for _, inst := range instances {
@@ -1180,7 +1186,46 @@ func (m *Manager) Cleanup(ctx context.Context) error {
 
 		// 判定为幽灵实例，直接删除
 		log.Printf("[Incus] Found ghost instance %s, deleting...", inst.Name)
-		_ = m.deleteVM(ctx, inst.Name)
+		if err := m.deleteVM(ctx, inst.Name); err != nil {
+			log.Printf("[Incus] Cleanup: failed to delete ghost instance %s: %v", inst.Name, err)
+		}
+	}
+
+	// A container may already have been removed outside the Agent, or the
+	// ghost deletion above may have completed. Drop only its now-unreachable
+	// forwarding rows; keep rows for registered VMs and any still-live guest.
+	instances, err = m.client.GetInstances(api.InstanceTypeAny)
+	if err != nil {
+		return fmt.Errorf("list Incus instances after ghost cleanup: %w", err)
+	}
+	live = make(map[string]bool, len(instances))
+	for _, inst := range instances {
+		live[inst.Name] = true
+	}
+	return m.cleanupOrphanPortForwards(registered, live)
+}
+
+func (m *Manager) cleanupOrphanPortForwards(registered, live map[string]bool) error {
+	forwards, err := m.db.ListAllPortForwards()
+	if err != nil {
+		log.Printf("[Incus] Cleanup: failed to list port forwards; keeping existing rows: %v", err)
+		return err
+	}
+	orphanCounts := make(map[string]int)
+	for _, forward := range forwards {
+		if forward == nil || registered[forward.VMID] || live[forward.VMID] {
+			continue
+		}
+		orphanCounts[forward.VMID]++
+	}
+	for vmID, count := range orphanCounts {
+		log.Printf(
+			"[Incus] Cleanup: removing %d port-forward rule(s) for %s; no Go VM record or Incus instance exists",
+			count, vmID,
+		)
+		if err := m.db.DeletePortForwardsForVM(vmID); err != nil {
+			return fmt.Errorf("delete orphan port forwards for %s: %w", vmID, err)
+		}
 	}
 	return nil
 }

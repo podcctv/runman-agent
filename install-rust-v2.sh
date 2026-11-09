@@ -326,6 +326,7 @@ PY
         "$MIGRATION_HELPER" export --config "$1" --output "$MIGRATION_DIR" \
             --error-state-overrides "$MIGRATION_DIR/error-state-overrides.json" \
             --orphan-core-exclusions "$MIGRATION_DIR/orphan-core-exclusions.json" \
+            --orphan-port-forward-exclusions "$MIGRATION_DIR/orphan-port-forward-exclusions.json" \
             || die "could not save the selected Incus replacement states"
         if ! python3 - "$MIGRATION_DIR/legacy-state.json" \
             "$MIGRATION_DIR/error-state-overrides.json" <<'PY'
@@ -439,10 +440,108 @@ PY
     fi
 }
 
+migration_confirm_orphan_port_forwards() {
+    local candidates="$MIGRATION_DIR/orphan-port-forward-candidates.json"
+    local exclusions="$MIGRATION_DIR/orphan-port-forward-exclusions.json"
+    local answer
+    [ -s "$candidates" ] \
+        || die "migration helper requested stale port-forward confirmation without a candidate report"
+    printf '\nGo has port-forward rule(s) whose VM UUID has no core VM record.\n'
+    printf 'They will be excluded from the Rust manifest; the original rows remain in the root-only Go database snapshot.\n'
+    if ! python3 - "$candidates" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    rows = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    print(f"cannot read orphan port-forward candidates: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(rows, list) or not rows or any(not isinstance(row, dict) for row in rows):
+    print("orphan port-forward candidate report is empty or invalid", file=sys.stderr)
+    raise SystemExit(1)
+for row in rows:
+    vm_id = row.get("vm_id")
+    protocol = row.get("protocol")
+    host_port = row.get("host_port")
+    guest_port = row.get("guest_port")
+    if (
+        not isinstance(vm_id, str)
+        or protocol not in {"tcp", "udp"}
+        or not isinstance(host_port, int)
+        or not isinstance(guest_port, int)
+    ):
+        print("orphan port-forward candidate has invalid fields", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"  {vm_id} {protocol} host:{host_port} -> guest:{guest_port}")
+PY
+    then
+        die "could not review orphan port-forward candidates"
+    fi
+    read -r -p 'Type EXCLUDE STALE GO PORT FORWARDS to confirm: ' answer </dev/tty \
+        || die "could not read stale port-forward confirmation; an interactive terminal is required"
+    [ "$answer" = "EXCLUDE STALE GO PORT FORWARDS" ] \
+        || die "stale port-forward exclusion cancelled; Go remains active"
+    if ! python3 - "$candidates" "$exclusions" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+try:
+    rows = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    print(f"cannot read orphan port-forward candidates: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(rows, list) or not rows or any(not isinstance(row, dict) for row in rows):
+    print("orphan port-forward candidate report is empty or invalid", file=sys.stderr)
+    raise SystemExit(1)
+identities = []
+for row in rows:
+    identity = {
+        "vm_id": row.get("vm_id"),
+        "protocol": row.get("protocol"),
+        "host_port": row.get("host_port"),
+        "guest_port": row.get("guest_port"),
+    }
+    if (
+        not isinstance(identity["vm_id"], str)
+        or identity["protocol"] not in {"tcp", "udp"}
+        or not isinstance(identity["host_port"], int)
+        or not isinstance(identity["guest_port"], int)
+    ):
+        print("orphan port-forward candidate has invalid fields", file=sys.stderr)
+        raise SystemExit(1)
+    identities.append(identity)
+keys = [
+    (row["vm_id"], row["protocol"], row["host_port"], row["guest_port"])
+    for row in identities
+]
+if len(keys) != len(set(keys)):
+    print("orphan port-forward candidates contain duplicate rule identities", file=sys.stderr)
+    raise SystemExit(1)
+path = pathlib.Path(sys.argv[2])
+tmp = path.with_name(path.name + ".tmp")
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as stream:
+    json.dump(sorted(identities, key=lambda row: (
+        row["vm_id"], row["protocol"], row["host_port"], row["guest_port"]
+    )), stream, separators=(",", ":"))
+    stream.write("\n")
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+    then
+        die "could not save stale port-forward exclusions"
+    fi
+}
+
 migration_export_go_state() {
     "$MIGRATION_HELPER" export --config "$1" --output "$MIGRATION_DIR" \
         --error-state-overrides "$MIGRATION_DIR/error-state-overrides.json" \
-        --orphan-core-exclusions "$MIGRATION_DIR/orphan-core-exclusions.json"
+        --orphan-core-exclusions "$MIGRATION_DIR/orphan-core-exclusions.json" \
+        --orphan-port-forward-exclusions "$MIGRATION_DIR/orphan-port-forward-exclusions.json"
 }
 
 is_elf_for_arch() { # the file must be a 64-bit ELF for this machine
@@ -1382,7 +1481,7 @@ esac
 
 prepare_go_migration() {
     local go_config=/opt/narwhal-agent/config.json go_binary=/opt/narwhal-agent/narwhal-agent
-    local asset go_unit_path host_port migration_free_after_delete orphan_count
+    local asset go_unit_path host_port migration_free_after_delete orphan_count orphan_forward_count
     local diagnostic_asset=diagnose-go-rust-migration.sh
     [ "$MIGRATE_GO" = 1 ] || return 0
     [ -t 0 ] || die "Go -> Rust migration requires an interactive terminal for the destructive confirmation"
@@ -1434,6 +1533,8 @@ prepare_go_migration() {
     chmod 600 "$MIGRATION_DIR/error-state-overrides.json"
     printf '[]\n' > "$MIGRATION_DIR/orphan-core-exclusions.json"
     chmod 600 "$MIGRATION_DIR/orphan-core-exclusions.json"
+    printf '[]\n' > "$MIGRATION_DIR/orphan-port-forward-exclusions.json"
+    chmod 600 "$MIGRATION_DIR/orphan-port-forward-exclusions.json"
     install -m 700 "$WORK/release/$diagnostic_asset" "$MIGRATION_DIR/$diagnostic_asset"
     cp -a "$go_config" "$MIGRATION_DIR/go-config.json"
     migration_backup_go_agent "$go_binary"
@@ -1455,15 +1556,23 @@ prepare_go_migration() {
     if systemctl is-active --quiet lxcfs.service; then MIGRATION_LXCFS_WAS_ACTIVE=1; fi
     if systemctl is-enabled --quiet lxcfs.service; then MIGRATION_LXCFS_WAS_ENABLED=1; fi
 
+    local migration_export_status=0
     if migration_export_go_state "$go_config"; then
         :
     else
-        local migration_export_status=$?
-        if [ "$migration_export_status" -eq 42 ]; then
-            migration_confirm_orphan_core_rows
-            migration_export_go_state "$go_config" \
-                || die "Go migration preflight failed after orphan-row confirmation; Go remains active"
-        else
+        migration_export_status=$?
+        while [ "$migration_export_status" -eq 42 ] || [ "$migration_export_status" -eq 43 ]; do
+            case "$migration_export_status" in
+                42) migration_confirm_orphan_core_rows ;;
+                43) migration_confirm_orphan_port_forwards ;;
+            esac
+            if migration_export_go_state "$go_config"; then
+                migration_export_status=0
+            else
+                migration_export_status=$?
+            fi
+        done
+        if [ "$migration_export_status" -ne 0 ]; then
             printf 'Go migration preflight failed; Go remains active. Snapshot: %s\n' "$MIGRATION_DIR" >&2
             printf 'Read-only diagnostic: bash %q %q\n' \
                 "$MIGRATION_DIR/$diagnostic_asset" "$MIGRATION_DIR" >&2
@@ -1471,6 +1580,8 @@ prepare_go_migration() {
         fi
     fi
     cp -a "$MIGRATION_DIR/orphan-core-candidates.json" "$MIGRATION_DIR/pre-confirm-orphan-core-candidates.json"
+    cp -a "$MIGRATION_DIR/orphan-port-forward-candidates.json" \
+        "$MIGRATION_DIR/pre-confirm-orphan-port-forward-candidates.json"
     MIGRATION_BACKEND=$(cat "$MIGRATION_DIR/source-backend")
     migration_choose_error_states "$go_config"
     WEB_LISTEN=$(cat "$MIGRATION_DIR/web-listen")
@@ -1493,6 +1604,12 @@ prepare_go_migration() {
         "$MIGRATION_DIR/orphan-core-candidates.json")
     if [ "$orphan_count" -gt 0 ]; then
         printf 'Confirmed orphan core records excluded from Rust: %s (original rows retained in go-agent.db).\n' "$orphan_count"
+    fi
+    orphan_forward_count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1], encoding="utf-8"))))' \
+        "$MIGRATION_DIR/orphan-port-forward-candidates.json")
+    if [ "$orphan_forward_count" -gt 0 ]; then
+        printf 'Confirmed stale Go port-forward rows excluded from Rust: %s (original rows retained in go-agent.db).\n' \
+            "$orphan_forward_count"
     fi
     printf 'Rust will create a new rmbr0 bridge on %s (IPv6 mode: %s); old Podman/Incus bridges are not reused.\n' \
         "${migration_ipv4:-unknown}" "${migration_ipv6_mode:-unknown}"
@@ -1525,10 +1642,15 @@ prepare_go_migration() {
     "$MIGRATION_HELPER" export --config "$go_config" --output "$MIGRATION_DIR" \
         --error-state-overrides "$MIGRATION_DIR/error-state-overrides.json" \
         --orphan-core-exclusions "$MIGRATION_DIR/orphan-core-exclusions.json" \
+        --orphan-port-forward-exclusions "$MIGRATION_DIR/orphan-port-forward-exclusions.json" \
         || die "final Go snapshot failed; the old guests remain intact and rollback will restart Go"
     if ! cmp -s "$MIGRATION_DIR/pre-confirm-orphan-core-candidates.json" \
         "$MIGRATION_DIR/orphan-core-candidates.json"; then
         die "orphan Go core rows changed after confirmation; retry migration to review the updated snapshot"
+    fi
+    if ! cmp -s "$MIGRATION_DIR/pre-confirm-orphan-port-forward-candidates.json" \
+        "$MIGRATION_DIR/orphan-port-forward-candidates.json"; then
+        die "orphan Go port-forward rows changed after confirmation; retry migration to review the updated snapshot"
     fi
     if [ "$MIGRATION_BACKEND" = incus ]; then
         if ! python3 - "$MIGRATION_DIR/pre-confirm-legacy-state.json" "$MIGRATION_DIR/legacy-state.json" <<'PY'
