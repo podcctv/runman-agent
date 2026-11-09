@@ -1586,6 +1586,12 @@ prepare_go_migration() {
     chmod 755 "$WORK/release/migrate-go-state.py" "$WORK/release/$diagnostic_asset" "$WORK/release/runman-agent-linux-$ARCH"
     "$WORK/release/runman-agent-linux-$ARCH" --version >/dev/null \
         || die "Rust release binary does not run on this host; Go remains active"
+    log "checking idmapped-mount support on the Rust data filesystem before migration"
+    if ! "$WORK/release/runman-agent-linux-$ARCH" __probe-idmap "$(dirname "$DATA_DIR")"; then
+        local storage
+        storage=$(findmnt -T "$(dirname "$DATA_DIR")" -n -o TARGET,SOURCE,FSTYPE 2>/dev/null || true)
+        die "Rust guest idmapped-mount preflight failed on $DATA_DIR (filesystem: ${storage:-unknown}); the migration stopped before changing Go. Resolve the probe error above, then retry"
+    fi
     MIGRATION_HELPER="$WORK/release/migrate-go-state.py"
 
     install -d -m 700 /var/backups

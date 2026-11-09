@@ -62,7 +62,8 @@ pub fn idmapped_bind(src: &Path, dst: &Path, userns: &impl AsRawFd) -> io::Resul
             libc::AT_FDCWD,
             src_c.as_ptr(),
             OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint | AT_RECURSIVE,
-        ))? as RawFd;
+        ))
+        .map_err(|e| syscall_context("open_tree", e))? as RawFd;
         let tree = OwnedFd::from_raw_fd(tree);
         let attr = MountAttr {
             attr_set: MOUNT_ATTR_IDMAP,
@@ -77,7 +78,8 @@ pub fn idmapped_bind(src: &Path, dst: &Path, userns: &impl AsRawFd) -> io::Resul
             libc::AT_EMPTY_PATH as libc::c_uint,
             &attr as *const MountAttr,
             std::mem::size_of::<MountAttr>(),
-        ))?;
+        ))
+        .map_err(|e| syscall_context("mount_setattr(MOUNT_ATTR_IDMAP)", e))?;
         check(libc::syscall(
             SYS_MOVE_MOUNT,
             tree.as_raw_fd(),
@@ -85,9 +87,14 @@ pub fn idmapped_bind(src: &Path, dst: &Path, userns: &impl AsRawFd) -> io::Resul
             libc::AT_FDCWD,
             dst_c.as_ptr(),
             MOVE_MOUNT_F_EMPTY_PATH,
-        ))?;
+        ))
+        .map_err(|e| syscall_context("move_mount", e))?;
     }
     Ok(())
+}
+
+fn syscall_context(operation: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{operation}: {error}"))
 }
 
 /// `openat2(root, rel, RESOLVE_IN_ROOT)`: resolve `rel` as if `root` were `/`,

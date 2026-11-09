@@ -77,6 +77,14 @@ fn main() -> Result<()> {
     if args.get(1).is_some_and(|a| a == "__exec") {
         runman_agent::runtime::exec::main(&args[2..]);
     }
+    #[cfg(target_os = "linux")]
+    if args.get(1).is_some_and(|a| a == "__probe-idmap") {
+        let path = args
+            .get(2)
+            .ok_or_else(|| anyhow::anyhow!("usage: __probe-idmap <filesystem-directory>"))?;
+        runman_agent::runtime::idmap_probe::run(std::path::Path::new(path))?;
+        return Ok(());
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?

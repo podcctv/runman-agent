@@ -17,6 +17,7 @@ pub mod customize;
 pub mod exec;
 pub mod fsutil;
 pub mod image;
+pub mod idmap_probe;
 pub mod monitor;
 pub mod net;
 pub mod seccomp;
