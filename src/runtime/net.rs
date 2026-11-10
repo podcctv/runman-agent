@@ -44,6 +44,7 @@ pub enum V6Mode {
         prefix: Ipv6Addr,
         len: u8,
         ndp_uplink: Option<String>,
+        pool: Option<Vec<Ipv6Addr>>,
     },
 }
 
@@ -113,14 +114,53 @@ impl Net {
                 if ndp_uplink.as_deref().is_some_and(|i| !valid_ifname(i)) {
                     bail!("invalid ipv6_ndp_uplink");
                 }
+                let pool = if c.ipv6_pool.is_empty() {
+                    None
+                } else {
+                    let mask = if len == 0 {
+                        0
+                    } else {
+                        u128::MAX << (128 - u32::from(len))
+                    };
+                    let network = u128::from(prefix) & mask;
+                    let mut seen = std::collections::HashSet::new();
+                    let addresses: Vec<Ipv6Addr> = c
+                        .ipv6_pool
+                        .iter()
+                        .map(|raw| {
+                            let addr = raw
+                                .parse::<Ipv6Addr>()
+                                .with_context(|| format!("invalid ipv6_pool address {raw:?}"))?;
+                            if addr.is_unspecified()
+                                || addr.is_loopback()
+                                || addr.is_multicast()
+                                || (addr.segments()[0] & 0xffc0) == 0xfe80
+                            {
+                                bail!("ipv6_pool address {addr} is not a usable unicast address");
+                            }
+                            if (u128::from(addr) & mask) != network {
+                                bail!("ipv6_pool address {addr} is outside ipv6_prefix");
+                            }
+                            if !seen.insert(addr) {
+                                bail!("duplicate ipv6_pool address {addr}");
+                            }
+                            Ok(addr)
+                        })
+                        .collect::<Result<_>>()?;
+                    Some(addresses)
+                };
                 V6Mode::Subnet {
                     prefix,
                     len,
                     ndp_uplink,
+                    pool,
                 }
             }
             other => bail!("unknown ipv6_mode {other:?}"),
         };
+        if !c.ipv6_pool.is_empty() && c.ipv6_mode != "subnet" {
+            bail!("ipv6_pool requires ipv6_mode = \"subnet\"");
+        }
         for d in &c.dns {
             d.parse::<std::net::IpAddr>()
                 .with_context(|| format!("invalid dns server {d:?}"))?;
@@ -170,7 +210,13 @@ impl Net {
     /// Largest index that still has an IPv4 address (.0 network, .1 gateway,
     /// last = broadcast).
     pub fn max_idx(&self) -> u32 {
-        (1u32 << (32 - self.v4_len)) - 4
+        let v4_max = (1u32 << (32 - self.v4_len)) - 4;
+        match &self.v6 {
+            V6Mode::Subnet {
+                pool: Some(pool), ..
+            } => v4_max.min(u32::try_from(pool.len().saturating_sub(1)).unwrap_or(u32::MAX)),
+            _ => v4_max,
+        }
     }
 
     pub fn addrs_for(&self, idx: u32) -> Result<Addrs> {
@@ -182,12 +228,22 @@ impl Net {
             V6Mode::Snat => Some(Ipv6Addr::from(
                 u128::from(self.snat6_prefix) + 2 + u128::from(idx),
             )),
-            V6Mode::Subnet { prefix, len, .. } => {
-                let host = V6_HOST_OFFSET + u128::from(idx);
-                if *len < 128 && host >> (128 - u32::from(*len)) != 0 {
-                    bail!("IPv6 prefix too small");
+            V6Mode::Subnet {
+                prefix, len, pool, ..
+            } => {
+                if let Some(pool) = pool {
+                    Some(
+                        *pool
+                            .get(idx as usize)
+                            .context("no IPv6 address in ipv6_pool")?,
+                    )
+                } else {
+                    let host = V6_HOST_OFFSET + u128::from(idx);
+                    if *len < 128 && host >> (128 - u32::from(*len)) != 0 {
+                        bail!("IPv6 prefix too small");
+                    }
+                    Some(Ipv6Addr::from(u128::from(*prefix) | host))
                 }
-                Some(Ipv6Addr::from(u128::from(*prefix) | host))
             }
         };
         Ok(Addrs {
@@ -268,6 +324,7 @@ impl Net {
             prefix,
             len,
             ndp_uplink,
+            ..
         } = &self.v6
         {
             self.sync_v6_routes(instances, *prefix, *len, ndp_uplink.as_deref())

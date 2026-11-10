@@ -39,7 +39,8 @@ bash install.sh --token '<平台下发的 Token>'      # 接入平台
 | `--token TOKEN` | 平台下发的 Token；省略则以独立模式运行 |
 | `--web-listen 127.0.0.1:8792` | 面板只监听本机，通过 `ssh -L` 访问（推荐公网节点使用）。默认的 `0.0.0.0:8792` 同时监听 IPv4 和 IPv6，没有 IPv6 的主机只监听 IPv4 |
 | `--ipv6 auto\|none\|snat\|subnet` | 默认 `auto`：实测整段 /64 能否作为源地址后选择 `subnet`，否则 `snat` 或 `none` |
-| `--ipv6-prefix CIDR --ipv6-uplink IFACE` | 手工指定 `subnet` 前缀 |
+| `--ipv6-prefix CIDR --ipv6-uplink IFACE` | 手工指定 `subnet` 前缀；前缀在上联链路时指定网卡以启用 NDP 代理 |
+| `--ipv6-pool IP,IP,...` | 可选的精确 IPv6 地址池，按实例槽位顺序分配；池中地址数量限制可用容器槽位。重跑时传入 IPv6 参数会更新现有配置并保留备份，不传则保留原配置 |
 | `--bandwidth MBPS` | 修正上报给平台的带宽（默认上报测速结果，见下文） |
 | `--no-rfw` / `--rfw-iface IFACE` | 不安装 rfw / 指定 rfw 保护的网卡 |
 | `RUNMAN_IMAGE_BASE_URL=URL` | 安装/升级时覆盖默认 Runman feed；已有的自定义地址会保留 |
@@ -57,6 +58,8 @@ bash install.sh --token '<平台下发的 Token>'      # 接入平台
   时区由 `traffic_timezone` 指定（默认 `+00:00`，国内节点一般设成 `+08:00`）。重装系统保留创建时间和已用流量，不会重置额度。
 
 配置文件为 `/etc/runman-agent/config.toml`，全部配置项见 [config.example.toml](config.example.toml)。
+
+已分配独立 IPv6 的机器可使用 `--ipv6 subnet --ipv6-prefix PREFIX --ipv6-uplink IFACE --ipv6-pool IP,IP,...`。池中第 N 个地址分配给实例槽位 N；宿主网卡必须只保留主机自己的地址，池中地址不能继续配置在宿主网卡上。地址池变更后，Agent 启动会按实例槽位迁移现有容器地址；地址池长度也会限制最多可创建的容器数。若前缀由上游路由到主机，省略 `--ipv6-uplink`；若地址在同一链路，指定外网接口以代理邻居发现。
 
 ## 发布与自更新
 

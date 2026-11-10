@@ -34,6 +34,8 @@ WEB_LISTEN="0.0.0.0:8792"
 IPV6="auto"
 IPV6_PREFIX=""
 IPV6_UPLINK=""
+IPV6_POOL=""
+NETWORK_OPTIONS_EXPLICIT=0
 BANDWIDTH=0
 WITH_RFW=1
 RFW_IFACE=""
@@ -1606,6 +1608,8 @@ Usage: install.sh [options]
   --ipv6-prefix CIDR      Prefix for --ipv6 subnet, e.g. 2001:db8:1:2::/64
   --ipv6-uplink IFACE     Interface where that prefix is on-link (NDP proxy);
                           omit when the prefix is routed to this host
+  --ipv6-pool IP,IP,...   Optional ordered list of exact IPv6 addresses from the
+                          subnet prefix; one address is assigned per instance slot
   --bandwidth MBPS        Correct the measured uplink bandwidth reported to the
                           platform (default: report the speed test)
   --no-rfw                Do not install the rfw firewall
@@ -1629,9 +1633,10 @@ while [ $# -gt 0 ]; do
         --platform-url) PLATFORM_URL="${2:?--platform-url needs a value}"; shift 2 ;;
         --web-listen) WEB_LISTEN="${2:?--web-listen needs a value}"; shift 2 ;;
         --no-web) WEB_LISTEN=""; shift ;;
-        --ipv6) IPV6="${2:?--ipv6 needs a value}"; shift 2 ;;
-        --ipv6-prefix) IPV6_PREFIX="${2:?--ipv6-prefix needs a value}"; shift 2 ;;
-        --ipv6-uplink) IPV6_UPLINK="${2:?--ipv6-uplink needs a value}"; shift 2 ;;
+        --ipv6) IPV6="${2:?--ipv6 needs a value}"; NETWORK_OPTIONS_EXPLICIT=1; shift 2 ;;
+        --ipv6-prefix) IPV6_PREFIX="${2:?--ipv6-prefix needs a value}"; NETWORK_OPTIONS_EXPLICIT=1; shift 2 ;;
+        --ipv6-uplink) IPV6_UPLINK="${2:?--ipv6-uplink needs a value}"; NETWORK_OPTIONS_EXPLICIT=1; shift 2 ;;
+        --ipv6-pool) IPV6_POOL="${2:?--ipv6-pool needs a value}"; NETWORK_OPTIONS_EXPLICIT=1; shift 2 ;;
         --bandwidth) BANDWIDTH="${2:?--bandwidth needs a value}"; shift 2 ;;
         --no-rfw) WITH_RFW=0; shift ;;
         --rfw-iface) RFW_IFACE="${2:?--rfw-iface needs a value}"; shift 2 ;;
@@ -1665,14 +1670,49 @@ IMAGE_BASE_URL="${IMAGE_BASE_URL%/}"
     || die "invalid --web-listen (expected ip:port)"
 [[ "$BANDWIDTH" =~ ^[0-9]{1,7}$ ]] || die "invalid --bandwidth"
 [ -z "$TOKEN" ] || [[ "$TOKEN" =~ ^[[:graph:]]{16,512}$ ]] || die "--token must be 16-512 printable characters"
+if { [ -n "$IPV6_PREFIX" ] || [ -n "$IPV6_UPLINK" ] || [ -n "$IPV6_POOL" ]; } && [ "$IPV6" = auto ]; then
+    IPV6=subnet
+fi
 case "$IPV6" in
     auto|none|snat) ;;
     subnet)
-        [[ "$IPV6_PREFIX" =~ ^[0-9a-fA-F:]+/[0-9]{1,3}$ ]] || die "--ipv6 subnet needs --ipv6-prefix CIDR"
+        [ -n "$IPV6_PREFIX" ] || die "--ipv6 subnet needs --ipv6-prefix CIDR"
+        [[ "$IPV6_PREFIX" =~ ^[0-9a-fA-F:]+/[0-9]{1,3}$ ]] || die "invalid --ipv6-prefix CIDR"
         [ -z "$IPV6_UPLINK" ] || [[ "$IPV6_UPLINK" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || die "invalid --ipv6-uplink"
+        if [ -n "$IPV6_POOL" ]; then
+            command -v python3 >/dev/null 2>&1 || die "python3 is required to validate --ipv6-pool"
+            IPV6_POOL=$(python3 - "$IPV6_PREFIX" "$IPV6_POOL" <<'PY'
+import ipaddress, sys
+
+try:
+    prefix = ipaddress.ip_network(sys.argv[1], strict=False)
+    if prefix.version != 6:
+        raise ValueError("prefix must be IPv6")
+    raw = sys.argv[2].split(",")
+    if any(not item.strip() for item in raw):
+        raise ValueError("pool contains an empty address")
+    addresses = [ipaddress.ip_address(item.strip()) for item in raw]
+    if any(address.version != 6 for address in addresses):
+        raise ValueError("pool entries must be IPv6 addresses")
+    if len(set(addresses)) != len(addresses):
+        raise ValueError("pool contains duplicate addresses")
+    for address in addresses:
+        if address not in prefix:
+            raise ValueError(f"{address} is outside {prefix}")
+        if address.is_unspecified or address.is_loopback or address.is_multicast or address.is_link_local:
+            raise ValueError(f"{address} is not a usable unicast address")
+    print(",".join(str(address) for address in addresses))
+except ValueError as exc:
+    print(f"invalid --ipv6-pool: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+) || die "invalid --ipv6-pool"
+            [ -n "$IPV6_POOL" ] || die "--ipv6-pool must contain at least one address"
+        fi
         ;;
     *) die "--ipv6 must be auto, none, snat or subnet" ;;
 esac
+[ -z "$IPV6_POOL" ] || [ "$IPV6" = subnet ] || die "--ipv6-pool requires --ipv6 subnet"
 [ -z "$RFW_IFACE" ] || [[ "$RFW_IFACE" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || die "invalid --rfw-iface"
 
 if [ "$MIGRATE_GO" = 1 ]; then
@@ -2285,6 +2325,99 @@ configure_image_base_url() {
     log "updated image_base_url to $IMAGE_BASE_URL; prior config saved at $backup"
 }
 
+configure_existing_ipv6_network() {
+    [ "$NETWORK_OPTIONS_EXPLICIT" = 1 ] || return 0
+    [ "$FRESH" = 0 ] || return 0
+    if [ "$IPV6" = auto ]; then
+        warn "--ipv6 auto leaves an existing network configuration unchanged; specify none, snat or subnet to update it"
+        return 0
+    fi
+    [ -f "$CONFIG" ] && [ ! -L "$CONFIG" ] || die "configuration is not a regular file: $CONFIG"
+    command -v python3 >/dev/null 2>&1 || die "python3 is required to update the IPv6 configuration"
+
+    local tmp stamp backup
+    tmp=$(mktemp "$CONFIG_DIR/.config.toml.ipv6-tmp.XXXXXXXX") \
+        || die "could not create a temporary config file"
+    if ! python3 - "$CONFIG" "$tmp" "$IPV6" "$IPV6_PREFIX" "$IPV6_UPLINK" "$IPV6_POOL" <<'PY'
+import json, pathlib, re, sys
+
+try:
+    import tomllib
+except ImportError:
+    print("Python 3.11 or newer is required to update config.toml", file=sys.stderr)
+    raise SystemExit(1)
+
+source, destination, mode, prefix, uplink, raw_pool = sys.argv[1:]
+path = pathlib.Path(source)
+raw = path.read_text(encoding="utf-8")
+config = tomllib.loads(raw)
+if "network" in config and not isinstance(config["network"], dict):
+    raise SystemExit("config.toml [network] must be a table")
+
+updates = {"ipv6_mode": mode, "ipv6_pool": raw_pool.split(",") if raw_pool else []}
+if mode == "subnet":
+    updates["ipv6_prefix"] = prefix
+    updates["ipv6_ndp_uplink"] = uplink
+literal = lambda value: json.dumps(value, ensure_ascii=False)
+lines = raw.splitlines()
+section = re.compile(r"^\s*\[([^\]]+)\]\s*(?:#.*)?$")
+key_line = re.compile(r"^\s*([A-Za-z0-9_-]+)\s*=")
+start = None
+end = None
+for index, line in enumerate(lines):
+    match = section.match(line)
+    if not match:
+        continue
+    if match.group(1) == "network":
+        if start is not None:
+            raise SystemExit("config.toml has more than one [network] table")
+        start = index
+    elif start is not None and end is None:
+        end = index
+
+if start is None:
+    if lines and lines[-1].strip():
+        lines.append("")
+    lines.append("[network]")
+    start = len(lines) - 1
+if end is None:
+    end = len(lines)
+
+updated = set()
+for index in range(start + 1, end):
+    match = key_line.match(lines[index])
+    if match and match.group(1) in updates:
+        key = match.group(1)
+        lines[index] = f"{key} = {literal(updates[key])}"
+        updated.add(key)
+missing = [f"{key} = {literal(value)}" for key, value in updates.items() if key not in updated]
+lines[end:end] = missing
+result = "\n".join(lines) + ("\n" if raw.endswith("\n") or lines else "")
+parsed = tomllib.loads(result)
+for key, value in updates.items():
+    if parsed["network"].get(key) != value:
+        raise SystemExit(f"failed to update [network].{key}")
+pathlib.Path(destination).write_text(result, encoding="utf-8")
+PY
+    then
+        rm -f -- "$tmp"
+        die "could not safely update the IPv6 network configuration"
+    fi
+    if cmp -s -- "$CONFIG" "$tmp"; then
+        rm -f -- "$tmp"
+        log "IPv6 network configuration already matches the requested settings"
+        return 0
+    fi
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    backup="$CONFIG.before-ipv6.$stamp"
+    [ ! -e "$backup" ] || { rm -f -- "$tmp"; die "refusing to overwrite config backup: $backup"; }
+    cp -a -- "$CONFIG" "$backup"
+    chmod --reference="$CONFIG" "$tmp"
+    chown --reference="$CONFIG" "$tmp"
+    mv -f -- "$tmp" "$CONFIG"
+    log "updated IPv6 network settings; prior config saved at $backup"
+}
+
 FRESH=0
 PASSWORD=""
 if [ "$MIGRATE_GO" = 1 ]; then
@@ -2300,6 +2433,16 @@ elif [ ! -f "$CONFIG" ]; then
         ipv6_conf=$("$BIN" detect-ipv6) || { warn "IPv6 detection failed; using none"; ipv6_conf='ipv6_mode = "none"'; }
     elif [ "$IPV6" = subnet ]; then
         ipv6_conf=$(printf 'ipv6_mode = "subnet"\nipv6_prefix = "%s"\nipv6_ndp_uplink = "%s"' "$IPV6_PREFIX" "$IPV6_UPLINK")
+        if [ -n "$IPV6_POOL" ]; then
+            local_pool='['
+            IFS=',' read -r -a pool_addresses <<< "$IPV6_POOL"
+            for address in "${pool_addresses[@]}"; do
+                [ "$local_pool" = '[' ] || local_pool+=', '
+                local_pool+="\"$address\""
+            done
+            local_pool+=']'
+            ipv6_conf+=$'\nipv6_pool = '"$local_pool"
+        fi
     else
         ipv6_conf="ipv6_mode = \"$IPV6\""
     fi
@@ -2325,6 +2468,7 @@ EOF
 else
     log "keeping existing $CONFIG"
 fi
+configure_existing_ipv6_network || die "could not safely configure the existing IPv6 network"
 configure_image_base_url || die "could not safely configure the Rust image feed"
 # Tokens are only ever issued by the platform; none means standalone mode.
 if [ -n "$TOKEN" ]; then

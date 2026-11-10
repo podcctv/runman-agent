@@ -75,6 +75,10 @@ pub struct NetworkConfig {
     /// Subnet mode: uplink on which the prefix is on-link (answer NDP for
     /// instance addresses). Empty when the prefix is routed to the host.
     pub ipv6_ndp_uplink: String,
+    /// Optional, ordered list of exact IPv6 addresses for subnet mode.
+    /// Instance index N receives entry N; an empty list keeps derived
+    /// addresses from `ipv6_prefix`.
+    pub ipv6_pool: Vec<String>,
     /// SNAT mode: ULA /64 used by guests. Defaults to fd91:cafe:cafe:10::/64.
     pub ipv6_snat_prefix: String,
     pub dns: Vec<String>,
@@ -96,6 +100,7 @@ impl Default for NetworkConfig {
             ipv6_mode: "none".into(),
             ipv6_prefix: String::new(),
             ipv6_ndp_uplink: String::new(),
+            ipv6_pool: Vec::new(),
             ipv6_snat_prefix: "fd91:cafe:cafe:10::/64".into(),
             dns: vec!["1.1.1.1".into(), "8.8.8.8".into()],
             veth_prefix: "rv".into(),

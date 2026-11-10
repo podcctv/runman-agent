@@ -145,6 +145,10 @@ struct Record {
     /// Watcher quarantine state is persistent and survives instance restart.
     #[serde(default)]
     network_quarantined: bool,
+    /// Address record changed but the guest's static network config still
+    /// needs to be rewritten. Retried on the next agent start after a crash.
+    #[serde(default)]
+    network_pending: bool,
     /// Temporary instance building a custom image: hidden from listings and
     /// heartbeats (the platform would delete it as an orphan).
     #[serde(default)]
@@ -352,7 +356,36 @@ impl Runtime {
         {
             self.net.enable_v6().await?;
         }
+
+        // Reconcile persisted guest addresses with the current network config.
+        // This migrates older generated addresses (or an earlier pool) while
+        // retaining each instance's stable index. Preflight every slot before
+        // writing any record so a pool that is too small fails without a
+        // partial address migration.
+        let address_updates: Vec<(Record, Addrs)> = self
+            .records()?
+            .into_iter()
+            .filter(|r| !r.builder)
+            .map(|rec| {
+                let addrs = self.net.addrs_for(rec.idx)?;
+                Ok((rec, addrs))
+            })
+            .collect::<Result<_>>()?;
+        for (mut rec, addrs) in address_updates {
+            if rec.addrs != addrs {
+                rec.addrs = addrs;
+                rec.network_pending = true;
+                self.save(&rec)?;
+            }
+        }
         self.reconcile_network().await?;
+        for mut rec in self.records()?.into_iter().filter(|r| r.network_pending) {
+            self.update_instance_network(&rec)
+                .await
+                .with_context(|| format!("update network for instance {}", rec.id))?;
+            rec.network_pending = false;
+            self.save(&rec)?;
+        }
         // Older records have no incarnation identity. Assign one before
         // exposing them to local control APIs.
         for mut rec in self
@@ -1624,6 +1657,7 @@ impl Runtime {
             addrs: self.net.addrs_for(idx)?,
             desired: Desired::Running,
             network_quarantined: false,
+            network_pending: false,
             builder,
             created,
         };
