@@ -2332,7 +2332,9 @@ configure_existing_ipv6_network() {
         warn "--ipv6 auto leaves an existing network configuration unchanged; specify none, snat or subnet to update it"
         return 0
     fi
-    [ -f "$CONFIG" ] && [ ! -L "$CONFIG" ] || die "configuration is not a regular file: $CONFIG"
+    if [ ! -f "$CONFIG" ] || [ -L "$CONFIG" ]; then
+        die "configuration is not a regular file: $CONFIG"
+    fi
     command -v python3 >/dev/null 2>&1 || die "python3 is required to update the IPv6 configuration"
 
     local tmp stamp backup
