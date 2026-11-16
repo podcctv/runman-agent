@@ -581,7 +581,7 @@ fn mask_host_info(rootfs: &Path) -> Result<()> {
 }
 
 fn pid1(rootfs: &Path, rx: &mut File, console: &OwnedFd) -> ! {
-    let res = (|| -> Result<()> {
+    let res = (|| -> Result<std::convert::Infallible> {
         let hard = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
         mount(
             Some("proc"),
@@ -633,11 +633,12 @@ fn pid1(rootfs: &Path, rx: &mut File, console: &OwnedFd) -> ! {
             CString::new("TERM=linux")?,
             CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")?,
         ];
-        nix::unistd::execve(&init, std::slice::from_ref(&init), &env).context("exec /sbin/init")?;
-        Ok(())
+        nix::unistd::execve(&init, std::slice::from_ref(&init), &env)
+            .context("exec /sbin/init")
     })();
-    if let Err(e) = res {
-        eprintln!("container init setup failed: {e:#}");
+    match res {
+        Ok(never) => match never {},
+        Err(e) => eprintln!("container init setup failed: {e:#}"),
     }
     unsafe { libc::_exit(1) }
 }

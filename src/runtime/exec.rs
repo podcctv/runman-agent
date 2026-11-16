@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use nix::sched::{CloneFlags, setns};
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, killpg, sigaction};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
@@ -197,7 +197,7 @@ fn terminate_child(child: Pid) -> Result<()> {
 }
 
 fn exec_child(argv: &[CString]) -> anyhow::Error {
-    let res = (|| -> Result<()> {
+    let res = (|| -> Result<std::convert::Infallible> {
         nix::unistd::setsid()?;
         if nix::unistd::isatty(std::io::stdin())? {
             unsafe { libc::ioctl(0, libc::TIOCSCTTY, 0) };
@@ -212,11 +212,10 @@ fn exec_child(argv: &[CString]) -> anyhow::Error {
         super::seccomp::install()?;
         // execvp searches the PATH of the current environment.
         unsafe { std::env::set_var("PATH", PATH) };
-        nix::unistd::execvp(&argv[0], argv)?;
-        Ok(())
+        nix::unistd::execvp(&argv[0], argv).map_err(Into::into)
     })();
     match res {
-        Ok(()) => anyhow!("exec returned"),
+        Ok(never) => match never {},
         Err(e) => e,
     }
 }
