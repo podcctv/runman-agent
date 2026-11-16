@@ -72,6 +72,8 @@ Rust v2 源码现已合入 `main`。Rust 代码更新会发布到独立的 `cont
 
 节点从 fork 的 GitHub Release 下载，只安装与 `SHA256SUMS` 校验和匹配、能正常运行的版本，发现新版后随机延迟 0–6 小时再应用，以免整批节点同时重启（面板里可立即更新）。本地编译的版本不会自动更新。
 
+当前自更新实现边界和目标的分阶段升级方案见 [自动更新流程设计](AUTO_UPDATE_DESIGN.md)。
+
 常规 Rust 安装不会接管 Go 配置、数据库或 Podman/Incus 实例。Go fork 安装器的 Rust v2 子菜单 **2** 可启动有损的 clean-rebuild 迁移：保留受支持的主机/面板设置、实例 UUID/资源/运行状态和端口转发，在健康核验后删除旧容器根文件系统。它不保留客体文件、应用、IP、WireGuard 和挂载卷关联；删除阶段开始后无法承诺完整回滚。开始前先读 [Go 到 Rust v2 迁移计划](MIGRATION_GO_TO_RUST_V2.md) 并备份关键数据。此迁移会复用现有平台主机标识和 Token，且先停用 Go agent，避免两个 agent 同时协调同一节点。迁移成功并确认旧实例删除后，会自动执行 7 天日志/缓存清理；只有盘点确认没有其他容器、数据卷或 rootless Podman 数据时，才尝试清除旧 Podman/Incus 服务。Docker 不会被选中、不运行 `autoremove`；Rust 实例所需的 `lxcfs` 会保留。
 
 
@@ -96,7 +98,7 @@ bash install.sh
 原配置备份为 `config.toml.before-image-source.<UTC时间>`。显式设置
 `RUNMAN_IMAGE_BASE_URL` 时，该值优先应用。配置修改后 Agent 重启并立即同步。
 
-默认 Runman feed 由配套 `alpine-base` 发布流水线从经过 OpenSSH 版本门禁的 Alpine rootfs 生成，支持 amd64 和 arm64；默认 feed 只发布 Alpine，Debian 不会出现在新装节点的镜像列表中。Rust 仓库里的 `images/build.sh` 和 `.github/workflows/images.yml` 仍保留，可生成包含 Alpine 与 Debian 的通用 Runman feed；需要时可用 `RUNMAN_IMAGE_BASE_URL` 将节点指向该 feed。
+默认 Runman feed 由配套 `alpine-base` 发布流水线从经过 OpenSSH 版本门禁的 Alpine rootfs 生成，支持 amd64 和 arm64；默认 feed 只发布 Alpine，Debian 不会出现在新装节点的镜像列表中。Rust 仓库里的 `images/build.sh` 和 `.github/workflows/images.yml` 仍保留，可生成包含 Alpine 与 Debian 的通用 Runman feed；该仓库的 Alpine 构建会先升级所有包，并要求 `openssh-server` 精确匹配当前安全基线 `10.3_p1-r2`，否则 CI 拒绝发布。升级 Alpine OpenSSH 安全基线时，也要同步更新这些构建门禁；需要时可用 `RUNMAN_IMAGE_BASE_URL` 将节点指向该通用 feed。
 
 通用 feed 中的 Debian / Alpine 镜像包大小如下；默认自建 feed 目前只发布 Alpine：
 

@@ -21,6 +21,8 @@ SERIAL="${4:-$(date -u +%Y%m%d)}"
 DEBIAN_SUITE=trixie
 DEBIAN_MIRROR=http://deb.debian.org/debian
 ALPINE_MIRROR=https://dl-cdn.alpinelinux.org/alpine
+# Keep in sync with the production alpine-base Runman feed security gate.
+ALPINE_OPENSSH_FIXED_VERSION=10.3_p1-r2
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 case "$ARCH" in amd64|arm64) ;; *) echo "unsupported arch $ARCH" >&2; exit 1 ;; esac
@@ -113,7 +115,20 @@ build_alpine() {
     local branch="v${version%.*}"
     printf '%s\n' "$ALPINE_MIRROR/$branch/main" "$ALPINE_MIRROR/$branch/community" > "$ROOT/etc/apk/repositories"
     cp /etc/resolv.conf "$ROOT/etc/resolv.conf"
+    # Refresh the minirootfs packages before adding sshd so the published
+    # template carries current security fixes from the selected stable branch.
+    chroot "$ROOT" apk upgrade -U -a >/dev/null
     chroot "$ROOT" apk add --no-cache openrc openssh busybox-openrc ifupdown-ng curl ca-certificates bash nano >/dev/null
+    local openssh_version
+    openssh_version=$(awk '
+        /^P:openssh-server$/ { wanted=1; next }
+        wanted && /^V:/ { print substr($0, 3); exit }
+        wanted && /^[A-Z]:/ { wanted=0 }
+    ' "$ROOT/lib/apk/db/installed")
+    if [ "$openssh_version" != "$ALPINE_OPENSSH_FIXED_VERSION" ]; then
+        echo "OpenSSH server package is '$openssh_version'; expected '$ALPINE_OPENSSH_FIXED_VERSION'. Refusing to publish this image." >&2
+        exit 1
+    fi
     # Container mode: OpenRC skips kernel/hardware services; no gettys (the
     # console is reached through the agent).
     sed -i 's/^#\?rc_sys=.*/rc_sys="lxc"/' "$ROOT/etc/rc.conf"

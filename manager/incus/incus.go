@@ -27,9 +27,13 @@ const (
 	IncusBridge        = "incusbr0"
 	DefaultAlpineImage = "alpine/3.24/cloud"
 	MirrorAlpineImage  = "alpine/3.24"
-	IPv4Resolver       = "1.1.1.1"
-	IPv6Resolver       = "2606:4700:4700::1111"
-	IPv6ResolverBackup = "2001:4860:4860::8888"
+	// Bump this when the Alpine ready-image security baseline changes so hosts
+	// stop reusing older cached aliases that may contain vulnerable packages.
+	alpineReadyImageRevision  = "ready-security-v1"
+	alpineOpenSSHFixedVersion = "10.3_p1-r2"
+	IPv4Resolver              = "1.1.1.1"
+	IPv6Resolver              = "2606:4700:4700::1111"
+	IPv6ResolverBackup        = "2001:4860:4860::8888"
 )
 
 type Manager struct {
@@ -207,6 +211,9 @@ func (m *Manager) createVM(ctx context.Context, req *agent.CmdCreateVM) error {
 	}
 
 	readyAlias := alias + "/ready"
+	if req.OsImage == "alpine" {
+		readyAlias = alias + "/" + alpineReadyImageRevision
+	}
 	_, _, err = m.client.GetImageAlias(readyAlias)
 	if err != nil {
 		m.buildMu.Lock()
@@ -715,11 +722,17 @@ func (m *Manager) ensureReadyImage(ctx context.Context, baseAlias, readyAlias, d
 	}
 
 	// packages 模块失败（网络未就绪/源故障）不会阻止 runcmd，因此 runcmd 里
-	// 带重试兜底安装，且 build_done 必须在确认 sshd 存在后才落盘，
-	// 避免把没有 sshd 的坏镜像发布成 ready 别名。
+	// 带重试兜底安装，且 build_done 必须在确认 sshd 和包更新成功后才落盘，
+	// 避免把缺少 sshd 或仍有旧版 OpenSSH 的镜像发布成 ready 别名。
 	installCmd := fmt.Sprintf("apt-get update && apt-get install -y bash wget curl %s sshpass sudo %s lsof iptables dos2unix", pkgSSH, pkgCron)
+	retryCmd := fmt.Sprintf("for i in $(seq 1 30); do command -v sshd >/dev/null 2>&1 && break; %s; sleep 5; done", installCmd)
+	buildDoneCmd := "command -v sshd >/dev/null 2>&1 && touch /root/build_done"
 	if distro == "alpine" {
-		installCmd = fmt.Sprintf("apk add --no-cache bash wget curl %s sshpass sudo %s lsof iptables dos2unix", pkgSSH, pkgCron)
+		const packageUpdateMarker = "/root/.runman-apk-upgrade-ok"
+		versionCheckCmd := fmt.Sprintf("test $(awk '/^P:openssh-server$/ { wanted=1; next } wanted && /^V:/ { print substr($0,3); exit } wanted && /^[A-Z]:/ { wanted=0 }' /lib/apk/db/installed) = %s", alpineOpenSSHFixedVersion)
+		installCmd = fmt.Sprintf("rm -f %s && apk upgrade -U -a && apk add --no-cache bash wget curl %s sshpass sudo %s lsof iptables dos2unix && %s && touch %s", packageUpdateMarker, pkgSSH, pkgCron, versionCheckCmd, packageUpdateMarker)
+		retryCmd = fmt.Sprintf("for i in $(seq 1 30); do %s && test -f %s && command -v sshd >/dev/null 2>&1 && break; sleep 5; done", installCmd, packageUpdateMarker)
+		buildDoneCmd = fmt.Sprintf("test -f %s && command -v sshd >/dev/null 2>&1 && rm -f %s && touch /root/build_done", packageUpdateMarker, packageUpdateMarker)
 	}
 
 	builderUserData := fmt.Sprintf(`#cloud-config
@@ -740,15 +753,15 @@ packages:
   - dos2unix
 runcmd:
   %s
-  - [ sh, -c, "for i in $(seq 1 30); do command -v sshd >/dev/null 2>&1 && break; %s; sleep 5; done" ]
+  - [ sh, -c, "%s" ]
   - mkdir -p /etc/ssh/sshd_config.d
   - [ sh, -c, "printf 'PermitRootLogin yes\\nPasswordAuthentication yes\\nListenAddress 0.0.0.0\\nListenAddress ::\\n' > /etc/ssh/sshd_config.d/99-runman.conf" ]
   - sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
   - sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
   - [ sh, -c, "systemctl enable ssh 2>/dev/null || rc-update add sshd default 2>/dev/null || true" ]
   - [ sh, -c, "systemctl enable %s 2>/dev/null || rc-update add %s default 2>/dev/null || true" ]
-  - [ sh, -c, "command -v sshd >/dev/null 2>&1 && touch /root/build_done" ]
-`, pkgSSH, pkgCron, aptConfig, installCmd, pkgCron, pkgCron)
+  - [ sh, -c, "%s" ]
+`, pkgSSH, pkgCron, aptConfig, retryCmd, pkgCron, pkgCron, buildDoneCmd)
 
 	var builderSource api.InstanceSource
 	if baseIsLocal {

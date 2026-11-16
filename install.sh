@@ -2407,10 +2407,28 @@ update_vm_images() {
         log "  Baking packages and sshd config (alpine)..."
         mv "$root/etc/resolv.conf" "$root/etc/resolv.conf.bak" 2>/dev/null || true
         echo "nameserver 1.1.1.1" > "$root/etc/resolv.conf"
-        chroot "$root" /sbin/apk add --no-cache curl e2fsprogs openssh \
-            || log "  Warning: package bake failed, image may lack curl/e2fsprogs"
+        local package_status=0 openssh_version
+        chroot "$root" /sbin/apk upgrade -U -a || package_status=$?
+        if [ "$package_status" -eq 0 ]; then
+            chroot "$root" /sbin/apk add --no-cache curl e2fsprogs openssh || package_status=$?
+        fi
+        if [ "$package_status" -eq 0 ]; then
+            openssh_version=$(awk '
+                /^P:openssh-server$/ { wanted=1; next }
+                wanted && /^V:/ { print substr($0, 3); exit }
+                wanted && /^[A-Z]:/ { wanted=0 }
+            ' "$root/lib/apk/db/installed")
+            if [ "$openssh_version" != "10.3_p1-r2" ]; then
+                log "  Error: OpenSSH server package is '$openssh_version'; expected '10.3_p1-r2'."
+                package_status=1
+            fi
+        fi
         rm -f "$root/etc/resolv.conf"
         mv "$root/etc/resolv.conf.bak" "$root/etc/resolv.conf" 2>/dev/null || true
+        if [ "$package_status" -ne 0 ]; then
+            log "  Error: Alpine package upgrade failed; refusing to publish an image with unverified OpenSSH."
+            return "$package_status"
+        fi
         bake_sshd_config "$root"
         ln -sf /etc/init.d/sshd "$root/etc/runlevels/default/sshd" 2>/dev/null || true
     }
@@ -2580,10 +2598,14 @@ update_vm_images() {
         local mnt
         mnt=$(mktemp -d)
         mount /opt/vm-images/alpine/current.raw "$mnt"
+        if ! customize_alpine "$mnt"; then
+            umount "$mnt" 2>/dev/null || true
+            rmdir "$mnt" 2>/dev/null || true
+            die "Failed to update Alpine packages; refusing to publish an image with unverified OpenSSH."
+        fi
         cp "$mnt/boot/vmlinuz-virt"   "$dir/vmlinuz"
         cp "$mnt/boot/initramfs-virt" "$dir/initrd"
         log "  Kernel: vmlinuz-virt"
-        customize_alpine "$mnt"
         umount "$mnt" && rmdir "$mnt"
 
         # Root is the whole device (no partition table), identified by UUID
