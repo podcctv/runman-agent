@@ -633,8 +633,7 @@ fn pid1(rootfs: &Path, rx: &mut File, console: &OwnedFd) -> ! {
             CString::new("TERM=linux")?,
             CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")?,
         ];
-        nix::unistd::execve(&init, std::slice::from_ref(&init), &env)
-            .context("exec /sbin/init")
+        nix::unistd::execve(&init, std::slice::from_ref(&init), &env).context("exec /sbin/init")
     })();
     match res {
         Ok(never) => match never {},
