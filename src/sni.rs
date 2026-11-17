@@ -192,7 +192,7 @@ fn sha256_sum(data: &[u8]) -> [u8; 32] {
         msg.push(0);
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for i in 0..16 {
             w[i] = u32::from_be_bytes([
@@ -321,7 +321,7 @@ fn aes128_encrypt_block(rk: &[[u8; 16]; 11], input: &[u8; 16]) -> [u8; 16] {
     for i in 0..16 {
         s[i] ^= rk[0][i];
     }
-    for round in 1..=10 {
+    for (round, round_key) in rk.iter().enumerate().skip(1) {
         for b in &mut s {
             *b = AES_SBOX[*b as usize];
         }
@@ -348,8 +348,8 @@ fn aes128_encrypt_block(rk: &[[u8; 16]; 11], input: &[u8; 16]) -> [u8; 16] {
                 s[c + 3] ^= t ^ xtime(a3 ^ a0);
             }
         }
-        for i in 0..16 {
-            s[i] ^= rk[round][i];
+        for (slot, &k) in s.iter_mut().zip(round_key.iter()) {
+            *slot ^= k;
         }
     }
     s
