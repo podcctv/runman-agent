@@ -549,6 +549,19 @@ async fn handle_firewall(
         .split_once('?')
         .unwrap_or((&request.target, ""));
     match (request.method.as_str(), path) {
+        ("GET", "/v1/firewall/sni/whitelist") => {
+            respond_json(
+                &mut stream,
+                200,
+                &serde_json::json!({
+                    "enabled": true,
+                    "scope": "container_inbound_tls_quic",
+                    "block_missing_sni_cn": true,
+                    "allowed_sni_domains": crate::sni::SNI_WHITELIST,
+                }),
+            )
+            .await
+        }
         ("GET", "/v1/firewall/readback") => match manager.readback().await {
             Ok(body) => respond_json(&mut stream, 200, &serde_json::to_value(body)?).await,
             Err(_) => {

@@ -74,6 +74,16 @@ func ListenAndServeFirewall(path string, manager FirewallController) error {
 
 func newFirewallHandler(manager FirewallController) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/firewall/sni/whitelist", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"enabled":                 true,
+			"scope":                   "container_inbound_tls_quic",
+			"block_missing_sni_cn":    true,
+			"allowed_sni_domains":     hostpolicy.SNIWhitelist,
+		})
+	})
 	mux.HandleFunc("GET /v1/firewall/events", func(w http.ResponseWriter, r *http.Request) {
 		cursor := r.URL.Query().Get("cursor")
 		if len(cursor) > 160 {

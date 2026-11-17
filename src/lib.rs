@@ -26,6 +26,7 @@ pub mod platform;
 pub mod proto;
 #[cfg(target_os = "linux")]
 pub mod runtime;
+pub mod sni;
 pub mod speedtest;
 pub mod traffic;
 pub mod updater;
