@@ -2246,6 +2246,33 @@ rfw_binary_supports_api() {
     [ -x "$binary" ] && "$binary" --api-addr "$RFW_API_ADDR" --version >/dev/null 2>&1
 }
 
+rfw_cpu_has_avx2() {
+    awk '
+        /^flags[[:space:]]*:/ {
+            seen = 1
+            found = 0
+            for (i = 2; i <= NF; i++) if ($i == "avx2") found = 1
+            if (!found) missing = 1
+        }
+        END { exit !(seen && !missing) }
+    ' /proc/cpuinfo
+}
+
+rfw_recent_sigill() {
+    command -v journalctl >/dev/null 2>&1 || return 1
+    journalctl -u rfw --since '-24 hours' -n 300 --no-pager -o cat 2>/dev/null \
+        | grep -Eqi 'Main process exited.*(status=4/ILL|SIGILL)'
+}
+
+rfw_asset_for_host() {
+    local arch="$1"
+    if [ "$arch" = "amd64" ] && { ! rfw_cpu_has_avx2 || rfw_recent_sigill; }; then
+        printf 'rfw-amd64-legacy\n'
+    else
+        printf 'rfw-%s\n' "$arch"
+    fi
+}
+
 rfw_set_unit_failure_limits() {
     local unit_file="$1" tmp add_interval=0 add_burst=0
     grep -Eq '^StartLimitInterval(Sec)?=' "$unit_file" || add_interval=1
@@ -2455,7 +2482,7 @@ enable_rfw_skb_mode() {
 
 install_rfw() {
     local mode="${1:-0}" # 0: normal (prompt), 1: force (no prompt), 2: update-only (no prompt, only if exists)
-    local ARCH
+    local ARCH rfw_asset
     local candidate="$RFW_BIN_DIR/rfw.new"
     local _rfw_bin_changed=0
     local _rfw_unit_changed=0
@@ -2474,15 +2501,21 @@ install_rfw() {
     log "$(t "Installing/Updating rfw..." "正在安装/更新 rfw...")"
     mkdir -p "$RFW_BIN_DIR"
     rm -f "$candidate"
+    rfw_asset=$(rfw_asset_for_host "$ARCH")
+    log "Selected RFW release asset: $rfw_asset"
 
     # 调试模式：检查本地文件
-    if [ -f "./rfw-$ARCH" ]; then
-        log "$(t "Found local rfw binary: ./rfw-$ARCH (debug mode)" "找到本地 rfw 二进制: ./rfw-$ARCH (调试模式)")"
-        cp "./rfw-$ARCH" "$candidate"
+    if [ -f "./$rfw_asset" ]; then
+        log "$(t "Found local rfw binary: ./$rfw_asset (debug mode)" "找到本地 rfw 二进制: ./$rfw_asset (调试模式)")"
+        cp "./$rfw_asset" "$candidate"
     else
         # 生产模式：从远程下载 (即使已存在也更新)
-        if ! download_with_retry "$RFW_BASE/rfw-$ARCH" "$candidate"; then
+        if ! download_with_retry "$RFW_BASE/$rfw_asset" "$candidate"; then
             rm -f "$candidate"
+            if [ "$rfw_asset" != "rfw-$ARCH" ]; then
+                log "Error: the CPU-compatible RFW asset $rfw_asset could not be downloaded; leaving the current service untouched."
+                return 1
+            fi
             log "$(t "Warning: rfw download failed." "警告: rfw 下载失败。")"
             if ! rfw_binary_supports_api "$RFW_BIN_DIR/rfw"; then
                 log "$(t "Error: no API-capable rfw binary is available; keeping the current service untouched." "错误：没有可用的 API 版 rfw；保留当前服务，不做切换。")"
