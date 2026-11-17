@@ -492,6 +492,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/podcctv/runman-agent/main/in
 
 > 定制 alpine-base 由你自行构建/托管（例如基于 https://github.com/podcctv/alpine-base ），与上面的 simplestreams 镜像服务器是两套独立资源。
 
+Incus 下新建 Alpine 容器时，Runman 会从所选基础镜像构建 `ready-security-v1` 镜像，并执行 `apk upgrade -U -a` 后再发布。旧版缓存的 `ready` 镜像不会被新建容器复用；该更新只影响后续新建容器，已有容器需单独升级软件包并重启 `sshd`，或重建。
+
 ### 3. SSH 登录欢迎页 / 横幅
 
 预设：`none` / `default` / `minimal` / `project`（面向客户的可替换模板）。`custom` 配合 `--banner-text` 可完全自定义。

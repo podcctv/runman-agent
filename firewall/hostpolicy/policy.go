@@ -23,7 +23,10 @@ import (
 )
 
 // Keep the management API limit aligned with rfw-common::MAX_RULES.
-const maxRules = 64
+const (
+	maxRules                    = 64
+	platformDefaultsVersion int = 1
+)
 
 // ErrRFWEventsUnsupported is returned when the RFW build has no HTTP event
 // endpoint. The current upstream v0.1.0 API exposes status and rules only.
@@ -157,9 +160,10 @@ type rfwRule struct {
 }
 
 type persistedState struct {
-	Revision int64         `json:"revision"`
-	Policy   Policy        `json:"policy"`
-	Rules    []managedRule `json:"managed_rules,omitempty"`
+	Revision                int64         `json:"revision"`
+	Policy                  Policy        `json:"policy"`
+	Rules                   []managedRule `json:"managed_rules,omitempty"`
+	PlatformDefaultsVersion int           `json:"platform_defaults_version,omitempty"`
 }
 
 // Runner is injectable so firewall behavior can be tested without changing
@@ -189,7 +193,68 @@ func New(path, rfwAddr string) (*Manager, error) {
 	if err := m.load(); err != nil {
 		return nil, err
 	}
+	if err := m.migratePlatformDefaults(); err != nil {
+		return nil, fmt.Errorf("migrate default host firewall policy: %w", err)
+	}
 	return m, nil
+}
+
+func (m *Manager) migratePlatformDefaults() error {
+	if m.state.PlatformDefaultsVersion >= platformDefaultsVersion {
+		return nil
+	}
+
+	policy := m.state.Policy
+	if m.state.Revision == 0 {
+		policy.Revision = 1
+	} else {
+		policy.Revision = m.state.Revision
+	}
+
+	defaultRule := Rule{
+		Key: "platform-cn-wireguard-in", Priority: 100, Direction: "in", Protocol: "wireguard",
+		Action: "block", Enabled: true, PortStart: 0, IPType: "geoip", Countries: []string{"CN"},
+	}
+	defaultFingerprint, err := ruleFingerprint(defaultRule)
+	if err != nil {
+		return err
+	}
+	for _, existing := range policy.Rules {
+		fingerprint, err := ruleFingerprint(existing)
+		if err != nil {
+			return err
+		}
+		if fingerprint == defaultFingerprint {
+			m.state.Revision = policy.Revision
+			m.state.Policy = policy
+			m.state.PlatformDefaultsVersion = platformDefaultsVersion
+			return m.save()
+		}
+	}
+
+	keyExists := func(key string) bool {
+		for _, existing := range policy.Rules {
+			if existing.Key == key {
+				return true
+			}
+		}
+		return false
+	}
+	for suffix := 1; keyExists(defaultRule.Key); suffix++ {
+		defaultRule.Key = fmt.Sprintf("platform-cn-wireguard-in-%d", suffix)
+	}
+	policy.Rules = append(policy.Rules, defaultRule)
+	if m.state.Revision > 0 {
+		policy.Revision++
+	}
+	policy, err = validatePolicy(policy)
+	if err != nil {
+		return err
+	}
+	m.state.Revision = policy.Revision
+	m.state.Policy = policy
+	m.state.PlatformDefaultsVersion = platformDefaultsVersion
+	return m.save()
 }
 
 func loopbackBaseURL(addr string) (string, error) {

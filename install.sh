@@ -528,7 +528,11 @@ ensure_podman_network_from_config() {
     command -v jq >/dev/null 2>&1 && command -v podman >/dev/null 2>&1 || return 0
     [ "$(jq -r '.virt_type // ""' "$AGENT_CONFIG_FILE" 2>/dev/null)" = "podman" ] || return 0
     if podman network exists "$PODMAN_NETWORK" 2>/dev/null; then
-        disable_podman_network_dns
+        if [ "${PRESERVE_EXISTING_PODMAN_NETWORK:-0}" = "1" ]; then
+            log "$(t "Preserving the existing Podman network settings during upgrade." "升级时保留现有 Podman 网络设置。")"
+        else
+            disable_podman_network_dns
+        fi
         return 0
     fi
 
@@ -1825,7 +1829,48 @@ enable_bbr() {
     log "$(t "Configuring kernel parameters (BBR + forwarding)..." "配置内核参数 (BBR + 转发)...")"
     # 多厂商兼容：DO/Hetzner/部分 VPS 默认 ip_forward=0、IPv6 forwarding=0，
     # 容器/VM 出网会失败；启用 forwarding 后 IPv6 RA 默认会被拒，accept_ra=2 才能保留默认路由。
-    cat > /etc/sysctl.d/99-narwhalcloud.conf <<'EOF'
+    # This file also stores per-interface IPv6 settings written by
+    # configure_host_ipv6_routing. Replace only the keys owned here so a full
+    # upgrade cannot erase those routes' RA/autoconf settings.
+    local sysctl_file="/etc/sysctl.d/99-narwhalcloud.conf" sysctl_tmp
+    sysctl_tmp=$(mktemp "${sysctl_file}.XXXXXX") || die "Cannot prepare sysctl configuration."
+    if [ -f "$sysctl_file" ]; then
+        awk '
+            BEGIN {
+                managed["net.core.default_qdisc"] = 1
+                managed["net.ipv4.tcp_congestion_control"] = 1
+                managed["fs.inotify.max_user_instances"] = 1
+                managed["fs.inotify.max_user_watches"] = 1
+                managed["fs.inotify.max_queued_events"] = 1
+                managed["kernel.pid_max"] = 1
+                managed["fs.file-max"] = 1
+                managed["fs.nr_open"] = 1
+                managed["vm.swappiness"] = 1
+                managed["net.ipv4.ip_forward"] = 1
+                managed["net.ipv6.conf.all.forwarding"] = 1
+                managed["net.ipv6.conf.default.forwarding"] = 1
+                managed["net.ipv6.conf.all.accept_ra"] = 1
+                managed["net.ipv6.conf.default.accept_ra"] = 1
+                managed["net.ipv6.conf.all.use_tempaddr"] = 1
+                managed["net.ipv6.conf.default.use_tempaddr"] = 1
+            }
+            {
+                line = $0
+                sub(/^[[:space:]]+/, "", line)
+                if (line !~ /^#/ && line ~ /=/) {
+                    key = line
+                    sub(/=.*/, "", key)
+                    gsub(/[[:space:]]/, "", key)
+                    if (key in managed) next
+                }
+                print $0
+            }
+        ' "$sysctl_file" > "$sysctl_tmp" || {
+            rm -f "$sysctl_tmp"
+            die "Cannot preserve existing sysctl configuration."
+        }
+    fi
+    cat >> "$sysctl_tmp" <<'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 fs.inotify.max_user_instances=524288
@@ -1843,7 +1888,9 @@ net.ipv6.conf.default.accept_ra=2
 net.ipv6.conf.all.use_tempaddr=0
 net.ipv6.conf.default.use_tempaddr=0
 EOF
-    sysctl -p /etc/sysctl.d/99-narwhalcloud.conf >/dev/null 2>&1 \
+    chmod 644 "$sysctl_tmp" && mv -f "$sysctl_tmp" "$sysctl_file" \
+        || { rm -f "$sysctl_tmp"; die "Failed to update sysctl configuration."; }
+    sysctl -p "$sysctl_file" >/dev/null 2>&1 \
         && log "$(t "✓ Kernel parameters configured." "✓ 内核参数已配置。")" \
         || log "$(t "Kernel parameters will take effect after reboot." "内核参数将在重启后生效。")"
 }
@@ -2168,26 +2215,247 @@ EOF
 }
 
 rfw_api_ready() {
-    local attempts="${1:-10}" i
+    local attempts="${1:-10}" initial_restarts="${2:-0}" max_restarts="${3:-0}" i restarts state
+    [[ "$initial_restarts" =~ ^[0-9]+$ ]] || initial_restarts=0
+    [[ "$max_restarts" =~ ^[0-9]+$ ]] || max_restarts=0
     for ((i = 0; i < attempts; i++)); do
         curl -sf "http://$RFW_API_ADDR/api/status" >/dev/null 2>&1 && return 0
+        if [ "$max_restarts" -gt 0 ]; then
+            state=$(systemctl show -p ActiveState --value rfw 2>/dev/null || true)
+            [ "$state" = "failed" ] && return 1
+            restarts=$(systemctl show -p NRestarts --value rfw 2>/dev/null || echo 0)
+            [[ "$restarts" =~ ^[0-9]+$ ]] || restarts=0
+            if [ "$restarts" -ge "$((initial_restarts + max_restarts))" ]; then
+                log "RFW restarted $((restarts - initial_restarts)) times before its API became ready."
+                return 1
+            fi
+        fi
         sleep 1
     done
     return 1
 }
 
+rfw_binary_supports_api() {
+    local binary="$1"
+    [ -x "$binary" ] && "$binary" --api-addr "$RFW_API_ADDR" --version >/dev/null 2>&1
+}
+
+rfw_set_unit_failure_limits() {
+    local unit_file="$1" tmp add_interval=0 add_burst=0
+    grep -Eq '^StartLimitInterval(Sec)?=' "$unit_file" || add_interval=1
+    grep -q '^StartLimitBurst=' "$unit_file" || add_burst=1
+    [ "$add_interval" = "1" ] || [ "$add_burst" = "1" ] || return 0
+    grep -q '^\[Unit\]$' "$unit_file" || return 1
+    tmp=$(mktemp "${unit_file}.XXXXXX") || return 1
+    awk -v add_interval="$add_interval" -v add_burst="$add_burst" '
+        { print }
+        /^\[Unit\]$/ {
+            if (add_interval == "1") print "StartLimitIntervalSec=60"
+            if (add_burst == "1") print "StartLimitBurst=3"
+        }
+    ' "$unit_file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 644 "$tmp" && mv -f "$tmp" "$unit_file" || { rm -f "$tmp"; return 1; }
+}
+
+rfw_restore_install_snapshot() {
+    local snapshot="$1" had_binary="$2" had_unit="$3" was_active="$4" was_enabled="$5"
+    local unit="/etc/systemd/system/rfw.service" restore_tmp
+
+    log "RFW did not become ready; restoring its previous binary and service unit."
+    systemctl stop rfw >/dev/null 2>&1 || true
+
+    if [ "$had_binary" = "1" ]; then
+        restore_tmp="$RFW_BIN_DIR/rfw.restore.$$"
+        rm -f "$restore_tmp"
+        cp -a "$snapshot/rfw" "$restore_tmp" && mv -f "$restore_tmp" "$RFW_BIN_DIR/rfw" || {
+            rm -f "$restore_tmp"
+            log "Error: failed to restore the previous RFW binary."
+            return 1
+        }
+    else
+        rm -f "$RFW_BIN_DIR/rfw"
+    fi
+
+    if [ "$had_unit" = "1" ]; then
+        restore_tmp="${unit}.restore.$$"
+        rm -f "$restore_tmp"
+        cp -a "$snapshot/rfw.service" "$restore_tmp" && mv -f "$restore_tmp" "$unit" || {
+            rm -f "$restore_tmp"
+            log "Error: failed to restore the previous RFW service unit."
+            return 1
+        }
+    else
+        systemctl disable rfw >/dev/null 2>&1 || true
+        rm -f "$unit"
+    fi
+
+    systemctl daemon-reload || return 1
+    systemctl reset-failed rfw >/dev/null 2>&1 || true
+    if [ "$was_enabled" = "1" ]; then
+        systemctl enable rfw >/dev/null 2>&1 || true
+    else
+        systemctl disable rfw >/dev/null 2>&1 || true
+    fi
+    if [ "$was_active" = "1" ] && [ "$had_binary" = "1" ] && [ "$had_unit" = "1" ]; then
+        systemctl start rfw || log "Error: the previous RFW service could not be restarted after rollback."
+    fi
+}
+
+rfw_configure_existing_unit() {
+    local unit="/etc/systemd/system/rfw.service"
+    local old_exec iface xdp_mode option new_exec tmp fallback_iface
+    [ -f "$unit" ] || return 1
+    if [ "$(grep -c '^ExecStart=' "$unit" || true)" != "1" ]; then
+        log "Error: expected one ExecStart in $unit; leaving the existing unit untouched."
+        return 1
+    fi
+    old_exec=$(sed -n 's/^ExecStart=//p' "$unit")
+
+    # Current RFW accepts these runtime options. Legacy block flags are moved
+    # into API rules; unknown options must be reviewed instead of silently lost.
+    while IFS= read -r option; do
+        [ -n "$option" ] || continue
+        case "$option" in
+            --iface|--xdp-mode|--api-addr|--rules-file|--geoip-dir|--countries|--block-email|--block-http|--block-socks5|--block-fet-strict|--block-wireguard) ;;
+            *) log "Error: unsupported legacy RFW option $option; leaving the existing unit untouched."; return 1 ;;
+        esac
+    done < <(printf '%s\n' "$old_exec" | grep -oE -- '--[[:alnum:]-]+' | sort -u || true)
+
+    if [[ "$old_exec" =~ --iface[[:space:]]+([^[:space:]]+) ]]; then
+        iface="${BASH_REMATCH[1]}"
+    elif [[ "$old_exec" =~ --iface=([^[:space:]]+) ]]; then
+        iface="${BASH_REMATCH[1]}"
+    elif [[ "$old_exec" =~ -i[[:space:]]+([^[:space:]]+) ]]; then
+        iface="${BASH_REMATCH[1]}"
+    fi
+    if [[ "$old_exec" =~ --xdp-mode[[:space:]]+([^[:space:]]+) ]]; then
+        xdp_mode="${BASH_REMATCH[1]}"
+    elif [[ "$old_exec" =~ --xdp-mode=([^[:space:]]+) ]]; then
+        xdp_mode="${BASH_REMATCH[1]}"
+    fi
+
+    if [ -z "${iface:-}" ] || ! ip link show dev "$iface" >/dev/null 2>&1 \
+        || [ "$iface" = "lo" ] || [ "$iface" = "incusbr0" ] \
+        || [[ "$iface" == podman* ]] || [[ "$iface" == veth* ]] || [[ "$iface" == docker* ]]; then
+        fallback_iface=$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $5}')
+        if [ -z "$fallback_iface" ] || ! ip link show dev "$fallback_iface" >/dev/null 2>&1; then
+            log "Error: cannot select an active RFW uplink interface."
+            return 1
+        fi
+        if [ -n "${iface:-}" ] && [ "$iface" != "$fallback_iface" ]; then
+            log "Migrating legacy RFW interface $iface to default uplink $fallback_iface."
+        fi
+        iface="$fallback_iface"
+    fi
+
+    new_exec="$RFW_BIN_DIR/rfw --iface $iface"
+    [ -n "${xdp_mode:-}" ] && new_exec="$new_exec --xdp-mode $xdp_mode"
+    new_exec="$new_exec --api-addr $RFW_API_ADDR --rules-file $RFW_BIN_DIR/rfw.json --geoip-dir $RFW_BIN_DIR/geoip"
+    tmp=$(mktemp "${unit}.XXXXXX") || return 1
+    if ! awk -v replacement="ExecStart=$new_exec" '
+        /^ExecStart=/ { print replacement; next }
+        { print }
+    ' "$unit" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if grep -q '^WorkingDirectory=' "$tmp"; then
+        sed -i "s|^WorkingDirectory=.*|WorkingDirectory=$RFW_BIN_DIR|" "$tmp"
+    else
+        local tmp2
+        tmp2=$(mktemp "${unit}.XXXXXX") || { rm -f "$tmp"; return 1; }
+        awk -v directory="WorkingDirectory=$RFW_BIN_DIR" '
+            { print }
+            /^\[Service\]$/ { print directory }
+        ' "$tmp" > "$tmp2" || { rm -f "$tmp" "$tmp2"; return 1; }
+        mv -f "$tmp2" "$tmp"
+    fi
+    if grep -Fxq 'Environment=RUST_LOG=info' "$tmp"; then
+        sed -i 's/^Environment=RUST_LOG=info$/Environment=RUST_LOG=warn/' "$tmp"
+    elif ! grep -q '^Environment=RUST_LOG=' "$tmp"; then
+        local tmp2
+        tmp2=$(mktemp "${unit}.XXXXXX") || { rm -f "$tmp"; return 1; }
+        awk '
+            { print }
+            /^\[Service\]$/ { print "Environment=RUST_LOG=warn" }
+        ' "$tmp" > "$tmp2" || { rm -f "$tmp" "$tmp2"; return 1; }
+        mv -f "$tmp2" "$tmp"
+    fi
+    if ! rfw_set_unit_failure_limits "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! cmp -s "$unit" "$tmp"; then
+        chmod 644 "$tmp" && mv -f "$tmp" "$unit" || { rm -f "$tmp"; return 1; }
+        _rfw_unit_changed=1
+    else
+        rm -f "$tmp"
+    fi
+}
+
+rfw_ensure_rule() {
+    local desired="$1" rules
+    rules=$(curl -sf "http://$RFW_API_ADDR/api/rules") || return 1
+    printf '%s' "$rules" | jq -e 'type == "array"' >/dev/null || return 1
+    if printf '%s' "$rules" | jq -e --argjson d "$desired" '
+        any(.[];
+            .priority == $d.priority and .enabled == $d.enabled and
+            .direction == $d.direction and .protocol == $d.protocol and
+            .action == $d.action and .port_start == $d.port_start and
+            (.port_end // .port_start) == ($d.port_end // $d.port_start) and
+            .ip_type == $d.ip_type and
+            ((.countries // [] | sort) == ($d.countries // [] | sort)) and
+            (.ip // "") == ($d.ip // "")
+        )
+    ' >/dev/null; then
+        return 0
+    fi
+    curl -fsS -X POST "http://$RFW_API_ADDR/api/rules" \
+        -H 'Content-Type: application/json' -d "$desired" >/dev/null
+}
+
+rfw_ensure_default_rules() {
+    local protocol port rule
+    for protocol in http socks fet; do
+        rule="{\"priority\":100,\"direction\":\"in\",\"protocol\":\"$protocol\",\"action\":\"block\",\"port_start\":0,\"enabled\":true,\"ip_type\":\"geoip\",\"countries\":[\"CN\"]}"
+        rfw_ensure_rule "$rule" || return 1
+    done
+    for port in 25 465 587; do
+        rule="{\"priority\":100,\"direction\":\"out\",\"protocol\":\"tcp\",\"action\":\"block\",\"port_start\":$port,\"enabled\":true,\"ip_type\":\"any\"}"
+        rfw_ensure_rule "$rule" || return 1
+    done
+}
+
 enable_rfw_skb_mode() {
     local unit="/etc/systemd/system/rfw.service"
+    local tmp
     [ -f "$unit" ] || return 1
     grep -Fq -- "--xdp-mode skb" "$unit" && return 0
-    sed -i '/^ExecStart=/ s/$/ --xdp-mode skb/' "$unit"
+    tmp=$(mktemp "${unit}.XXXXXX") || return 1
+    awk '
+        /^ExecStart=/ {
+            line = $0
+            gsub(/ --xdp-mode(=| )[[:alnum:]-]+/, "", line)
+            print line " --xdp-mode skb"
+            next
+        }
+        { print }
+    ' "$unit" > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 644 "$tmp" && mv -f "$tmp" "$unit" || { rm -f "$tmp"; return 1; }
     systemctl daemon-reload
+    systemctl reset-failed rfw >/dev/null 2>&1 || true
     systemctl restart rfw
 }
 
 install_rfw() {
     local mode="${1:-0}" # 0: normal (prompt), 1: force (no prompt), 2: update-only (no prompt, only if exists)
     local ARCH
+    local candidate="$RFW_BIN_DIR/rfw.new"
+    local _rfw_bin_changed=0
+    local _rfw_unit_changed=0
+    local _rfw_snapshot="" _rfw_had_binary=0 _rfw_had_unit=0
+    local _rfw_was_active=0 _rfw_was_enabled=0 _rfw_restart_baseline=0
+    local _rfw_install_started
     ARCH=$(detect_arch)
 
     if [ "$mode" = "0" ]; then
@@ -2199,25 +2467,73 @@ install_rfw() {
 
     log "$(t "Installing/Updating rfw..." "正在安装/更新 rfw...")"
     mkdir -p "$RFW_BIN_DIR"
+    rm -f "$candidate"
 
     # 调试模式：检查本地文件
     if [ -f "./rfw-$ARCH" ]; then
         log "$(t "Found local rfw binary: ./rfw-$ARCH (debug mode)" "找到本地 rfw 二进制: ./rfw-$ARCH (调试模式)")"
-        cp "./rfw-$ARCH" "$RFW_BIN_DIR/rfw"
-        chmod +x "$RFW_BIN_DIR/rfw"
+        cp "./rfw-$ARCH" "$candidate"
     else
         # 生产模式：从远程下载 (即使已存在也更新)
-        if download_with_retry "$RFW_BASE/rfw-$ARCH" "$RFW_BIN_DIR/rfw.new"; then
-            chmod +x "$RFW_BIN_DIR/rfw.new"
-            systemctl is-active --quiet rfw && systemctl stop rfw
-            mv "$RFW_BIN_DIR/rfw.new" "$RFW_BIN_DIR/rfw"
+        if ! download_with_retry "$RFW_BASE/rfw-$ARCH" "$candidate"; then
+            rm -f "$candidate"
+            log "$(t "Warning: rfw download failed." "警告: rfw 下载失败。")"
+            if ! rfw_binary_supports_api "$RFW_BIN_DIR/rfw"; then
+                log "$(t "Error: no API-capable rfw binary is available; keeping the current service untouched." "错误：没有可用的 API 版 rfw；保留当前服务，不做切换。")"
+                return 1
+            fi
         else
-             log "$(t "Warning: rfw download failed." "警告: rfw 下载失败。")"
-             [ -f "$RFW_BIN_DIR/rfw" ] || return 0
+            chmod +x "$candidate"
         fi
     fi
 
-    _rfw_unit_changed=0
+    if [ -f "$candidate" ]; then
+        chmod +x "$candidate"
+        if ! rfw_binary_supports_api "$candidate"; then
+            rm -f "$candidate"
+            log "$(t "Error: downloaded rfw does not support --api-addr; keeping the current service untouched." "错误：下载的 rfw 不支持 --api-addr；保留当前服务，不做切换。")"
+            return 1
+        fi
+    elif ! rfw_binary_supports_api "$RFW_BIN_DIR/rfw"; then
+        log "$(t "Error: installed rfw does not support the management API." "错误：已安装的 rfw 不支持管理 API。")"
+        return 1
+    fi
+
+    _rfw_snapshot=$(mktemp -d "$RFW_BIN_DIR/.rfw-install-snapshot.XXXXXX") || {
+        rm -f "$candidate"
+        log "Error: cannot create an RFW rollback snapshot."
+        return 1
+    }
+    if [ -f "$RFW_BIN_DIR/rfw" ]; then
+        cp -a "$RFW_BIN_DIR/rfw" "$_rfw_snapshot/rfw" || {
+            rm -rf -- "$_rfw_snapshot"
+            rm -f "$candidate"
+            log "Error: cannot snapshot the installed RFW binary."
+            return 1
+        }
+        _rfw_had_binary=1
+    fi
+    if [ -f "/etc/systemd/system/rfw.service" ]; then
+        cp -a "/etc/systemd/system/rfw.service" "$_rfw_snapshot/rfw.service" || {
+            rm -rf -- "$_rfw_snapshot"
+            rm -f "$candidate"
+            log "Error: cannot snapshot the RFW service unit."
+            return 1
+        }
+        _rfw_had_unit=1
+    fi
+    [ "$(systemctl show -p ActiveState --value rfw 2>/dev/null || true)" = "active" ] && _rfw_was_active=1
+    systemctl is-enabled --quiet rfw 2>/dev/null && _rfw_was_enabled=1
+    _rfw_install_started=$(date --iso-8601=seconds)
+
+    if [ -f "/etc/systemd/system/rfw.service" ]; then
+        if ! rfw_configure_existing_unit; then
+            rm -rf -- "$_rfw_snapshot"
+            rm -f "$candidate"
+            return 1
+        fi
+    fi
+
     if [ ! -f "/etc/systemd/system/rfw.service" ]; then
         # 过滤掉 lo 及虚拟网桥
         mapfile -t interfaces < <(ip -o link show | awk -F': ' '{print $2}' \
@@ -2226,6 +2542,8 @@ install_rfw() {
 
         if [ ${#interfaces[@]} -eq 0 ]; then
             log "$(t "Error: no available WAN interfaces found." "错误: 未找到可用的 WAN 网卡。")"
+            rm -rf -- "$_rfw_snapshot"
+            rm -f "$candidate"
             return 1
         elif [ ${#interfaces[@]} -eq 1 ]; then
             SEL_IFACE="${interfaces[0]}"
@@ -2254,6 +2572,8 @@ install_rfw() {
 [Unit]
 Description=RFW eBPF Firewall
 After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -2261,72 +2581,88 @@ User=root
 # Per-packet INFO logs can overwhelm journald during normal high traffic or an attack.
 Environment=RUST_LOG=warn
 WorkingDirectory=$RFW_BIN_DIR
-ExecStart=$RFW_BIN_DIR/rfw --iface $SEL_IFACE --api-addr $RFW_API_ADDR
+ExecStart=$RFW_BIN_DIR/rfw --iface $SEL_IFACE --api-addr $RFW_API_ADDR --rules-file $RFW_BIN_DIR/rfw.json --geoip-dir $RFW_BIN_DIR/geoip
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
         _rfw_unit_changed=1
         log "$(t "✓ rfw service file written. API listens on $RFW_API_ADDR (local only)." "✓ rfw 服务文件已写入，API 监听 $RFW_API_ADDR（仅本地）。")"
-    elif grep -Fqx "Environment=RUST_LOG=info" /etc/systemd/system/rfw.service; then
-        # Upgrade installer-managed units so normal packet events do not flood journald.
-        sed -i 's/^Environment=RUST_LOG=info$/Environment=RUST_LOG=warn/' /etc/systemd/system/rfw.service
-        systemctl daemon-reload
-        _rfw_unit_changed=1
-        log "$(t "rfw packet logging changed to warn level." "rfw 逐包日志已调整为 warn 级别。")"
     fi
-    
-    if [ "$_rfw_unit_changed" = "1" ] && systemctl is-active --quiet rfw; then
-        systemctl restart rfw
+
+    if [ "$_rfw_unit_changed" = "1" ] || [ -f "$candidate" ]; then
+        # Stop even a crash-looping unit before swapping the executable.
+        systemctl stop rfw >/dev/null 2>&1 || true
     fi
-    start_service rfw
+    if [ -f "$candidate" ]; then
+        if ! mv -f "$candidate" "$RFW_BIN_DIR/rfw"; then
+            rfw_restore_install_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
+            rm -rf -- "$_rfw_snapshot"
+            rm -f "$candidate"
+            log "Error: failed to install the staged RFW binary."
+            return 1
+        fi
+        _rfw_bin_changed=1
+    fi
+
+    if [ "$_rfw_unit_changed" = "1" ]; then
+        if ! systemctl daemon-reload; then
+            rfw_restore_install_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
+            rm -rf -- "$_rfw_snapshot"
+            log "Error: failed to reload the RFW service unit."
+            return 1
+        fi
+    fi
+    systemctl reset-failed rfw >/dev/null 2>&1 || true
+    _rfw_restart_baseline=$(systemctl show -p NRestarts --value rfw 2>/dev/null || echo 0)
+    if ! systemctl start rfw; then
+        rfw_restore_install_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
+        rm -rf -- "$_rfw_snapshot"
+        log "Error: failed to start rfw; the previous installation was restored."
+        return 1
+    fi
+    if ! systemctl enable rfw >/dev/null 2>&1; then
+        rfw_restore_install_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
+        rm -rf -- "$_rfw_snapshot"
+        log "Error: failed to enable rfw at boot; the previous installation was restored."
+        return 1
+    fi
+    log "$(t "Service rfw started." "服务 rfw 已启动。")"
 
     # The API starts after eBPF attaches and persisted GeoIP rules are restored;
     # a cold download may take up to the rfw HTTP client's 30-second timeout.
     # Some cloud NICs reject the default native XDP mode but support generic SKB.
     _rfw_ready=0
-    if rfw_api_ready 45; then
+    if rfw_api_ready 45 "$_rfw_restart_baseline" 3; then
         _rfw_ready=1
-    elif journalctl -u rfw -b --no-pager -n 120 2>/dev/null | grep -Eiq 'XDP.*(附加失败|attach failed)|failed to attach.*XDP'; then
+    elif journalctl -u rfw --since "$_rfw_install_started" --no-pager -n 120 2>/dev/null | grep -Eiq 'XDP.*(附加失败|attach failed)|failed to attach.*XDP'; then
         log "$(t "rfw XDP native mode is unsupported; retrying in SKB mode." "rfw 默认 XDP 模式不受该网卡支持，正在改用兼容的 SKB 模式重试。")"
-        if enable_rfw_skb_mode && rfw_api_ready 15; then
-            _rfw_ready=1
-            log "$(t "✓ rfw API is ready in SKB mode." "✓ rfw API 已通过 SKB 模式就绪。")"
+        if enable_rfw_skb_mode; then
+            _rfw_restart_baseline=$(systemctl show -p NRestarts --value rfw 2>/dev/null || echo 0)
+            if rfw_api_ready 15 "$_rfw_restart_baseline" 3; then
+                _rfw_ready=1
+                log "$(t "✓ rfw API is ready in SKB mode." "✓ rfw API 已通过 SKB 模式就绪。")"
+            fi
         fi
     fi
 
     if [ "$_rfw_ready" = "1" ]; then
-        # Check if rules already exist
-        _current_rules=$(curl -sf "http://$RFW_API_ADDR/api/rules")
-        if [ "$_current_rules" != "[]" ] && [ -n "$_current_rules" ]; then
-            log "$(t "rfw rules already exist, skipping default rules." "rfw 规则已存在，跳过默认规则安装。")"
-        else
-            log "$(t "Installing default rfw rules..." "安装默认 rfw 规则...")"
-            _geoip_countries='["CN"]'
-
-            # Block inbound http/socks/fet from high-risk regions
-            for _proto in http socks fet; do
-                curl -sf -X POST "http://$RFW_API_ADDR/api/rules" \
-                    -H "Content-Type: application/json" \
-                    -d "{\"priority\":100,\"direction\":\"in\",\"protocol\":\"$_proto\",\"action\":\"block\",\"port_start\":0,\"enabled\":true,\"ip_type\":\"geoip\",\"countries\":$_geoip_countries}" \
-                    >/dev/null
-            done
-
-            # Block outbound SMTP ports (anti-spam)
-            for _port in 25 465 587; do
-                curl -sf -X POST "http://$RFW_API_ADDR/api/rules" \
-                    -H "Content-Type: application/json" \
-                    -d "{\"priority\":100,\"direction\":\"out\",\"protocol\":\"tcp\",\"action\":\"block\",\"port_start\":$_port,\"enabled\":true,\"ip_type\":\"any\"}" \
-                    >/dev/null
-            done
-            log "$(t "✓ Default rfw rules installed/verified." "✓ 默认 rfw 规则已安装/确认。")"
+        if ! rfw_ensure_default_rules; then
+            log "$(t "Error: RFW API is ready but default rule reconciliation failed." "错误：RFW API 已就绪，但默认规则同步失败。")"
+            rm -rf -- "$_rfw_snapshot"
+            return 1
         fi
+        log "$(t "✓ Default rfw rules installed/verified." "✓ 默认 rfw 规则已安装/确认。")"
     else
-        log "$(t "Warning: rfw API not ready, skipping default rules. Check: journalctl -u rfw --no-pager -n 80" "警告：rfw API 未就绪，跳过默认规则安装。请检查：journalctl -u rfw --no-pager -n 80")"
+        log "$(t "Error: rfw API did not become ready; update is incomplete. Check: journalctl -u rfw --no-pager -n 80" "错误：rfw API 未就绪，本次更新未完成。请检查：journalctl -u rfw --no-pager -n 80")"
+        rfw_restore_install_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
+        rm -rf -- "$_rfw_snapshot"
+        return 1
     fi
+
+    rm -rf -- "$_rfw_snapshot"
 
     log "$(t "✓ rfw firewall installed/updated." "✓ rfw 防火墙已安装/更新。")"
 }
@@ -2721,8 +3057,8 @@ fetch_vm_images() {
 }
 
 # ── Prebuilt Incus image import ──────────────────────────────────────────────
-# 导入预构建的 ready 镜像（别名与 Agent ensureReadyImage 一致），跳过首次创建
-# 实例时的在线构建；下载失败时 Agent 会自动回退构建。
+# 导入历史 /ready 别名以兼容既有部署。当前 Agent 的 Alpine 创建流程使用
+# 独立的 ready-security-v1 别名，避免复用未经过包升级的旧 ready 镜像。
 # INCUS_IMAGE_REFRESH=1 时对已存在的别名检查远端更新并重新导入。
 
 incus_ready_alias() {
@@ -3073,6 +3409,9 @@ if systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null || [ -f "$AGENT_BINA
     download_agent "$ARCH" stage
 
     _installed_virt=$(detect_installed_virt_type)
+    # An in-place component upgrade must not change the DNS mode of a live
+    # Podman network used by containers created under an older Agent.
+    PRESERVE_EXISTING_PODMAN_NETWORK=1
     if [ "$IMAGE_MENU" = "1" ] && [ "$NON_INTERACTIVE" != "1" ] && [ -t 0 ]; then
         prompt_existing_image_update "$_installed_virt"
     fi
@@ -3537,7 +3876,6 @@ elif [ "$VIRT_TYPE" = "podman" ]; then
 
 if podman network exists "$PODMAN_NETWORK" 2>/dev/null; then
     log "$(t "Podman network $PODMAN_NETWORK already exists, skipping." "Podman 网络 $PODMAN_NETWORK 已存在，跳过创建。")"
-    disable_podman_network_dns
 elif [ "$IPV6_MODE" = "none" ]; then
     log "$(t "Creating Podman network (IPv4 only)..." "创建 Podman 网络（仅 IPv4）...")"
     podman network create \

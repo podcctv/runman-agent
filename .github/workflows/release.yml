@@ -237,6 +237,9 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
+          # Distributed binaries must not inherit a runner-specific CPU target.
+          # LAX4 and other KVM guests may expose only the x86-64 baseline.
+          unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
           if [ "${{ matrix.variant }}" = "legacy" ]; then
             # Rust's target-cpu setting does not constrain Ring's C sources.
             # Keep every C dependency at the x86-64 baseline for CPUs without AVX2.
