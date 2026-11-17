@@ -2225,7 +2225,7 @@ rfw_api_ready() {
     [[ "$initial_restarts" =~ ^[0-9]+$ ]] || initial_restarts=0
     [[ "$max_restarts" =~ ^[0-9]+$ ]] || max_restarts=0
     for ((i = 0; i < attempts; i++)); do
-        curl -sf "http://$RFW_API_ADDR/api/status" >/dev/null 2>&1 && return 0
+        curl --noproxy '*' -fsS --max-time 2 "http://$RFW_API_ADDR/api/status" >/dev/null 2>&1 && return 0
         if [ "$max_restarts" -gt 0 ]; then
             state=$(systemctl show -p ActiveState --value rfw 2>/dev/null || true)
             [ "$state" = "failed" ] && return 1
@@ -2239,6 +2239,25 @@ rfw_api_ready() {
         sleep 1
     done
     return 1
+}
+
+rfw_api_stable() {
+    local seconds="${1:-60}" expected_restarts="${2:-0}" i state restarts
+    [[ "$seconds" =~ ^[0-9]+$ ]] || return 1
+    [[ "$expected_restarts" =~ ^[0-9]+$ ]] || return 1
+    for ((i = 0; i < seconds; i++)); do
+        state=$(systemctl show -p ActiveState --value rfw 2>/dev/null || true)
+        restarts=$(systemctl show -p NRestarts --value rfw 2>/dev/null || true)
+        if [ "$state" != "active" ] || [ "$restarts" != "$expected_restarts" ]; then
+            log "RFW stability check failed (state=${state:-unknown} restarts=${restarts:-unknown}, expected=$expected_restarts)."
+            return 1
+        fi
+        curl --noproxy '*' -fsS --max-time 2 "http://$RFW_API_ADDR/api/status" >/dev/null 2>&1 || {
+            log "RFW API stopped responding during its stability window."
+            return 1
+        }
+        sleep 1
+    done
 }
 
 rfw_binary_supports_api() {
@@ -2266,11 +2285,63 @@ rfw_recent_sigill() {
 
 rfw_asset_for_host() {
     local arch="$1"
-    if [ "$arch" = "amd64" ] && { ! rfw_cpu_has_avx2 || rfw_recent_sigill; }; then
+    if [ "$arch" != "amd64" ]; then
+        printf 'rfw-%s\n' "$arch"
+    elif ! rfw_cpu_has_avx2; then
+        log "CPU does not expose AVX2; selecting the x86-64 baseline RFW asset." >&2
+        printf 'rfw-amd64-legacy\n'
+    elif rfw_recent_sigill; then
+        log "Recent RFW SIGILL detected; selecting the x86-64 baseline RFW asset." >&2
         printf 'rfw-amd64-legacy\n'
     else
-        printf 'rfw-%s\n' "$arch"
+        log "CPU exposes AVX2 and no recent RFW SIGILL was found; selecting the standard RFW asset." >&2
+        printf 'rfw-amd64\n'
     fi
+}
+
+rfw_binary_matches_arch() {
+    local binary="$1" arch="$2"
+    python3 - "$binary" "$arch" <<'PY'
+import sys
+
+expected_machine = {"amd64": 62, "arm64": 183}.get(sys.argv[2])
+with open(sys.argv[1], "rb") as source:
+    header = source.read(20)
+if (expected_machine is None or len(header) != 20 or
+        header[:6] != b"\x7fELF\x02\x01" or
+        int.from_bytes(header[18:20], "little") != expected_machine):
+    raise SystemExit("RFW candidate is not an ELF64 binary for this host architecture")
+PY
+}
+
+rfw_download_verified_asset() {
+    local asset="$1" destination="$2" sums count expected actual
+    sums=$(mktemp "$RFW_BIN_DIR/.rfw-SHA256SUMS.XXXXXX") || return 1
+    if ! download_with_retry "$RFW_BASE/SHA256SUMS" "$sums"; then
+        rm -f "$sums"
+        log "Error: cannot download the RFW release checksum list."
+        return 1
+    fi
+    if ! download_with_retry "$RFW_BASE/$asset" "$destination"; then
+        rm -f "$sums"
+        log "Error: cannot download the selected RFW asset $asset."
+        return 1
+    fi
+    count=$(grep -Ec "  \\*?$asset\$" "$sums" || true)
+    if [ "$count" != "1" ]; then
+        rm -f "$sums" "$destination"
+        log "Error: the release checksum list must contain exactly one entry for $asset."
+        return 1
+    fi
+    expected=$(grep -E "  \\*?$asset\$" "$sums" | awk 'NR == 1 {print $1}')
+    actual=$(sha256sum "$destination" | awk '{print $1}')
+    rm -f "$sums"
+    if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+        rm -f "$destination"
+        log "Error: checksum verification failed for $asset."
+        return 1
+    fi
+    log "Verified SHA-256 for $asset."
 }
 
 rfw_set_unit_failure_limits() {
@@ -2330,8 +2401,26 @@ rfw_restore_install_snapshot() {
         systemctl disable rfw >/dev/null 2>&1 || true
     fi
     if [ "$was_active" = "1" ] && [ "$had_binary" = "1" ] && [ "$had_unit" = "1" ]; then
-        systemctl start rfw || log "Error: the previous RFW service could not be restarted after rollback."
+        local restore_baseline
+        restore_baseline=$(systemctl show -p NRestarts --value rfw 2>/dev/null || echo 0)
+        if ! systemctl start rfw \
+            || ! rfw_api_ready 30 "$restore_baseline" 3 \
+            || ! rfw_api_stable 15 "$restore_baseline"; then
+            log "Error: the previous RFW service did not pass rollback health checks."
+            return 1
+        fi
+        log "Previous RFW binary restored and API health verified."
     fi
+}
+
+rfw_restore_or_keep_snapshot() {
+    local snapshot="$1" had_binary="$2" had_unit="$3" was_active="$4" was_enabled="$5"
+    if rfw_restore_install_snapshot "$snapshot" "$had_binary" "$had_unit" "$was_active" "$was_enabled"; then
+        rm -rf -- "$snapshot"
+        return 0
+    fi
+    log "Error: RFW rollback needs attention; the pre-upgrade snapshot was kept at $snapshot."
+    return 1
 }
 
 rfw_configure_existing_unit() {
@@ -2482,7 +2571,7 @@ enable_rfw_skb_mode() {
 
 install_rfw() {
     local mode="${1:-0}" # 0: normal (prompt), 1: force (no prompt), 2: update-only (no prompt, only if exists)
-    local ARCH rfw_asset
+    local ARCH rfw_asset candidate_version
     local candidate="$RFW_BIN_DIR/rfw.new"
     local _rfw_bin_changed=0
     local _rfw_unit_changed=0
@@ -2510,10 +2599,10 @@ install_rfw() {
         cp "./$rfw_asset" "$candidate"
     else
         # 生产模式：从远程下载 (即使已存在也更新)
-        if ! download_with_retry "$RFW_BASE/$rfw_asset" "$candidate"; then
+        if ! rfw_download_verified_asset "$rfw_asset" "$candidate"; then
             rm -f "$candidate"
             if [ "$rfw_asset" != "rfw-$ARCH" ]; then
-                log "Error: the CPU-compatible RFW asset $rfw_asset could not be downloaded; leaving the current service untouched."
+                log "Error: the CPU-compatible RFW asset $rfw_asset could not be verified; leaving the current service untouched."
                 return 1
             fi
             log "$(t "Warning: rfw download failed." "警告: rfw 下载失败。")"
@@ -2528,11 +2617,22 @@ install_rfw() {
 
     if [ -f "$candidate" ]; then
         chmod +x "$candidate"
+        if ! rfw_binary_matches_arch "$candidate" "$ARCH"; then
+            rm -f "$candidate"
+            log "Error: selected RFW asset is not an ELF64 binary for architecture $ARCH; keeping the installed firewall."
+            return 1
+        fi
         if ! rfw_binary_supports_api "$candidate"; then
             rm -f "$candidate"
             log "$(t "Error: downloaded rfw does not support --api-addr; keeping the current service untouched." "错误：下载的 rfw 不支持 --api-addr；保留当前服务，不做切换。")"
             return 1
         fi
+        candidate_version=$("$candidate" --api-addr "$RFW_API_ADDR" --version 2>&1) || {
+            rm -f "$candidate"
+            log "Error: selected RFW candidate cannot execute on this host; keeping the installed firewall."
+            return 1
+        }
+        log "RFW candidate preflight passed: $candidate_version"
     elif ! rfw_binary_supports_api "$RFW_BIN_DIR/rfw"; then
         log "$(t "Error: installed rfw does not support the management API." "错误：已安装的 rfw 不支持管理 API。")"
         return 1
@@ -2637,8 +2737,7 @@ EOF
     fi
     if [ -f "$candidate" ]; then
         if ! mv -f "$candidate" "$RFW_BIN_DIR/rfw"; then
-            rfw_restore_install_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
-            rm -rf -- "$_rfw_snapshot"
+            rfw_restore_or_keep_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
             rm -f "$candidate"
             log "Error: failed to install the staged RFW binary."
             return 1
@@ -2648,8 +2747,7 @@ EOF
 
     if [ "$_rfw_unit_changed" = "1" ]; then
         if ! systemctl daemon-reload; then
-            rfw_restore_install_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
-            rm -rf -- "$_rfw_snapshot"
+            rfw_restore_or_keep_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
             log "Error: failed to reload the RFW service unit."
             return 1
         fi
@@ -2657,15 +2755,13 @@ EOF
     systemctl reset-failed rfw >/dev/null 2>&1 || true
     _rfw_restart_baseline=$(systemctl show -p NRestarts --value rfw 2>/dev/null || echo 0)
     if ! systemctl start rfw; then
-        rfw_restore_install_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
-        rm -rf -- "$_rfw_snapshot"
-        log "Error: failed to start rfw; the previous installation was restored."
+        rfw_restore_or_keep_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
+        log "Error: failed to start rfw; rollback was attempted."
         return 1
     fi
     if ! systemctl enable rfw >/dev/null 2>&1; then
-        rfw_restore_install_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
-        rm -rf -- "$_rfw_snapshot"
-        log "Error: failed to enable rfw at boot; the previous installation was restored."
+        rfw_restore_or_keep_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
+        log "Error: failed to enable rfw at boot; rollback was attempted."
         return 1
     fi
     log "$(t "Service rfw started." "服务 rfw 已启动。")"
@@ -2690,14 +2786,19 @@ EOF
     if [ "$_rfw_ready" = "1" ]; then
         if ! rfw_ensure_default_rules; then
             log "$(t "Error: RFW API is ready but default rule reconciliation failed." "错误：RFW API 已就绪，但默认规则同步失败。")"
-            rm -rf -- "$_rfw_snapshot"
+            rfw_restore_or_keep_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
             return 1
         fi
         log "$(t "✓ Default rfw rules installed/verified." "✓ 默认 rfw 规则已安装/确认。")"
+        if ! rfw_api_stable 60 "$_rfw_restart_baseline"; then
+            log "Error: RFW did not remain healthy for 60 seconds after rule reconciliation; rolling back."
+            rfw_restore_or_keep_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
+            return 1
+        fi
+        log "RFW passed a 60-second API/systemd restart stability gate."
     else
         log "$(t "Error: rfw API did not become ready; update is incomplete. Check: journalctl -u rfw --no-pager -n 80" "错误：rfw API 未就绪，本次更新未完成。请检查：journalctl -u rfw --no-pager -n 80")"
-        rfw_restore_install_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
-        rm -rf -- "$_rfw_snapshot"
+        rfw_restore_or_keep_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
         return 1
     fi
 

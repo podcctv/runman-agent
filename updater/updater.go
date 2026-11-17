@@ -316,6 +316,10 @@ func (s *Service) executeUpdate() error {
 		// Never fall back to a cached script: it may belong to upstream.
 		return err
 	}
+	if err := validateInstallerRFWGuards(installScript); err != nil {
+		return fmt.Errorf("installer RFW safety preflight: %w", err)
+	}
+	log.Printf("[Updater] Downloaded installer passed the RFW safety preflight")
 	if output, err := exec.Command("bash", "-n", installScript).CombinedOutput(); err != nil {
 		return fmt.Errorf("installer syntax check: %w: %s", err, output)
 	}
@@ -336,6 +340,35 @@ func (s *Service) executeUpdate() error {
 
 	log.Printf("[Updater] Update unit started; the installer will run service, web, and database health checks before reporting its result")
 
+	return nil
+}
+
+// Automatic upgrades invoke install.sh in update-only mode, which also replaces
+// RFW. Refuse to run a stale or incomplete installer unless it selects a
+// CPU-compatible asset, validates the downloaded ELF and checksum, and checks
+// service stability with a recoverable snapshot.
+func validateInstallerRFWGuards(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read downloaded installer: %w", err)
+	}
+	script := string(data)
+	required := []string{
+		"rfw_cpu_has_avx2() {",
+		"rfw_recent_sigill() {",
+		"rfw_asset_for_host() {",
+		"rfw-amd64-legacy",
+		"rfw_download_verified_asset() {",
+		"rfw_binary_matches_arch() {",
+		"rfw_api_stable() {",
+		"rfw_restore_or_keep_snapshot() {",
+		`rfw_api_stable 60 "$_rfw_restart_baseline"`,
+	}
+	for _, marker := range required {
+		if !strings.Contains(script, marker) {
+			return fmt.Errorf("downloaded installer is missing required RFW safeguard %q", marker)
+		}
+	}
 	return nil
 }
 
