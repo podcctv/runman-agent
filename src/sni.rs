@@ -145,7 +145,8 @@ pub fn parse_tls_handshake_client_hello_sni(hs: &[u8]) -> SniParse {
                     return SniParse::Malformed;
                 }
                 let name_type = ext_data[spos];
-                let name_len = u16::from_be_bytes([ext_data[spos + 1], ext_data[spos + 2]]) as usize;
+                let name_len =
+                    u16::from_be_bytes([ext_data[spos + 1], ext_data[spos + 2]]) as usize;
                 spos += 3;
                 if spos + name_len > send {
                     return SniParse::Malformed;
@@ -181,8 +182,8 @@ const SHA256_K: [u32; 64] = [
 
 fn sha256_sum(data: &[u8]) -> [u8; 32] {
     let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
     ];
     let bit_len = (data.len() as u64) * 8;
     let mut msg = data.to_vec();
@@ -194,18 +195,30 @@ fn sha256_sum(data: &[u8]) -> [u8; 32] {
     for chunk in msg.chunks_exact(64) {
         let mut w = [0u32; 64];
         for i in 0..16 {
-            w[i] = u32::from_be_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]);
+            w[i] = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
             let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
         }
         let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ ((!e) & g);
-            let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(SHA256_K[i]).wrapping_add(w[i]);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let t2 = s0.wrapping_add(maj);
@@ -252,12 +265,12 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 }
 
 const QUIC_V1_SALT: [u8; 20] = [
-    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c,
-    0xad, 0xcc, 0xbb, 0x7f, 0x0a,
+    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
+    0xcc, 0xbb, 0x7f, 0x0a,
 ];
 const QUIC_V2_SALT: [u8; 20] = [
-    0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d,
-    0xcb, 0xf9, 0xbd, 0x2e, 0xd9,
+    0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb,
+    0xf9, 0xbd, 0x2e, 0xd9,
 ];
 
 #[rustfmt::skip]
@@ -312,9 +325,18 @@ fn aes128_encrypt_block(rk: &[[u8; 16]; 11], input: &[u8; 16]) -> [u8; 16] {
         for b in &mut s {
             *b = AES_SBOX[*b as usize];
         }
-        let t1 = s[1]; s[1] = s[5]; s[5] = s[9]; s[9] = s[13]; s[13] = t1;
-        s.swap(2, 10); s.swap(6, 14);
-        let t3 = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = s[3]; s[3] = t3;
+        let t1 = s[1];
+        s[1] = s[5];
+        s[5] = s[9];
+        s[9] = s[13];
+        s[13] = t1;
+        s.swap(2, 10);
+        s.swap(6, 14);
+        let t3 = s[15];
+        s[15] = s[11];
+        s[11] = s[7];
+        s[7] = s[3];
+        s[3] = t3;
         if round < 10 {
             for col in 0..4 {
                 let c = col * 4;
@@ -452,7 +474,12 @@ pub fn extract_quic_initial_sni(udp_payload: &[u8]) -> SniParse {
     if (first & 0xc0) != 0xc0 {
         return SniParse::NotHandshake;
     }
-    let version = u32::from_be_bytes([udp_payload[1], udp_payload[2], udp_payload[3], udp_payload[4]]);
+    let version = u32::from_be_bytes([
+        udp_payload[1],
+        udp_payload[2],
+        udp_payload[3],
+        udp_payload[4],
+    ]);
     let (salt, is_v2) = match version {
         0x0000_0001 => (&QUIC_V1_SALT, false),
         0x6b33_43cf => (&QUIC_V2_SALT, true),
@@ -509,9 +536,17 @@ pub fn extract_quic_initial_sni(udp_payload: &[u8]) -> SniParse {
     client_in.copy_from_slice(&client_in_vec);
 
     let (lbl_key, lbl_iv, lbl_hp) = if is_v2 {
-        (b"quicv2 key".as_slice(), b"quicv2 iv".as_slice(), b"quicv2 hp".as_slice())
+        (
+            b"quicv2 key".as_slice(),
+            b"quicv2 iv".as_slice(),
+            b"quicv2 hp".as_slice(),
+        )
     } else {
-        (b"quic key".as_slice(), b"quic iv".as_slice(), b"quic hp".as_slice())
+        (
+            b"quic key".as_slice(),
+            b"quic iv".as_slice(),
+            b"quic hp".as_slice(),
+        )
     };
     let mut key = [0u8; 16];
     key.copy_from_slice(&hkdf_expand_label(&client_in, lbl_key, 16));
@@ -614,7 +649,12 @@ pub fn evaluate_inbound_sni(raw: &[u8], is_cn_src: bool) -> SniDecision {
             if end < ihl {
                 return SniDecision::Allow;
             }
-            (IpAddr::V4(Ipv4Addr::new(raw[12], raw[13], raw[14], raw[15])), raw[9], ihl, end)
+            (
+                IpAddr::V4(Ipv4Addr::new(raw[12], raw[13], raw[14], raw[15])),
+                raw[9],
+                ihl,
+                end,
+            )
         }
         6 => {
             if raw.len() < 40 {
@@ -671,7 +711,11 @@ pub fn evaluate_inbound_sni(raw: &[u8], is_cn_src: bool) -> SniDecision {
             }
             let dport = u16::from_be_bytes([raw[offset + 2], raw[offset + 3]]);
             let ulen = u16::from_be_bytes([raw[offset + 4], raw[offset + 5]]) as usize;
-            let end = if ulen >= 8 { (offset + ulen).min(total_end) } else { total_end };
+            let end = if ulen >= 8 {
+                (offset + ulen).min(total_end)
+            } else {
+                total_end
+            };
             (dport, &raw[offset + 8..end])
         }
         _ => return SniDecision::Allow,
@@ -690,12 +734,24 @@ pub fn evaluate_inbound_sni(raw: &[u8], is_cn_src: bool) -> SniDecision {
             if is_allowed_sni(&sni) {
                 SniDecision::Allow
             } else {
-                SniDecision::Block { reason: "disallowed_sni", sni: Some(sni), proto, dport, src_ip }
+                SniDecision::Block {
+                    reason: "disallowed_sni",
+                    sni: Some(sni),
+                    proto,
+                    dport,
+                    src_ip,
+                }
             }
         }
         SniParse::MissingSni | SniParse::Malformed => {
             if is_cn_src {
-                SniDecision::Block { reason: "missing_or_invalid_sni_cn", sni: None, proto, dport, src_ip }
+                SniDecision::Block {
+                    reason: "missing_or_invalid_sni_cn",
+                    sni: None,
+                    proto,
+                    dport,
+                    src_ip,
+                }
             } else {
                 SniDecision::Allow
             }
@@ -728,7 +784,12 @@ mod tests {
         body.extend_from_slice(&[0x13, 0x01, 0x01, 0x00]);
         body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
         body.extend_from_slice(&ext);
-        let mut hs = vec![0x01, ((body.len() >> 16) & 0xff) as u8, ((body.len() >> 8) & 0xff) as u8, (body.len() & 0xff) as u8];
+        let mut hs = vec![
+            0x01,
+            ((body.len() >> 16) & 0xff) as u8,
+            ((body.len() >> 8) & 0xff) as u8,
+            (body.len() & 0xff) as u8,
+        ];
         hs.extend_from_slice(&body);
         hs
     }
@@ -768,6 +829,12 @@ mod tests {
         pkt_no[32] = 0x50;
         pkt_no[40..].copy_from_slice(&tls_no);
         assert_eq!(evaluate_inbound_sni(&pkt_no, false), SniDecision::Allow);
-        assert!(matches!(evaluate_inbound_sni(&pkt_no, true), SniDecision::Block { reason: "missing_or_invalid_sni_cn", .. }));
+        assert!(matches!(
+            evaluate_inbound_sni(&pkt_no, true),
+            SniDecision::Block {
+                reason: "missing_or_invalid_sni_cn",
+                ..
+            }
+        ));
     }
 }
