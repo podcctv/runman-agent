@@ -60,16 +60,26 @@ class UpgradeTests(unittest.TestCase):
         self.tool("uname", "echo x86_64")
         self.tool("systemctl", r'''
 printf 'systemctl %s\n' "$*" >> "$TEST_CALLS"
+state_file="$TEST_ROOT/systemctl-state"
+active="$TEST_ACTIVE"
+[ ! -f "$state_file" ] || active=$(cat "$state_file")
 case "$1" in
   show) printf '%s --config %s\n' "$TEST_ROOT/agent/narwhal-agent" "$TEST_ROOT/agent/config.json" ;;
   cat) echo '[Service]' ;;
-  is-active) test "$TEST_ACTIVE" = 1 ;;
-  restart) test "${TEST_RESTART_FAIL:-0}" != 1 ;;
+  is-active) test "$active" = 1 ;;
+  restart) test "${TEST_RESTART_FAIL:-0}" != 1 && printf '1\n' > "$state_file" ;;
+  stop) printf '0\n' > "$state_file" ;;
+  start) printf '1\n' > "$state_file" ;;
+  reset-failed) exit 0 ;;
   *) exit 91 ;;
 esac
 ''')
         self.tool("curl", r'''
 printf 'curl %s\n' "$*" >> "$TEST_CALLS"
+if [[ "$*" == *"/login"* ]]; then
+  test "${TEST_HEALTH_FAIL:-0}" != 1
+  exit $?
+fi
 test "${TEST_DOWNLOAD_FAIL:-0}" != 1 || exit 22
 test "$1" = -fsSL && test "$2" = -o || exit 92
 cp "$TEST_ROOT/new-agent" "$3"
@@ -165,7 +175,7 @@ exit 93
                                 cwd=self.root, env=self.env, input="1\n14\n",
                                 text=True, capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("Agent-only update complete", result.stdout)
+        self.assertIn("Agent/RFW-only update complete", result.stdout)
         self.assertNotIn("FORBIDDEN", self.calls.read_text())
 
     def test_download_failure_keeps_original_binary(self):
@@ -186,7 +196,14 @@ exit 93
     def test_restart_failure_is_not_reported_as_success(self):
         self.env["TEST_RESTART_FAIL"] = "1"
         output, _ = self.run_installer(success=False)
-        self.assertIn("Agent restart failed. Backup:", output)
+        self.assertIn("previous Agent restored", output)
+        self.assertEqual((self.agent / "narwhal-agent").read_text(), "old-agent")
+
+    def test_update_only_refreshes_rfw_before_agent_binary_replacement(self):
+        source = self.script.read_text()
+        rfw_refresh = source.index('if ! install_rfw 2; then')
+        agent_replace = source.index('if ! mv "$AGENT_BINARY.new" "$AGENT_BINARY"; then')
+        self.assertLess(rfw_refresh, agent_replace)
 
     def test_missing_config_does_not_install_fresh(self):
         (self.agent / "config.json").unlink()

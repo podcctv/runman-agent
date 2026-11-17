@@ -454,7 +454,7 @@ Runman Agent installer
   bash install.sh --cleanup --cleanup-runtimes
                                           Also remove empty Podman/Incus packages
   bash install.sh --virt incus            Install/update Incus backend
-  bash install.sh --update-only           Back up and update Agent only; require an existing installation
+  bash install.sh --update-only           Back up and update existing Agent/RFW only; require an existing installation
   bash install.sh --migrate-rust-v2       Lossy clean rebuild from Go Podman/Incus to Rust v2
   bash install.sh --rust-update           Install/update Rust v2
   RUNMAN_IMAGE_BASE_URL=URL bash install.sh --rust-update
@@ -1020,7 +1020,7 @@ show_go_menu() {
         printf ' 11) %s\n' "$(t "Uninstall Go Agent (keep containers/images)" "卸载 Go Agent（保留容器/镜像）")"
         printf ' 12) %s\n' "$(t "Full Incus cleanup and Go uninstall" "清理 Incus 制品并卸载 Go Agent")"
         printf ' 13) %s\n' "$(t "Configure/refresh Go container images" "配置/刷新 Go 容器镜像")"
-        printf ' 14) %s\n' "$(t "Go Agent-only upgrade / migrate from upstream" "仅升级 Go Agent / 从原版迁移")"
+        printf ' 14) %s\n' "$(t "Go Agent/RFW upgrade / migrate from upstream" "升级 Go Agent/RFW / 从原版迁移")"
         printf ' 15) %s\n' "$(t "Clean host logs and unused images (7-day retention)" "清理主机日志和未使用镜像（保留 7 天）")"
         printf ' 16) %s\n' "$(t "Uninstall Go and remove empty Podman/Incus services" "卸载 Go Agent 并清理空的 Podman/Incus 服务")"
         printf '  0) %s\n' "$(t "Back to version selection" "返回版本选择")"
@@ -2459,7 +2459,7 @@ rfw_configure_existing_unit() {
     if [ -z "${iface:-}" ] || ! ip link show dev "$iface" >/dev/null 2>&1 \
         || [ "$iface" = "lo" ] || [ "$iface" = "incusbr0" ] \
         || [[ "$iface" == podman* ]] || [[ "$iface" == veth* ]] || [[ "$iface" == docker* ]]; then
-        fallback_iface=$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $5}')
+        fallback_iface=$(default_route_iface 4)
         if [ -z "$fallback_iface" ] || ! ip link show dev "$fallback_iface" >/dev/null 2>&1; then
             log "Error: cannot select an active RFW uplink interface."
             return 1
@@ -2759,11 +2759,6 @@ EOF
         log "Error: failed to start rfw; rollback was attempted."
         return 1
     fi
-    if ! systemctl enable rfw >/dev/null 2>&1; then
-        rfw_restore_or_keep_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
-        log "Error: failed to enable rfw at boot; rollback was attempted."
-        return 1
-    fi
     log "$(t "Service rfw started." "服务 rfw 已启动。")"
 
     # The API starts after eBPF attaches and persisted GeoIP rules are restored;
@@ -2800,6 +2795,26 @@ EOF
         log "$(t "Error: rfw API did not become ready; update is incomplete. Check: journalctl -u rfw --no-pager -n 80" "错误：rfw API 未就绪，本次更新未完成。请检查：journalctl -u rfw --no-pager -n 80")"
         rfw_restore_or_keep_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
         return 1
+    fi
+
+    if [ "$mode" = "2" ] && [ "$_rfw_had_unit" = "1" ] && [ "$_rfw_was_enabled" = "0" ]; then
+        if ! systemctl disable rfw >/dev/null 2>&1; then
+            rfw_restore_or_keep_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
+            log "Error: could not preserve the previous disabled RFW state; rollback was attempted."
+            return 1
+        fi
+    elif ! systemctl enable rfw >/dev/null 2>&1; then
+        rfw_restore_or_keep_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
+        log "Error: failed to enable rfw at boot; rollback was attempted."
+        return 1
+    fi
+    if [ "$mode" = "2" ] && [ "$_rfw_had_unit" = "1" ] && [ "$_rfw_was_active" = "0" ]; then
+        if ! systemctl stop rfw >/dev/null 2>&1; then
+            rfw_restore_or_keep_snapshot "$_rfw_snapshot" "$_rfw_had_binary" "$_rfw_had_unit" "$_rfw_was_active" "$_rfw_was_enabled" || true
+            log "Error: could not preserve the previous stopped RFW state; rollback was attempted."
+            return 1
+        fi
+        log "RFW updated and health-checked; the service remains stopped as before."
     fi
 
     rm -rf -- "$_rfw_snapshot"
@@ -3663,9 +3678,10 @@ if systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null || [ -f "$AGENT_BINA
     download_agent "$ARCH" stage
 
     _installed_virt=$(detect_installed_virt_type)
-    # An in-place component upgrade must not change the DNS mode of a live
-    # Podman network used by containers created under an older Agent.
-    PRESERVE_EXISTING_PODMAN_NETWORK=1
+    # Agent/RFW-only upgrades leave the live Podman network untouched. A full
+    # upgrade still reconciles its legacy DNS setting as before.
+    PRESERVE_EXISTING_PODMAN_NETWORK=0
+    [ "$UPDATE_ONLY" = "1" ] && PRESERVE_EXISTING_PODMAN_NETWORK=1
     if [ "$IMAGE_MENU" = "1" ] && [ "$NON_INTERACTIVE" != "1" ] && [ -t 0 ]; then
         prompt_existing_image_update "$_installed_virt"
     fi
@@ -3705,6 +3721,10 @@ if systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null || [ -f "$AGENT_BINA
 
     if [ "$UPDATE_ONLY" = "1" ]; then
         write_update_result running || log "Warning: could not write the update-in-progress marker."
+        if ! install_rfw 2; then
+            write_update_result failed || true
+            die "RFW update failed; the Agent binary was not replaced. Check the RFW journal and retry."
+        fi
     fi
     if ! mv "$AGENT_BINARY.new" "$AGENT_BINARY"; then
         if [ "$UPDATE_ONLY" = "1" ]; then
@@ -3749,7 +3769,7 @@ if systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null || [ -f "$AGENT_BINA
     fi
     log "$(t "✓ NarwhalCloud Agent updated." "✓ NarwhalCloud Agent 已更新。")"
     if [ "$UPDATE_ONLY" = "1" ]; then
-        log "$(t "Agent-only update complete; backend, images and host networking unchanged." "仅 Agent 更新完成；后端、镜像与宿主机网络未改动。")"
+        log "$(t "Agent/RFW-only update complete; backend, images and host networking unchanged." "Agent/RFW 更新完成；后端、镜像与宿主机网络未改动。")"
         exit 0
     fi
 

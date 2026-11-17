@@ -338,7 +338,7 @@ func (s *Service) executeUpdate() error {
 		return fmt.Errorf("start update unit: %w: %s", err, output)
 	}
 
-	log.Printf("[Updater] Update unit started; the installer will run service, web, and database health checks before reporting its result")
+	log.Printf("[Updater] Update unit started; the installer will check RFW compatibility/stability and Agent service, web, and database health before reporting its result")
 
 	return nil
 }
