@@ -128,6 +128,7 @@ type ExpectedRuleReadback struct {
 // persisted desired state. It does not claim a direct eBPF-map inspection.
 type Readback struct {
 	Status             string                 `json:"status"`
+	PolicyConfigured   bool                   `json:"policy_configured"`
 	ObservedAt         int64                  `json:"observed_at"`
 	RFWAPIVersion      string                 `json:"rfw_api_version,omitempty"`
 	CapabilitiesKnown  bool                   `json:"capabilities_known"`
@@ -596,6 +597,7 @@ func (m *Manager) Readback(ctx context.Context) (Readback, error) {
 	actualFingerprints := make(map[int]string, len(rows))
 	result := Readback{
 		Status: "in_sync", ObservedAt: time.Now().Unix(), RFWAPIVersion: apiVersion,
+		PolicyConfigured:  m.state.Revision > 0,
 		CapabilitiesKnown: capabilitiesKnown, SupportedProtocols: make([]string, 0, len(supportedProtocols)),
 		PolicyRevision: m.state.Revision,
 		RuleCount:      len(rows), Rules: make([]RuleReadback, 0, len(rows)),
@@ -682,6 +684,12 @@ func (m *Manager) Readback(ctx context.Context) (Readback, error) {
 			result.Status = "drifted"
 		}
 		result.ExpectedRules = append(result.ExpectedRules, ExpectedRuleReadback{Key: desired.Key, ID: id, SyncState: status})
+	}
+	// An absent desired policy and an empty live RFW table are not evidence
+	// that the firewall is healthy. Report drift instead of a vacuous in-sync.
+	// Keep the value within the existing API contract consumed by older Watchers.
+	if m.state.Revision == 0 && len(rows) == 0 {
+		result.Status = "drifted"
 	}
 	return result, nil
 }

@@ -423,6 +423,27 @@ func TestReadbackDistinguishesManualManagedDriftAndMissingRules(t *testing.T) {
 	}
 }
 
+func TestReadbackMarksUnconfiguredEmptyFirewallAsDrifted(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"api_version": "0.1.0"})
+	})
+	mux.HandleFunc("GET /api/rules", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("[]"))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	m := &Manager{rfwURL: server.URL, client: server.Client(), state: persistedState{}}
+	readback, err := m.Readback(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readback.Status != "drifted" || readback.PolicyConfigured || readback.RuleCount != 0 {
+		t.Fatalf("empty, unconfigured firewall was not reported as drift: %#v", readback)
+	}
+}
+
 func TestReconcileRepairsDriftedManagedRuleWithoutTouchingManualRules(t *testing.T) {
 	rows := []map[string]any{
 		{"id": 1, "priority": 10, "enabled": true, "direction": "in", "protocol": "tcp", "action": "block", "port_start": 22, "port_end": 22, "ip_type": "any"},

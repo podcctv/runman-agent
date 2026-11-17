@@ -220,6 +220,9 @@ jobs:
             }
           fi
 
+      - name: Preserve RFW rules across service directories
+        run: python3 runman-agent/scripts/patch-rfw-rules-path.py "$GITHUB_WORKSPACE"
+
       - name: Install bpf-linker
         run: |
           mkdir -p ~/.cargo/bin

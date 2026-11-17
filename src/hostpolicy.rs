@@ -142,6 +142,8 @@ pub struct ExpectedRuleReadback {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Readback {
     pub status: String,
+    #[serde(default)]
+    pub policy_configured: bool,
     pub observed_at: i64,
     #[serde(default)]
     pub rfw_api_version: String,
@@ -270,6 +272,7 @@ impl Manager {
         let actual: BTreeMap<i32, &RawRule> = rows.iter().map(|r| (r.id, r)).collect();
         let mut result = Readback {
             status: "in_sync".into(),
+            policy_configured: state.revision > 0,
             observed_at: now(),
             rfw_api_version: api_version,
             capabilities_known: known,
@@ -330,6 +333,12 @@ impl Manager {
                 id,
                 sync_state: sync_state.into(),
             });
+        }
+        // An absent desired policy and an empty live RFW table are not
+        // evidence that the firewall is healthy. Keep the status in the
+        // existing contract, but do not report this vacuous state in sync.
+        if state.revision == 0 && rows.is_empty() {
+            result.status = "drifted".into();
         }
         Ok(result)
     }
