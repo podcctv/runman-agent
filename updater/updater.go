@@ -21,6 +21,8 @@ import (
 const (
 	releaseRepository = "podcctv/runman-agent"
 	installScript     = "/opt/narwhal-agent/install.sh"
+	updateResultFile  = "/var/lib/narwhal-agent/update-result"
+	updateRetryDelay  = 24 * time.Hour
 )
 
 type githubRelease struct {
@@ -30,10 +32,12 @@ type githubRelease struct {
 }
 
 type Service struct {
-	database    *db.DB
-	currentVer  string
-	lastChecked time.Time
-	updateMu    sync.Mutex
+	database           *db.DB
+	currentVer         string
+	lastChecked        time.Time
+	updateMu           sync.Mutex
+	updateResultMu     sync.Mutex
+	lastReportedResult string
 }
 
 var diyVersionPattern = regexp.MustCompile(`^v[0-9]+(?:\.[0-9]+){1,2}(?:[-+][0-9A-Za-z.-]+)?-diy\.([0-9a-fA-F]{7,40})$`)
@@ -101,6 +105,8 @@ func NewService(database *db.DB, currentVer string) *Service {
 
 func (s *Service) Start(ctx context.Context) {
 	log.Printf("[Updater] Service started (current: %s)", s.currentVer)
+	go s.watchUpdateResult(ctx)
+	s.reportUpdateResult()
 	if os.Getenv("RUNMAN_AGENT_AUTO_UPDATE") == "0" {
 		log.Printf("[Updater] Automatic updates disabled by RUNMAN_AGENT_AUTO_UPDATE=0")
 		return
@@ -126,6 +132,79 @@ func (s *Service) Start(ctx context.Context) {
 			s.checkAndRun(ctx)
 		}
 	}
+}
+
+func (s *Service) watchUpdateResult(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	timer := time.NewTimer(5 * time.Minute)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			return
+		case <-ticker.C:
+			s.reportUpdateResult()
+		}
+	}
+}
+
+func (s *Service) reportUpdateResult() {
+	s.updateResultMu.Lock()
+	defer s.updateResultMu.Unlock()
+
+	data, err := os.ReadFile(updateResultFile)
+	if err != nil {
+		return
+	}
+	fields := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if ok {
+			fields[key] = value
+		}
+	}
+	status := fields["status"]
+	updatedAt := fields["updated_at"]
+	if updatedAt == "" || status == "running" {
+		return
+	}
+	if s.lastReportedResult == updatedAt {
+		return
+	}
+	previous, _ := s.database.GetSystem("update_result_reported_at")
+	if previous == updatedAt {
+		s.lastReportedResult = updatedAt
+		return
+	}
+
+	switch status {
+	case "succeeded":
+		log.Printf("[Updater] Installer reported a successful Agent upgrade (channel=%s, at=%s)", fields["channel"], updatedAt)
+	case "installed_stopped":
+		log.Printf("[Updater] Agent binary installed while the service was stopped (channel=%s, at=%s); runtime health was not checked", fields["channel"], updatedAt)
+	case "rolled_back":
+		log.Printf("[Updater] Upgrade health check failed; the installer restored and verified the previous Agent (at=%s)", updatedAt)
+	case "rollback_failed":
+		log.Printf("[Updater] Upgrade and automatic rollback both need attention (at=%s); inspect journalctl -u narwhal-agent-update and the saved backup", updatedAt)
+	case "failed":
+		log.Printf("[Updater] Installer failed before completing the Agent upgrade (channel=%s, at=%s)", fields["channel"], updatedAt)
+	default:
+		return
+	}
+	if status == "rolled_back" || status == "rollback_failed" || status == "failed" {
+		retryAt := time.Now().Add(updateRetryDelay).Format(time.RFC3339)
+		if err := s.database.SetSystem("update_target_time", retryAt); err != nil {
+			log.Printf("[Updater] Could not schedule the failed upgrade retry: %v", err)
+			return
+		}
+		log.Printf("[Updater] Failed upgrade will be retried after %s", retryAt)
+	}
+	_ = s.database.SetSystem("update_result_status", status)
+	_ = s.database.SetSystem("update_result_reported_at", updatedAt)
+	s.lastReportedResult = updatedAt
 }
 
 // ManualUpdate 供 Web 端或其他地方手动触发立即更新
@@ -228,6 +307,9 @@ func (s *Service) executeUpdate() error {
 		return fmt.Errorf("update already being prepared")
 	}
 	defer s.updateMu.Unlock()
+	if err := exec.Command("systemctl", "is-active", "--quiet", "narwhal-agent-update.service").Run(); err == nil {
+		return fmt.Errorf("narwhal-agent-update is already running")
+	}
 	// 1. 先下载最新的安装脚本
 	if err := s.downloadInstallScript(); err != nil {
 		log.Printf("[Updater] Failed to download latest install script: %v", err)
@@ -252,7 +334,7 @@ func (s *Service) executeUpdate() error {
 		return fmt.Errorf("start update unit: %w: %s", err, output)
 	}
 
-	log.Printf("[Updater] Update unit started; inspect journalctl -u narwhal-agent-update")
+	log.Printf("[Updater] Update unit started; the installer will run service, web, and database health checks before reporting its result")
 
 	return nil
 }

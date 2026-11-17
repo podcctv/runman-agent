@@ -10,6 +10,8 @@ AGENT_BIN_DIR="/opt/narwhal-agent"
 AGENT_BINARY="$AGENT_BIN_DIR/narwhal-agent"
 AGENT_SERVICE="narwhal-agent"
 AGENT_DATA_DIR="/var/lib/narwhal-agent"
+UPDATE_RESULT_FILE="$AGENT_DATA_DIR/update-result"
+UPDATE_RESULT_STATE="none"
 AGENT_CONFIG_DIR="/opt/narwhal-agent"
 AGENT_CONFIG_FILE="$AGENT_CONFIG_DIR/config.json"
 AGENT_DB="$AGENT_CONFIG_DIR/agent.db"
@@ -40,6 +42,10 @@ DEFAULT_INCUS_ALPINE_VERSION="3.24"
 INSTALLER_SOURCE="${BASH_SOURCE[0]:-}"
 finish_streamed_installer() {
     [ "${BASH_SUBSHELL:-0}" -eq 0 ] || return 0
+    if [ "${UPDATE_ONLY:-0}" = "1" ] && [ "${UPDATE_RESULT_STATE:-none}" = "running" ] \
+        && declare -F write_update_result >/dev/null 2>&1; then
+        write_update_result failed || true
+    fi
     case "$INSTALLER_SOURCE" in
         /dev/fd/*|/proc/*/fd/*)
             [ -r "$INSTALLER_SOURCE" ] || return 0
@@ -3398,11 +3404,125 @@ PY
     log "$(t "Pre-upgrade backup (keep private):" "升级前备份（请妥善保密）:") $UPGRADE_BACKUP"
 }
 
+write_update_result() {
+    local status="$1" tmp
+    mkdir -p "$AGENT_DATA_DIR" || return 1
+    tmp=$(mktemp "$AGENT_DATA_DIR/.update-result.XXXXXX") || return 1
+    {
+        printf 'status=%s\n' "$status"
+        printf 'channel=%s\n' "$AGENT_RELEASE_TAG"
+        printf 'updated_at=%s\n' "$(date --iso-8601=seconds)"
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 600 "$tmp" && mv -f "$tmp" "$UPDATE_RESULT_FILE" || {
+        rm -f "$tmp"
+        return 1
+    }
+    UPDATE_RESULT_STATE="$status"
+}
+
+agent_health_url() {
+    python3 - "$AGENT_CONFIG_FILE" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    address = json.load(source).get("web") or ":8792"
+if "://" in address:
+    raise SystemExit("web address must be a host:port, not a URL")
+host, separator, port = address.rpartition(":")
+if not separator or not port.isdigit() or not 1 <= int(port) <= 65535:
+    raise SystemExit(f"invalid web listen address: {address!r}")
+host = host.strip("[]")
+if host in ("", "0.0.0.0", "*"):
+    host = "127.0.0.1"
+elif host == "::":
+    host = "::1"
+if ":" in host:
+    host = f"[{host}]"
+print(f"http://{host}:{port}/login")
+PY
+}
+
+agent_database_healthy() {
+    python3 - "$AGENT_DB" <<'PY'
+import pathlib
+import sqlite3
+import sys
+
+uri = pathlib.Path(sys.argv[1]).as_uri() + "?mode=ro"
+with sqlite3.connect(uri, uri=True, timeout=10) as database:
+    result = database.execute("PRAGMA quick_check").fetchone()
+    if not result or result[0] != "ok":
+        raise SystemExit("SQLite quick_check failed")
+PY
+}
+
+wait_for_agent_health() {
+    local attempts="${1:-60}" i url
+    url=$(agent_health_url) || return 1
+    for ((i = 0; i < attempts; i++)); do
+        if systemctl is-active --quiet "$AGENT_SERVICE" \
+            && curl --noproxy '*' -fsS --max-time 3 "$url" -o /dev/null 2>/dev/null; then
+            agent_database_healthy
+            return $?
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+rollback_update_only() {
+    local binary_tmp config_tmp database_tmp
+    log "Upgrade health check failed; restoring the previous Agent snapshot."
+    systemctl stop "$AGENT_SERVICE" >/dev/null 2>&1 || true
+    if systemctl is-active --quiet "$AGENT_SERVICE"; then
+        write_update_result rollback_failed || true
+        log "Error: Agent is still active; refusing to replace its live SQLite database. Backup: $UPGRADE_BACKUP"
+        return 1
+    fi
+
+    binary_tmp="$AGENT_BINARY.restore.$$"
+    config_tmp="$AGENT_CONFIG_FILE.restore.$$"
+    database_tmp="$AGENT_DB.restore.$$"
+    rm -f "$binary_tmp" "$config_tmp" "$database_tmp"
+    if ! cp -p "$UPGRADE_BACKUP/narwhal-agent" "$binary_tmp" \
+        || ! mv -f "$binary_tmp" "$AGENT_BINARY" \
+        || ! cp -p "$UPGRADE_BACKUP/config.json" "$config_tmp" \
+        || ! mv -f "$config_tmp" "$AGENT_CONFIG_FILE"; then
+        rm -f "$binary_tmp" "$config_tmp" "$database_tmp"
+        write_update_result rollback_failed || true
+        log "Error: could not restore the previous Agent binary or config. Backup: $UPGRADE_BACKUP"
+        return 1
+    fi
+
+    rm -f "${AGENT_DB}-wal" "${AGENT_DB}-shm" "${AGENT_DB}-journal"
+    if ! cp -p "$UPGRADE_BACKUP/agent.db" "$database_tmp" \
+        || ! mv -f "$database_tmp" "$AGENT_DB"; then
+        rm -f "$database_tmp"
+        write_update_result rollback_failed || true
+        log "Error: could not restore the previous Agent database. Backup: $UPGRADE_BACKUP"
+        return 1
+    fi
+
+    systemctl reset-failed "$AGENT_SERVICE" >/dev/null 2>&1 || true
+    if [ "${AGENT_WAS_ACTIVE:-0}" = "1" ]; then
+        if ! systemctl start "$AGENT_SERVICE" || ! wait_for_agent_health 60; then
+            write_update_result rollback_failed || true
+            log "Error: previous Agent files were restored, but the old service failed its health check. Backup: $UPGRADE_BACKUP"
+            return 1
+        fi
+    fi
+    write_update_result rolled_back || log "Warning: could not persist the update result marker."
+    log "Previous Agent restored and verified. Backup retained at $UPGRADE_BACKUP"
+}
+
 if systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null || [ -f "$AGENT_BINARY" ] || [ -f "$AGENT_CONFIG_FILE" ]; then
     log "$(t "Existing NarwhalCloud Agent detected, updating..." "检测到已安装的 NarwhalCloud Agent，执行更新流程...")"
     preflight_existing_install
     exec 9>/run/lock/narwhal-agent-install.lock
     flock -n 9 || die "Another Agent installation/update is already running."
+    AGENT_WAS_ACTIVE=0
+    systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null && AGENT_WAS_ACTIVE=1
     backup_existing_install
     ARCH=$(detect_arch)
     # Finish downloading before changing config or replacing the running binary.
@@ -3449,7 +3569,15 @@ if systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null || [ -f "$AGENT_BINA
         configure_journald
     fi
 
-    mv "$AGENT_BINARY.new" "$AGENT_BINARY"
+    if [ "$UPDATE_ONLY" = "1" ]; then
+        write_update_result running || log "Warning: could not write the update-in-progress marker."
+    fi
+    if ! mv "$AGENT_BINARY.new" "$AGENT_BINARY"; then
+        if [ "$UPDATE_ONLY" = "1" ]; then
+            write_update_result failed || true
+        fi
+        die "Failed to replace the Agent binary. Backup: $UPGRADE_BACKUP"
+    fi
 
     # Update netavark
     if [ "$UPDATE_ONLY" != "1" ] && [ "$_installed_virt" = "podman" ] && [ -f "/usr/libexec/podman/netavark" ]; then
@@ -3463,14 +3591,27 @@ if systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null || [ -f "$AGENT_BINA
         fi
     fi
 
-    if systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null; then
-        systemctl restart "$AGENT_SERVICE" \
-            || die "Agent restart failed. Backup: $UPGRADE_BACKUP; inspect journalctl -u $AGENT_SERVICE"
-        sleep 3
-        systemctl is-active --quiet "$AGENT_SERVICE" \
-            || die "Agent did not remain active. Backup: $UPGRADE_BACKUP; inspect journalctl -u $AGENT_SERVICE"
+    if [ "$AGENT_WAS_ACTIVE" = "1" ]; then
+        if [ "$UPDATE_ONLY" = "1" ]; then
+            if ! systemctl restart "$AGENT_SERVICE" || ! wait_for_agent_health 60; then
+                if rollback_update_only; then
+                    die "Upgrade health check failed; previous Agent restored. See journalctl -u $AGENT_SERVICE"
+                fi
+                die "Upgrade failed and rollback needs attention. Backup: $UPGRADE_BACKUP; inspect journalctl -u $AGENT_SERVICE"
+            fi
+            write_update_result succeeded || log "Warning: could not persist the successful update marker."
+        else
+            systemctl restart "$AGENT_SERVICE" \
+                || die "Agent restart failed. Backup: $UPGRADE_BACKUP; inspect journalctl -u $AGENT_SERVICE"
+            sleep 3
+            systemctl is-active --quiet "$AGENT_SERVICE" \
+                || die "Agent did not remain active. Backup: $UPGRADE_BACKUP; inspect journalctl -u $AGENT_SERVICE"
+        fi
     else
         log "$(t "Agent was stopped; leaving it stopped." "Agent 原本已停止，本次保持停止状态。")"
+        if [ "$UPDATE_ONLY" = "1" ]; then
+            write_update_result installed_stopped || log "Warning: could not persist the update result marker."
+        fi
     fi
     log "$(t "✓ NarwhalCloud Agent updated." "✓ NarwhalCloud Agent 已更新。")"
     if [ "$UPDATE_ONLY" = "1" ]; then
