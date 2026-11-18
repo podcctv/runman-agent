@@ -2,7 +2,9 @@
 set -euo pipefail
 
 bin=$1
-work=$(mktemp -d)
+umask 077
+work=$(mktemp -d /var/lib/runman-cli-test.XXXXXXXX)
+chmod 0711 "$work"
 pid=
 instance=
 cleanup() {
