@@ -1615,8 +1615,8 @@ Usage: install.sh [options]
                           platform (default: report the speed test)
   --no-rfw                Do not install the rfw firewall
   --rfw-iface IFACE       Interface rfw protects (default: IPv4 default route)
-  --from-dir DIR          Use release files from DIR (runman-agent-linux-<arch>, SHA256SUMS,
-                          optionally rfw-<arch> and rfw-amd64-legacy) instead of downloading
+  --from-dir DIR          Prefer local release files (runman-agent-linux-<arch>, SHA256SUMS,
+                          runman-update-guard.sh, and optional RFW artifacts)
   --migrate-go            Lossy clean-rebuild migration from a supported Go Podman/Incus node;
                           keeps a rollback snapshot until Rust health, port, and network checks pass
   --repair-rfw            Repair a confirmed x86_64 RFW SIGILL loop without migrating Go containers
@@ -2580,6 +2580,7 @@ After=network-online.target nftables.service lxcfs.service
 Wants=network-online.target lxcfs.service
 
 [Service]
+Type=exec
 Environment=RUNMAN_UPDATE_GUARD=1
 ExecStartPre=$UPDATE_GUARD prepare $BIN
 ExecStart=$BIN --config $CONFIG

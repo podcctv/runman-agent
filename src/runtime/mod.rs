@@ -1165,21 +1165,7 @@ impl Runtime {
         ] {
             mkdir_private(&d)?;
         }
-        let disk = rs.disk_image();
-        let _ = std::fs::remove_file(&disk);
-        std::fs::File::create(&disk)?.set_len(rec.disk_gb << 30)?;
-        run(Command::new("mkfs.ext4")
-            .args([
-                "-q",
-                "-F",
-                "-m",
-                "0",
-                "-E",
-                "lazy_itable_init=1,lazy_journal_init=1",
-            ])
-            .arg(&disk))
-        .await
-        .context("mkfs.ext4")?;
+        format_instance_disk(&rs.disk_image(), rec.disk_gb).await?;
 
         let hostname = rec.hostname.clone();
         let password = password.to_owned();
@@ -1547,6 +1533,26 @@ impl Runtime {
         }
         s
     }
+}
+
+async fn format_instance_disk(disk: &Path, size_gb: u64) -> Result<()> {
+    let len = size_gb
+        .checked_mul(1 << 30)
+        .context("instance disk size exceeds limits")?;
+    let _ = std::fs::remove_file(disk);
+    std::fs::File::create(disk)?.set_len(len)?;
+    run(Command::new("mkfs.ext4")
+        .args([
+            "-q",
+            "-F",
+            "-m",
+            "0",
+            "-E",
+            "lazy_itable_init=1,lazy_journal_init=1",
+        ])
+        .arg(disk))
+    .await
+    .context("mkfs.ext4")
 }
 
 fn load_forwards(path: &Path) -> Result<Vec<PortForward>> {

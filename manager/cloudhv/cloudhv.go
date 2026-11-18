@@ -48,6 +48,7 @@ type vmStatusInfo struct {
 // Manager 实现 VMManager 接口，管理多个 cloud-hypervisor 进程（每个 VM 一个进程）。
 type Manager struct {
 	binary      string // cloud-hypervisor 二进制路径
+	imageDir    string
 	instDir     string // VM 实例数据目录 (imgDir/instances)
 	runDir      string
 	db          *db.DB
@@ -186,6 +187,7 @@ func New(database *db.DB, ipv6Mode, ipv6Subnet, ipv6Addr, ipv6Iface string) (*Ma
 
 	m := &Manager{
 		binary:      chBinary,
+		imageDir:    imgDir,
 		instDir:     instDir,
 		runDir:      runDir,
 		db:          database,
@@ -489,7 +491,7 @@ func defaultRouteIface() string {
 // ─── 磁盘辅助 ─────────────────────────────────────────────────────────────────
 
 func (m *Manager) prepareDisks(vmID, distro string, diskGB int64) error {
-	base := filepath.Join(imgDir, distro, "current.raw")
+	base := filepath.Join(m.imageDir, distro, "current.raw")
 	if _, err := os.Stat(base); err != nil {
 		return fmt.Errorf("base image for %q not found: %s", distro, base)
 	}
@@ -973,8 +975,8 @@ func (m *Manager) saveInstanceConfig(vmID string, cfg *instanceConfig) error {
 
 func (m *Manager) buildVmConfig(vmID string, icfg *instanceConfig, net *netConfig) (*vmCreateReq, error) {
 	distro := icfg.Distro
-	vmlinuz := filepath.Join(imgDir, distro, "vmlinuz")
-	initrd := filepath.Join(imgDir, distro, "initrd")
+	vmlinuz := filepath.Join(m.imageDir, distro, "vmlinuz")
+	initrd := filepath.Join(m.imageDir, distro, "initrd")
 	cmdlineFile := filepath.Join(m.instDir, vmID, "cmdline")
 
 	for _, f := range []string{vmlinuz, initrd, cmdlineFile} {
@@ -1122,7 +1124,7 @@ func (m *Manager) createVM(_ context.Context, req *agent.CmdCreateVM) (err error
 	}
 	log.Printf("[CreateVM] config saved: vmID=%s", req.VmId)
 
-	srcCmdline := filepath.Join(imgDir, req.OsImage, "cmdline")
+	srcCmdline := filepath.Join(m.imageDir, req.OsImage, "cmdline")
 	cmdlineData, readErr := os.ReadFile(srcCmdline)
 	if readErr != nil {
 		log.Printf("[CreateVM] error: cmdline not found for distro %q: %v", req.OsImage, readErr)
@@ -1472,7 +1474,7 @@ func (m *Manager) GetVMLocalIP(_ context.Context, vmID string) (string, error) {
 func (m *Manager) GetSupportedImages(_ context.Context) ([]*agent.OSImageInfo, error) {
 	var images []*agent.OSImageInfo
 	for _, distro := range []string{"debian", "alpine"} {
-		if _, err := os.Stat(filepath.Join(imgDir, distro, "current.raw")); err == nil {
+		if _, err := os.Stat(filepath.Join(m.imageDir, distro, "current.raw")); err == nil {
 			name := strings.ToUpper(distro[:1]) + distro[1:] + " (cloud-hypervisor)"
 			images = append(images, &agent.OSImageInfo{
 				Id:   distro,
@@ -1481,7 +1483,7 @@ func (m *Manager) GetSupportedImages(_ context.Context) ([]*agent.OSImageInfo, e
 		}
 	}
 	if len(images) == 0 {
-		return nil, fmt.Errorf("no VM images found in %s; run install.sh to download base images", imgDir)
+		return nil, fmt.Errorf("no VM images found in %s; run install.sh to download base images", m.imageDir)
 	}
 	return images, nil
 }

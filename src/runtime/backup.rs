@@ -74,13 +74,24 @@ async fn digest(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn archive_args() -> [&'static str; 4] {
-    [
-        "--numeric-owner",
-        "--xattrs",
-        "--xattrs-include=*",
-        "--acls",
-    ]
+fn mount_worker(script: &str) -> Command {
+    // The mount belongs to the helper, so even a killed handler cannot leave a
+    // mount in staging or make staging cleanup traverse the guest filesystem.
+    let mut worker = Command::new("unshare");
+    worker.kill_on_drop(true).env_remove("TAR_OPTIONS").args([
+        "--mount",
+        "--propagation",
+        "private",
+        "--fork",
+        "--kill-child",
+        "--",
+        "bash",
+        "-eu",
+        "-c",
+        script,
+        "runman-backup",
+    ]);
+    worker
 }
 
 impl Runtime {
@@ -152,20 +163,22 @@ impl Runtime {
                 description: forward.description.clone(),
             })
             .collect();
-        run(Command::new("tar")
-            .kill_on_drop(true)
-            .env_remove("TAR_OPTIONS")
-            .args(archive_args())
-            .args(["--sparse", "--format=pax", "-cf"])
-            .arg(&archive)
-            .arg("-C")
-            .arg(&spec.dir)
-            .arg("disk.img")
-            .arg("-C")
-            .arg(base)
-            .arg("rootfs"))
+        let mount = staging.0.join("upper");
+        fs::create_dir(&mount)?;
+        run(mount_worker(
+            r#"
+mount -t ext4 -o loop,ro,noload,nodev "$1" "$2"
+exec tar --numeric-owner --xattrs --xattrs-include='*' --xattrs-exclude=user.overlay.origin \
+    --acls --sparse --format=pax -cf "$3" -C "$2" up -C "$4" rootfs
+"#,
+        )
+        .arg(spec.disk_image())
+        .arg(&mount)
+        .arg(&archive)
+        .arg(base))
         .await
         .context("archive instance disk and image")?;
+        fs::remove_dir(mount)?;
         File::open(&archive)?.sync_all()?;
         let manifest = Manifest {
             format: FORMAT,
@@ -208,32 +221,36 @@ impl Runtime {
         );
         let instances = self.data.join("instances");
         let staging = Staging::new(&instances)?;
-        run(Command::new("tar")
-            .kill_on_drop(true)
-            .env_remove("TAR_OPTIONS")
-            .args(archive_args())
-            .args(["--same-owner", "--same-permissions", "-xf"])
-            .arg(&archive)
-            .arg("-C")
-            .arg(&staging.0)
-            .args(["disk.img", "rootfs"]))
-        .await
-        .context("extract instance backup")?;
         let mut record = manifest.source;
-        let disk = fs::symlink_metadata(staging.0.join("disk.img"))?;
-        ensure!(
-            disk.is_file()
-                && record.disk_gb.checked_mul(1 << 30) == Some(disk.len())
-                && fs::symlink_metadata(staging.0.join("rootfs"))?.is_dir(),
-            "backup disk or image does not match its manifest"
-        );
+        let disk = staging.0.join("disk.img");
         let id = VmId::parse(&uuid::Uuid::new_v4().to_string())?;
         let _instance = self.lock_vm(id.as_str()).await;
         let target = self.dir(id.as_str());
-        for path in ["mnt/disk", "mnt/lower", "mnt/upper", "mnt/rootfs"] {
+        for path in ["mnt", "mnt/disk", "mnt/lower", "mnt/upper", "mnt/rootfs"] {
             mkdir_private(&staging.0.join(path))?;
         }
-        File::open(staging.0.join("disk.img"))?.sync_all()?;
+        format_instance_disk(&disk, record.disk_gb).await?;
+        run(mount_worker(
+            r#"
+mount -t ext4 -o loop,nodev "$1" "$2"
+tar_args=(--numeric-owner --same-owner --same-permissions --xattrs --xattrs-include='*' --acls)
+tar "${tar_args[@]}" -xf "$3" -C "$2" up
+mkdir "$2/wk"
+tar "${tar_args[@]}" -xf "$3" -C "$4" rootfs
+umount "$2"
+"#,
+        )
+        .arg(&disk)
+        .arg(staging.0.join("mnt/disk"))
+        .arg(&archive)
+        .arg(&staging.0))
+        .await
+        .context("extract instance backup")?;
+        ensure!(
+            fs::symlink_metadata(staging.0.join("rootfs"))?.is_dir(),
+            "backup rootfs is not a directory"
+        );
+        File::open(&disk)?.sync_all()?;
         {
             let _allocation = self.alloc.lock().unwrap();
             ensure!(!target.exists(), "restore destination already exists");

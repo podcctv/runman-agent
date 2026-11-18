@@ -1,13 +1,19 @@
 package cloudhv
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"runman-agent/db"
+	"runman-agent/proto/agent"
 )
 
 // Run as a subprocess behind the same Unix socket and HTTP interface as the VMM.
@@ -40,6 +46,62 @@ func TestCloudHVFixture(t *testing.T) {
 	if err := http.Serve(listener, handler); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// Execute inside a disposable network namespace on an amd64 host with KVM.
+func TestBootCloudHVOnKVM(t *testing.T) {
+	binary := os.Getenv("RUNMAN_TEST_KVM_BINARY")
+	imageDir := os.Getenv("RUNMAN_TEST_KVM_IMAGES")
+	if binary == "" || imageDir == "" {
+		t.Skip("requires a Cloud Hypervisor binary and fixture image")
+	}
+	dir := t.TempDir()
+	database, err := db.Init(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := Manager{
+		binary: binary, imageDir: imageDir, instDir: dir, runDir: dir,
+		db: database, ipv6Mode: "none",
+	}
+	if err := manager.ensureBridge(); err != nil {
+		t.Fatal(err)
+	}
+	id := "kvm"
+	t.Cleanup(func() {
+		if t.Failed() {
+			if log, err := os.ReadFile(filepath.Join(dir, id+".log")); err == nil {
+				t.Logf("Cloud Hypervisor:\n%s", log)
+			}
+		}
+		if err := manager.DeleteVM(context.Background(), id); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := manager.CreateVM(context.Background(), &agent.CmdCreateVM{
+		VmId: id, OsImage: "alpine", Cpu: 1, RamMb: 512, DiskGb: 3,
+		RootPassword: "CloudHV-fixture-only",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := manager.getNetworkConfig(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(75 * time.Second); time.Now().Before(deadline); {
+		connection, err := net.DialTimeout("tcp", net.JoinHostPort(cfg.IPv4, "22"), time.Second)
+		if err == nil {
+			_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+			var prefix [8]byte
+			_, readErr := io.ReadFull(connection, prefix[:])
+			_ = connection.Close()
+			if readErr == nil && string(prefix[:]) == "SSH-2.0-" {
+				return
+			}
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatalf("guest at %s did not present an SSH banner", cfg.IPv4)
 }
 
 func TestBootFailureCleansUpNewProcess(t *testing.T) {
