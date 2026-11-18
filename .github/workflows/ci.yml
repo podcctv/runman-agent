@@ -15,6 +15,8 @@ on:
       - "scripts/**"
       - "images/**"
       - "install-rust-v2.sh"
+      - "install.sh"
+      - "manager/cloudhv/**"
       - "README-RUST-V2.md"
       - ".github/workflows/ci.yml"
       - ".github/workflows/release-rust-v2.yml"
@@ -31,6 +33,8 @@ on:
       - "scripts/**"
       - "images/**"
       - "install-rust-v2.sh"
+      - "install.sh"
+      - "manager/cloudhv/**"
       - "README-RUST-V2.md"
       - ".github/workflows/ci.yml"
       - ".github/workflows/release-rust-v2.yml"
@@ -39,6 +43,15 @@ permissions:
   contents: read
 
 jobs:
+  cloudhv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: go test -v ./manager/cloudhv
+
   check:
     runs-on: ubuntu-24.04
     steps:
@@ -56,7 +69,8 @@ jobs:
       - name: Installer
         run: |
           sudo apt-get install -y -qq shellcheck
-          shellcheck -S style install-rust-v2.sh images/build.sh scripts/runman-update-guard.sh tests/with_wireguard_peer.sh
+          shellcheck -S style install-rust-v2.sh images/build.sh scripts/runman-update-guard.sh \
+            tests/with_wireguard_peer.sh tests/test_update_systemd.sh
           bash install-rust-v2.sh --help >/dev/null
           bash install-rust-v2.sh --help | grep -q -- '--repair-rfw'
           bash tests/test_update_guard.sh
@@ -80,6 +94,8 @@ jobs:
           sudo sysctl -q -w fs.inotify.max_user_instances=65536
       - name: Build tests
         run: cargo test --release --test runtime_linux --no-run
+      - name: Roll back a failing systemd startup
+        run: sudo bash tests/test_update_systemd.sh
       - name: Runtime integration tests
         run: |
           set -o pipefail
@@ -95,3 +111,4 @@ jobs:
             echo "::error title=runtime_linux::$line"
           done
           sudo journalctl -u 'runman-*' --no-pager -n 30 | while IFS= read -r line; do echo "::warning title=journal::$line"; done
+          sudo dmesg | tail -100

@@ -1615,7 +1615,7 @@ Usage: install.sh [options]
                           platform (default: report the speed test)
   --no-rfw                Do not install the rfw firewall
   --rfw-iface IFACE       Interface rfw protects (default: IPv4 default route)
-  --from-dir DIR          Use binaries from DIR (runman-agent-linux-<arch>, SHA256SUMS,
+  --from-dir DIR          Use release files from DIR (runman-agent-linux-<arch>, SHA256SUMS,
                           optionally rfw-<arch> and rfw-amd64-legacy) instead of downloading
   --migrate-go            Lossy clean-rebuild migration from a supported Go Podman/Incus node;
                           keeps a rollback snapshot until Rust health, port, and network checks pass
@@ -2253,11 +2253,11 @@ systemctl enable --now lxcfs.service >/dev/null 2>&1 || warn "lxcfs is not runni
 [ -n "$WORK" ] || WORK=$(mktemp -d /tmp/runman-agent-rust-v2.XXXXXXXX)
 trap cleanup_exit EXIT
 
-fetch() { # fetch <name> <dest> <base-url>; --from-dir wins when it has the file
+fetch() { # fetch <name> <dest> <base-url> [source path]; --from-dir wins
     if [ -n "$FROM_DIR" ] && [ -f "$FROM_DIR/$1" ]; then
         cp "$FROM_DIR/$1" "$2"
     elif [ "${3%/}" = "${RELEASE_URL%/}" ]; then
-        download_rust_release_asset "$1" "$2"
+        download_rust_release_asset "$1" "$2" "${4:-}"
     else
         curl -4 -fsSL --retry 3 --connect-timeout 20 -o "$2" "$3/$1"
     fi
@@ -2272,8 +2272,8 @@ is_elf_for_arch "$WORK/$asset" || die "$asset is not a binary for $ARCH"
 chmod 755 "$WORK/$asset"
 "$WORK/$asset" --version >/dev/null || die "$asset does not run on this host"
 guard_asset=runman-update-guard.sh
-fetch "$guard_asset" "$WORK/$guard_asset" "$RELEASE_URL" || die "cannot fetch $guard_asset"
-(cd "$WORK" && grep -F "  $guard_asset" SHA256SUMS | sha256sum -c --quiet -) || die "checksum mismatch for $guard_asset"
+fetch "$guard_asset" "$WORK/$guard_asset" "$RELEASE_URL" "scripts/$guard_asset" || die "cannot fetch $guard_asset"
+(cd "$WORK" && grep -E '  \*?runman-update-guard\.sh$' SHA256SUMS | sha256sum -c --quiet -) || die "checksum mismatch for $guard_asset"
 install -m 755 "$WORK/$guard_asset" "$UPDATE_GUARD.new"
 mv -f "$UPDATE_GUARD.new" "$UPDATE_GUARD"
 install -m 755 "$WORK/$asset" "$BIN.new"

@@ -249,8 +249,9 @@ fn net_script(n: &NetFiles) -> String {
     let v6: Vec<_> = n.ipv6.iter().chain(&x6).collect();
     if !v6.is_empty() {
         f.push_str("sysctl -qw net.ipv6.conf.eth0.accept_ra=0 2>/dev/null || true\n");
+        f.push_str("sysctl -qw net.ipv6.conf.eth0.dad_transmits=0 2>/dev/null || true\n");
         for a in &v6 {
-            f.push_str(&format!("ip -6 addr add {a}/128 dev eth0 nodad\n"));
+            f.push_str(&format!("ip -6 addr add {a}/128 dev eth0\n"));
         }
         let src6 = x6.first().map(|a| format!(" src {a}")).unwrap_or_default();
         f.push_str(&format!(

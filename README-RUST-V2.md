@@ -68,6 +68,7 @@ Rust v2 源码现已合入 `main`。Rust 代码更新会发布到独立的 `cont
 - `runman-agent-linux-amd64`、`runman-agent-linux-arm64`（静态 musl 二进制）
 - `install.sh`
 - `migrate-go-state.py`（Go 容器清单/快照辅助程序）
+- `runman-update-guard.sh`（systemd 更新守卫）
 - `SHA256SUMS`
 
 节点从 fork 的 GitHub Release 下载，校验 SHA-256、ELF 架构和 `--version` 后再暂存更新。运行新版前保留上一版本，由 systemd 守卫确认运行时初始化和面板监听，启动失败会恢复上一版本，并在面板显示失败版本的摘要。同一失败版本会被跳过。首次启用守卫需要重新运行 Rust 安装器。本地编译的版本不会自动更新。

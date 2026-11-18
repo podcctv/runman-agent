@@ -49,6 +49,7 @@ type vmStatusInfo struct {
 type Manager struct {
 	binary      string // cloud-hypervisor 二进制路径
 	instDir     string // VM 实例数据目录 (imgDir/instances)
+	runDir      string
 	db          *db.DB
 	ipv6Mode    string                   // "none"/"subnet"/"snat"
 	ipv6Subnet  string                   // 可用子网，如 "2001:db8:1234::/64"（mode=subnet）
@@ -186,6 +187,7 @@ func New(database *db.DB, ipv6Mode, ipv6Subnet, ipv6Addr, ipv6Iface string) (*Ma
 	m := &Manager{
 		binary:      chBinary,
 		instDir:     instDir,
+		runDir:      runDir,
 		db:          database,
 		ipv6Mode:    ipv6Mode,
 		ipv6Subnet:  ipv6Subnet,
@@ -759,31 +761,50 @@ func (m *Manager) ipv6GWForNet() string {
 // ─── 进程管理 ─────────────────────────────────────────────────────────────────
 
 func (m *Manager) sockPath(vmID string) string {
-	return filepath.Join(runDir, vmID+"-api.sock")
+	return filepath.Join(m.runDir, vmID+"-api.sock")
 }
 
 func (m *Manager) serialSockPath(vmID string) string {
-	return filepath.Join(runDir, vmID+"-serial.sock")
+	return filepath.Join(m.runDir, vmID+"-serial.sock")
 }
 
 func (m *Manager) pidFile(vmID string) string {
-	return filepath.Join(runDir, vmID+".pid")
+	return filepath.Join(m.runDir, vmID+".pid")
 }
 
 func (m *Manager) isRunning(vmID string) bool {
+	process := m.findProcess(vmID)
+	if process == nil {
+		return false
+	}
+	defer process.Release()
+	return process.Signal(syscall.Signal(0)) == nil
+}
+
+func (m *Manager) findProcess(vmID string) *os.Process {
 	data, err := os.ReadFile(m.pidFile(vmID))
 	if err != nil {
-		return false
+		return nil
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		return false
+	if err != nil || pid < 2 {
+		return nil
 	}
-	proc, err := os.FindProcess(pid)
+	process, err := os.FindProcess(pid)
 	if err != nil {
-		return false
+		return nil
 	}
-	return proc.Signal(syscall.Signal(0)) == nil
+	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err == nil {
+		args := strings.Split(string(cmdline), "\x00")
+		for i := 1; i < len(args); i++ {
+			if args[i-1] == "--api-socket" && args[i] == "path="+m.sockPath(vmID) {
+				return process
+			}
+		}
+	}
+	_ = process.Release()
+	return nil
 }
 
 func (m *Manager) launchProcess(vmID string) (*os.Process, error) {
@@ -794,7 +815,7 @@ func (m *Manager) launchProcess(vmID string) (*os.Process, error) {
 	cmd := exec.Command(m.binary, "--api-socket", "path="+sockPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
-	logFile, _ := os.OpenFile(filepath.Join(runDir, vmID+".log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	logFile, _ := os.OpenFile(filepath.Join(m.runDir, vmID+".log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if logFile != nil {
 		defer logFile.Close()
 		cmd.Stdout = logFile
@@ -986,27 +1007,6 @@ func (m *Manager) buildVmConfig(vmID string, icfg *instanceConfig, net *netConfi
 		hotplugSize = &doubledMemBytes
 	}
 
-	disks := []diskConfig{
-		{
-			Path:              filepath.Join(m.instDir, vmID, "system.raw"),
-			ImageType:         "Raw",
-			NumQueues:         1,
-			Direct:            false,
-			IoUring:           true,
-			RateLimiterConfig: buildDiskRateLimit(icfg.BandwidthMbps),
-		},
-	}
-	if _, err := os.Stat(filepath.Join(m.instDir, vmID, "cloudinit.img")); err == nil {
-		disks = append(disks, diskConfig{
-			Path:      filepath.Join(m.instDir, vmID, "cloudinit.img"),
-			ImageType: "Raw",
-			Readonly:  true,
-			Direct:    false,
-			IoUring:   false,
-			NumQueues: 1,
-		})
-	}
-
 	return &vmCreateReq{
 		Cpus: cpusConfig{
 			BootVcpus: cpu,
@@ -1024,7 +1024,7 @@ func (m *Manager) buildVmConfig(vmID string, icfg *instanceConfig, net *netConfi
 			Initramfs: initrd,
 			Cmdline:   strings.TrimSpace(string(cmdlineBytes)),
 		},
-		Disks: disks,
+		Disks: buildDisks(filepath.Join(m.instDir, vmID), icfg.BandwidthMbps),
 		Net: []netCfg{{
 			Tap:               net.Tap,
 			Mac:               net.MAC,
@@ -1052,6 +1052,26 @@ func (m *Manager) buildVmConfig(vmID string, icfg *instanceConfig, net *netConfi
 			Mode: "Off",
 		},
 	}, nil
+}
+
+func buildDisks(instanceDir string, bandwidthMbps int) []diskConfig {
+	disks := []diskConfig{{
+		Path:              filepath.Join(instanceDir, "system.raw"),
+		ImageType:         "Raw",
+		NumQueues:         1,
+		IoUring:           true,
+		RateLimiterConfig: buildDiskRateLimit(bandwidthMbps),
+	}}
+	seed := filepath.Join(instanceDir, "cloudinit.img")
+	if _, err := os.Stat(seed); err == nil {
+		disks = append(disks, diskConfig{
+			Path:      seed,
+			ImageType: "Raw",
+			Readonly:  true,
+			NumQueues: 1,
+		})
+	}
+	return disks
 }
 
 func (m *Manager) CreateVM(ctx context.Context, req *agent.CmdCreateVM) error {
@@ -1083,7 +1103,7 @@ func (m *Manager) createVM(_ context.Context, req *agent.CmdCreateVM) (err error
 		return err
 	}
 	defer func() {
-		if err != nil {
+		if err != nil && !m.isRunning(req.VmId) {
 			err = errors.Join(err, os.RemoveAll(dir))
 		}
 	}()
@@ -1120,7 +1140,7 @@ func (m *Manager) createVM(_ context.Context, req *agent.CmdCreateVM) (err error
 		return err
 	}
 	defer func() {
-		if err == nil {
+		if err == nil || m.isRunning(req.VmId) {
 			return
 		}
 		if cleanupErr := removeTap(netCfg.Tap); cleanupErr != nil {
@@ -1186,60 +1206,44 @@ func (m *Manager) StartVM(ctx context.Context, vmID string) error {
 }
 
 func (m *Manager) startVM(_ context.Context, vmID string) (err error) {
-	if !m.isRunning(vmID) {
-		icfg, err := m.loadInstanceConfig(vmID)
-		if err != nil {
-			return fmt.Errorf("instance %q not found: %w", vmID, err)
-		}
-		netCfg, err := m.allocNetwork(vmID)
-		if err != nil {
+	if m.isRunning(vmID) {
+		var info vmInfoResp
+		if err := m.apiGet(vmID, "vm.info", &info); err != nil {
 			return err
 		}
-		defer func() {
-			if err != nil {
-				err = errors.Join(err, removeTap(netCfg.Tap))
-			}
-		}()
-		if err := m.setupNetwork(netCfg, icfg.CPU); err != nil {
+		switch info.State {
+		case "Running":
+			return nil
+		case "Paused":
+			return m.apiPut(vmID, "vm.resume", nil)
+		}
+		// A stopped or half-created VMM may hold a config from the
+		// previous agent version. Always rebuild the current disk payload.
+		if err := m.killProcess(vmID); err != nil {
 			return err
 		}
-		vmCfg, err := m.buildVmConfig(vmID, icfg, netCfg)
-		if err != nil {
-			return err
-		}
-		return m.bootNewProcess(vmID, vmCfg)
 	}
-
-	var info vmInfoResp
-	if err := m.apiGet(vmID, "vm.info", &info); err != nil {
+	icfg, err := m.loadInstanceConfig(vmID)
+	if err != nil {
+		return fmt.Errorf("instance %q not found: %w", vmID, err)
+	}
+	netCfg, err := m.allocNetwork(vmID)
+	if err != nil {
 		return err
 	}
-	switch info.State {
-	case "Running":
-		return nil
-	case "Created":
-		return m.apiPut(vmID, "vm.boot", nil)
-	case "Paused":
-		return m.apiPut(vmID, "vm.resume", nil)
-	default:
-		_ = m.apiPut(vmID, "vm.delete", nil)
-		icfg, err := m.loadInstanceConfig(vmID)
-		if err != nil {
-			return err
+	defer func() {
+		if err != nil && !m.isRunning(vmID) {
+			err = errors.Join(err, removeTap(netCfg.Tap))
 		}
-		netCfg, err := m.allocNetwork(vmID)
-		if err != nil {
-			return err
-		}
-		vmCfg, err := m.buildVmConfig(vmID, icfg, netCfg)
-		if err != nil {
-			return err
-		}
-		if err := m.apiPut(vmID, "vm.create", vmCfg); err != nil {
-			return err
-		}
-		return m.apiPut(vmID, "vm.boot", nil)
+	}()
+	if err := m.setupNetwork(netCfg, icfg.CPU); err != nil {
+		return err
 	}
+	vmCfg, err := m.buildVmConfig(vmID, icfg, netCfg)
+	if err != nil {
+		return err
+	}
+	return m.bootNewProcess(vmID, vmCfg)
 }
 
 func (m *Manager) StopVM(ctx context.Context, vmID string, force bool) error {
@@ -1280,15 +1284,17 @@ func (m *Manager) deleteVM(_ context.Context, vmID string) error {
 		log.Printf("[DeleteVM] stopping running VM: %s", vmID)
 		_ = m.apiPut(vmID, "vm.shutdown", nil)
 		time.Sleep(3 * time.Second)
-		_ = m.killProcess(vmID)
+		if err := m.killProcess(vmID); err != nil {
+			return err
+		}
 		log.Printf("[DeleteVM] VM stopped: %s", vmID)
 	}
 
 	// 获取网络配置（只读查询，不分配新记录）
 	if netCfg, err := m.getNetworkConfig(vmID); err == nil {
 		log.Printf("[DeleteVM] deleting TAP device: %s", netCfg.Tap)
-		if err := runCmd("ip", "link", "delete", netCfg.Tap); err != nil {
-			log.Printf("[DeleteVM] warning: failed to delete TAP device: %v", err)
+		if err := removeTap(netCfg.Tap); err != nil {
+			return err
 		}
 	}
 
@@ -1297,7 +1303,7 @@ func (m *Manager) deleteVM(_ context.Context, vmID string) error {
 		m.pidFile(vmID),
 		m.sockPath(vmID),
 		m.serialSockPath(vmID),
-		filepath.Join(runDir, vmID+".log"),
+		filepath.Join(m.runDir, vmID+".log"),
 	} {
 		_ = os.Remove(f)
 	}
@@ -1308,7 +1314,7 @@ func (m *Manager) deleteVM(_ context.Context, vmID string) error {
 		return fmt.Errorf("delete VMConfig: %w", err)
 	}
 	if err := m.db.DeleteCloudHVConfig(vmID); err != nil {
-		log.Printf("[DeleteVM] warning: failed to delete CloudHVConfig for %s: %v", vmID, err)
+		return fmt.Errorf("delete CloudHVConfig: %w", err)
 	}
 	log.Printf("[DeleteVM] database records deleted: %s", vmID)
 
@@ -1547,23 +1553,35 @@ func isClosedError(err error) bool {
 // ─── 辅助函数 ─────────────────────────────────────────────────────────────────
 
 func (m *Manager) killProcess(vmID string) error {
-	data, err := os.ReadFile(m.pidFile(vmID))
-	if err != nil {
+	process := m.findProcess(vmID)
+	if process == nil {
 		return nil
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		return nil
+	defer process.Release()
+	_ = process.Signal(syscall.SIGTERM)
+	if err := awaitProcessExit(process, 2*time.Second); err != nil {
+		if err := process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return fmt.Errorf("stop cloud-hypervisor: %w", err)
+		}
+		if err := awaitProcessExit(process, 2*time.Second); err != nil {
+			return err
+		}
 	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return nil
+	if err := os.Remove(m.pidFile(vmID)); err != nil && !os.IsNotExist(err) {
+		return err
 	}
-	_ = proc.Signal(syscall.SIGTERM)
-	time.Sleep(2 * time.Second)
-	_ = proc.Kill()
-	_ = os.Remove(m.pidFile(vmID))
 	return nil
+}
+
+func awaitProcessExit(process *os.Process, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := process.Signal(syscall.Signal(0)); errors.Is(err, os.ErrProcessDone) {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("cloud-hypervisor process %d did not exit", process.Pid)
 }
 
 func (m *Manager) getUsage(vmID string) (cpuPct float32, ramUsedMb int64) {

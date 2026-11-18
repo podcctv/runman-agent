@@ -252,6 +252,58 @@ async fn replayed_command_is_not_executed_twice() {
 }
 
 #[tokio::test]
+async fn completed_command_replay_survives_a_new_agent() {
+    let mut mock = Mock::start(Some(Duration::from_millis(100))).await;
+    let data = std::env::temp_dir().join(format!("runman-replay-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&data).unwrap();
+    let config = data.join("agent.toml");
+    std::fs::write(
+        &config,
+        toml::to_string(&Config {
+            platform_url: mock.url.clone(),
+            token: TOKEN.into(),
+            data_dir: data.clone(),
+            ..Config::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let start = || {
+        let store = Store::load(&config).unwrap();
+        let fake = Fake::new();
+        let agent = Agent::new(
+            store.clone(),
+            fake.services().with_forward_limit(store),
+            fast(),
+        );
+        let stop = CancellationToken::new();
+        let run = tokio::spawn(agent.run(stop.clone()));
+        (fake, stop, run)
+    };
+    let (first, stop, run) = start();
+    mock.expect_connected(WAIT).await;
+    mock.send("replay-after-restart", create(VM)).await;
+    let expected = result_for(&mut mock, "replay-after-restart").await;
+    assert!(expected.success);
+    assert_eq!(first.create_calls.load(Ordering::SeqCst), 1);
+    stop.cancel();
+    tokio::time::timeout(WAIT, run).await.unwrap().unwrap();
+
+    let (second, stop, run) = start();
+    mock.expect_connected(WAIT).await;
+    mock.send("replay-after-restart", create(VM)).await;
+    assert_eq!(
+        result_for(&mut mock, "replay-after-restart").await,
+        expected
+    );
+    assert_eq!(second.create_calls.load(Ordering::SeqCst), 0);
+    stop.cancel();
+    tokio::time::timeout(WAIT, run).await.unwrap().unwrap();
+    std::fs::remove_dir_all(data).unwrap();
+}
+
+#[tokio::test]
 async fn result_finished_after_reconnect_reaches_new_stream() {
     let mut h = start(Some(Duration::from_millis(100)), fast()).await;
     *h.fake.create_delay.lock().unwrap() = Duration::from_millis(800);

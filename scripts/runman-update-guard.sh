@@ -34,6 +34,10 @@ if [ "$phase" = prepare ]; then
 elif [ "$phase" = verify ]; then
     [ -f "$pending" ] || exit 0
     for ((attempt = 0; attempt < 90; attempt++)); do
+        if [ -z "${MAINPID:-}" ] || ! kill -0 "$MAINPID" 2>/dev/null; then
+            echo "Runman exited before update readiness." >&2
+            exit 1
+        fi
         if [ -f "$ready" ]; then
             sleep 5
             kill -0 "$MAINPID"

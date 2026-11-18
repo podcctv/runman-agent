@@ -446,7 +446,9 @@ async fn network_checks(rt: &Runtime, id: &VmId) {
     rt.delete(&other).await.unwrap();
 
     // 20 Mbit/s limit and traffic accounting.
-    let speed = console_run(rt, id, "curl -sS -o /dev/null -w '%{speed_download}' 'https://speed.cloudflare.com/__down?bytes=10000000'").await;
+    let speed_base = std::env::var("RUNMAN_TEST_SPEED_BASE")
+        .unwrap_or_else(|_| "https://speed.cloudflare.com".into());
+    let speed = console_run(rt, id, &format!("curl --max-time 15 -fsS -o /dev/null -w '%{{speed_download}}' '{speed_base}/__down?bytes=10000000'")).await;
     let bps: f64 = speed.parse().unwrap_or(0.0);
     println!(
         "download with 10 Mbit/s limit: {:.1} Mbit/s",
@@ -455,7 +457,7 @@ async fn network_checks(rt: &Runtime, id: &VmId) {
     // The lower bound only catches a collapse (as with policing); the real
     // throughput depends on this host's internet link.
     assert!(bps * 8.0 > 4e6 && bps * 8.0 < 12e6, "{speed}");
-    let up = console_run(rt, id, "head -c 8000000 /dev/urandom > /tmp/up.bin; curl -sS -o /dev/null -w '%{speed_upload}' --data-binary @/tmp/up.bin https://speed.cloudflare.com/__up").await;
+    let up = console_run(rt, id, &format!("head -c 8000000 /dev/urandom > /tmp/up.bin; curl --max-time 15 -fsS -o /dev/null -w '%{{speed_upload}}' --data-binary @/tmp/up.bin '{speed_base}/__up'")).await;
     let up_bps: f64 = up.parse().unwrap_or(0.0);
     println!(
         "upload with 10 Mbit/s limit: {:.1} Mbit/s",
