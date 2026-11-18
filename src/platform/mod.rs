@@ -126,10 +126,17 @@ pub struct Agent {
 impl Agent {
     pub fn new(cfg: Arc<config::Store>, services: Services, timing: Timing) -> Arc<Self> {
         let link = Link::default();
-        let speed = Arc::new(crate::speedtest::SpeedTest::load(&cfg.get().data_dir));
+        let settings = cfg.get();
+        let speed = Arc::new(crate::speedtest::SpeedTest::load(&settings.data_dir));
         Arc::new(Self {
             speed,
-            commands: CommandRunner::new(services.clone(), link.clone()),
+            commands: CommandRunner::new(
+                services.clone(),
+                link.clone(),
+                cfg.is_persistent()
+                    .then(|| settings.data_dir.join("platform-commands.db")),
+                settings.platform_url,
+            ),
             cfg,
             services,
             timing,
@@ -254,15 +261,10 @@ impl Agent {
         shutdown: &CancellationToken,
         connected: &mut bool,
     ) -> Result<()> {
-        let mut endpoint = Endpoint::from_shared(cfg.platform_url.clone())
-            .context("invalid platform_url")?
-            .connect_timeout(self.timing.connect_timeout)
+        let endpoint = platform_endpoint(cfg, self.timing.connect_timeout)?
             .http2_keep_alive_interval(Duration::from_secs(30))
             .keep_alive_timeout(Duration::from_secs(10))
             .keep_alive_while_idle(true);
-        if cfg.platform_url.starts_with("https://") {
-            endpoint = endpoint.tls_config(ClientTlsConfig::new().with_webpki_roots())?;
-        }
         let channel = endpoint.connect().await.context("connect platform")?;
         let mut client = AgentGatewayClient::new(channel);
 
@@ -448,6 +450,16 @@ impl Agent {
 type WgWaiters = Arc<Mutex<HashMap<String, oneshot::Sender<proto::WgSyncResponse>>>>;
 
 /// Sleep; returns true if cancelled first.
+pub(crate) fn platform_endpoint(cfg: &config::Config, timeout: Duration) -> Result<Endpoint> {
+    let endpoint = Endpoint::from_shared(cfg.platform_url.clone())
+        .context("invalid platform_url")?
+        .connect_timeout(timeout);
+    if cfg.platform_url.starts_with("https://") {
+        return Ok(endpoint.tls_config(ClientTlsConfig::new().with_webpki_roots())?);
+    }
+    Ok(endpoint)
+}
+
 async fn sleep_or_cancel(d: Duration, token: &CancellationToken) -> bool {
     tokio::select! {
         _ = token.cancelled() => true,

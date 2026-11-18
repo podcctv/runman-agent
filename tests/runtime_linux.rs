@@ -630,6 +630,135 @@ async fn ipv6_subnet_mode() {
 
 #[tokio::test]
 #[ignore = "needs root, systemd and network"]
+async fn ipv6_routed_pool() {
+    let address = "fd42:6:6::20";
+    let rt = side_runtime(
+        "testpool",
+        NetworkConfig {
+            bridge: "rmtestpool".into(),
+            ipv4_subnet: "10.98.0.0/20".into(),
+            veth_prefix: "pv".into(),
+            wg_prefix: "pw".into(),
+            nft_table: "runman_p".into(),
+            wg_table_base: 26000,
+            ipv6_mode: "subnet".into(),
+            ipv6_prefix: "fd42:6:6::/64".into(),
+            ipv6_pool: vec![address.into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let id = VmId::parse(&uuid::Uuid::new_v4().to_string()).unwrap();
+    rt.create(&spec(&id, "alpine", "Pool-pass1")).await.unwrap();
+    let summary = vms(&rt)
+        .await
+        .into_iter()
+        .find(|summary| summary.vm_id == id.as_str())
+        .unwrap();
+    assert!(summary.ips.iter().any(|ip| ip == address));
+    let overflow = VmId::parse(&uuid::Uuid::new_v4().to_string()).unwrap();
+    assert!(
+        rt.create(&spec(&overflow, "alpine", "Pool-pass2"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no free instance slot"),
+    );
+    let configured = wait_for(&rt, &id, "ip -6 addr show dev eth0", |output| {
+        output.contains(address)
+    })
+    .await;
+    assert!(configured.contains(address), "{configured}");
+    let route = std::process::Command::new("ip")
+        .args(["-6", "route", "get", address])
+        .output()
+        .unwrap();
+    assert!(route.status.success());
+    assert!(String::from_utf8_lossy(&route.stdout).contains("dev rmtestpool"));
+    rt.delete(&id).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs root, systemd and network"]
+async fn stopped_backup_restore() {
+    let rt = side_runtime(
+        "testbackup",
+        NetworkConfig {
+            bridge: "rmtestbackup".into(),
+            ipv4_subnet: "10.99.0.0/20".into(),
+            veth_prefix: "bv".into(),
+            wg_prefix: "bw".into(),
+            nft_table: "runman_b".into(),
+            wg_table_base: 27000,
+            ..Default::default()
+        },
+    )
+    .await;
+    let source = VmId::parse(&uuid::Uuid::new_v4().to_string()).unwrap();
+    rt.create(&spec(&source, "alpine", "Backup-pass1"))
+        .await
+        .unwrap();
+    assert!(rt.backup_stopped(&source).await.is_err());
+    assert_eq!(
+        console_run(
+            &rt,
+            &source,
+            "echo saved >/root/runman-backup-test; chmod 640 /root/runman-backup-test; cat /root/runman-backup-test",
+        )
+        .await,
+        "saved"
+    );
+    let original_port = rt.free_port().await.unwrap();
+    rt.add(PortForward {
+        vm_id: source.clone(),
+        proto: L4Proto::Tcp,
+        host_port: original_port,
+        guest_port: 22,
+        description: "backup test".into(),
+    })
+    .await
+    .unwrap();
+    rt.stop(&source, false).await.unwrap();
+    let backup = rt.backup_stopped(&source).await.unwrap();
+    assert!(
+        rt.backups()
+            .await
+            .unwrap()
+            .iter()
+            .any(|b| b.id == backup.id)
+    );
+    let restored = rt
+        .restore_backup(&VmId::parse(&backup.id).unwrap())
+        .await
+        .unwrap();
+    assert_ne!(restored.id, source);
+    assert_eq!(status(&rt, &restored.id).await, Some(VmStatus::Stopped));
+    assert_eq!(restored.forwards.len(), 1);
+    assert_eq!(restored.forwards[0].previous_host_port, original_port);
+    assert_ne!(restored.forwards[0].host_port, original_port);
+    let rules = PortForwards::list(&rt, Some(&restored.id)).await.unwrap();
+    assert_eq!(rules[0].guest_port, 22);
+    assert_eq!(rules[0].host_port, restored.forwards[0].host_port);
+    rt.start(&restored.id).await.unwrap();
+    assert_eq!(
+        console_run(
+            &rt,
+            &restored.id,
+            "cat /root/runman-backup-test; stat -c '%a %u:%g' /root/runman-backup-test",
+        )
+        .await,
+        "saved\n640 0:0"
+    );
+    rt.delete(&restored.id).await.unwrap();
+    rt.delete(&source).await.unwrap();
+    rt.remove_all(&restored.id).await.unwrap();
+    rt.remove_all(&source).await.unwrap();
+    std::fs::remove_dir_all(Path::new("/var/lib/runman-agent-testbackup/backups").join(backup.id))
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs root, systemd and network"]
 async fn ipv6_snat_mode() {
     let rt = side_runtime(
         "test6",

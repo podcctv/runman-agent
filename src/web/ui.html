@@ -258,6 +258,7 @@ function updateInfo(u) {
   return `<div class="muted">${u.auto_update ? '自动更新已开启' : '自动更新已关闭'} · 上次检查 ${esc(when)}</div>`
     + (u.pending ? '<div><span class="badge warn">有新版本待安装</span></div>' : '')
     + (u.last_error ? `<div class="muted">${esc(u.last_error)}</div>` : '')
+    + (u.failed_digest ? `<div class="muted">已回退启动失败的版本 ${esc(u.failed_digest.slice(0, 12))}</div>` : '')
     + '<button class="btn" id="update-now" style="margin-top:6px">检查并更新</button>';
 }
 $('#tab-settings').addEventListener('change', e => {
@@ -302,6 +303,16 @@ function forwardsCell(i) {
   return rows.join('') || '<span class="muted">-</span>';
 }
 
+function backupList(backups) {
+  if (!backups.length) return '';
+  return `<div class="card section"><h2>实例备份</h2>
+    ${backups.map(backup => `<div class="row">
+      <span>${esc(backup.hostname)}</span><code>${esc(backup.id)}</code>
+      <span class="muted">${esc(new Date(backup.created * 1000).toLocaleString())}</span>
+      <button class="btn" data-restore="${esc(backup.id)}">恢复到新实例</button>
+    </div>`).join('')}</div>`;
+}
+
 async function loadInstances() {
   const el = $('#tab-instances');
   try {
@@ -309,7 +320,8 @@ async function loadInstances() {
     const list = await api('/api/instances');
     const head = standalone() ? createForm()
       : '<p class="muted">此节点由平台管理：新建、删除、重装和端口转发请在平台上操作。</p>';
-    if (!list.length) { el.innerHTML = head + '<p class="muted section">此节点上还没有实例。</p>'; return; }
+    const backups = standalone() ? backupList(await api('/api/backups')) : '';
+    if (!list.length) { el.innerHTML = head + '<p class="muted section">此节点上还没有实例。</p>' + backups; return; }
     el.innerHTML = head + `<div class="table-wrap section"><table>
       <tr><th>实例</th><th>状态</th><th>规格</th><th>地址</th><th>端口转发</th>${node.traffic && node.traffic.mode === 'fixed'
         ? `<th title="下次重置：${esc(nextResetText(node.traffic))}">本月流量<div class="muted" style="font-weight:normal">${esc(atOffset(node.traffic.next_reset, node.traffic.timezone).slice(5, 10))} 重置</div></th>`
@@ -328,9 +340,10 @@ async function loadInstances() {
             ? `<button class="btn" data-act="console">终端</button><button class="btn" data-act="restart">重启</button><button class="btn" data-act="stop">关机</button><button class="btn danger" data-act="force_stop">强制关机</button>`
             : `<button class="btn primary" data-act="start">开机</button>`}
           <button class="btn" data-act="password">改密码</button><button class="btn" data-act="log">日志</button><button class="btn" data-act="chart">图表</button>
+          ${standalone() && i.status === 'stopped' ? '<button class="btn" data-act="backup">备份</button>' : ''}
           ${standalone() ? '<button class="btn" data-act="reinstall">重装</button><button class="btn danger" data-act="delete">删除</button>' : ''}
         </div></td></tr>`).join('')}
-    </table></div>`;
+    </table></div>` + backups;
   } catch (e) { el.textContent = e.message; }
 }
 
@@ -356,6 +369,18 @@ $('#tab-instances').addEventListener('submit', async e => {
 });
 
 $('#tab-instances').addEventListener('click', async e => {
+  const restore = e.target.closest('button[data-restore]');
+  if (restore) {
+    if (!confirm('恢复到一个新实例？恢复后实例保持关机。')) return;
+    restore.disabled = true;
+    try {
+      const result = await api(`/api/backups/${restore.dataset.restore}/restore`, { method: 'POST' });
+      dialog('实例已恢复', `<code>${esc(result.id)}</code>
+        ${result.forwards.map(f => `<div>${esc(f.proto)} ${esc(f.previous_host_port)} → ${esc(f.host_port)}（实例端口 ${esc(f.guest_port)}）</div>`).join('')}`);
+    } catch (err) { toast('恢复失败：' + err.message); }
+    loadInstances();
+    return;
+  }
   const b = e.target.closest('button[data-act]'); if (!b) return;
   const id = b.closest('tr').dataset.id, act = b.dataset.act;
   if (act === 'console') return openConsole(id);
@@ -365,6 +390,10 @@ $('#tab-instances').addEventListener('click', async e => {
     if (act === 'password') {
       const pw = prompt('新的 root 密码'); if (!pw) return;
       await api(`/api/instances/${id}/password`, { method: 'POST', body: { password: pw } }); toast('root 密码已更新');
+    } else if (act === 'backup') {
+      b.disabled = true;
+      const backup = await api(`/api/instances/${id}/backup`, { method: 'POST' });
+      toast(`备份已完成：${backup.id}`);
     } else if (act === 'reinstall') {
       const os = prompt(`重装为哪个系统？（${node.images.map(i => i.id).join(' / ')}）\n磁盘上的数据将全部清除。`, node.images[0]?.id || '');
       if (!os) return;

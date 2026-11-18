@@ -12,6 +12,7 @@
 //! Port forwards live in `<data>/portforwards.json`.
 
 pub mod attach;
+mod backup;
 pub mod build;
 pub mod customize;
 pub mod exec;
@@ -379,6 +380,13 @@ impl Runtime {
             }
         }
         self.reconcile_network().await?;
+        for record in self.records()? {
+            let id = VmId::parse(&record.id)?;
+            let _instance = self.lock_vm(id.as_str()).await;
+            if let Err(error) = self.finish_restore_forwards(&id).await {
+                warn!("instance {id}: could not finish restoring port forwards: {error:#}");
+            }
+        }
         for mut rec in self.records()?.into_iter().filter(|r| r.network_pending) {
             self.update_instance_network(&rec)
                 .await
@@ -1709,6 +1717,18 @@ impl Runtime {
 
 #[async_trait]
 impl Instances for Runtime {
+    async fn backups(&self) -> Result<Vec<crate::model::InstanceBackup>> {
+        self.list_backups()
+    }
+
+    async fn backup_stopped(&self, id: &VmId) -> Result<crate::model::InstanceBackup> {
+        self.backup_stopped_instance(id).await
+    }
+
+    async fn restore_backup(&self, id: &VmId) -> Result<crate::model::RestoredInstance> {
+        self.restore_stopped_instance(id).await
+    }
+
     async fn create(&self, spec: &InstanceSpec) -> Result<()> {
         let _g = self.lock_vm(spec.vm_id.as_str()).await;
         self.create_locked(spec, false).await
@@ -1723,6 +1743,7 @@ impl Instances for Runtime {
 
     async fn start(&self, id: &VmId) -> Result<()> {
         let _g = self.lock_vm(id.as_str()).await;
+        self.prepare_restored_network(id).await?;
         let rec = self.set_desired(id, Desired::Running)?;
         if self.is_active(id.as_str()).await {
             return Ok(());
@@ -1739,6 +1760,7 @@ impl Instances for Runtime {
 
     async fn restart(&self, id: &VmId) -> Result<()> {
         let _g = self.lock_vm(id.as_str()).await;
+        self.prepare_restored_network(id).await?;
         let rec = self.set_desired(id, Desired::Running)?;
         self.halt(id.as_str(), false).await?;
         self.launch(&rec).await

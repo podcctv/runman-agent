@@ -51,6 +51,8 @@ enum Command {
     ShowToken,
     /// Probe the host and print suggested IPv6 settings for `[network]`.
     DetectIpv6,
+    /// Report node readiness and connectivity without changing node state.
+    Doctor,
     /// Measure the uplink bandwidth now and save it (restart the agent to
     /// report a result measured here).
     Speedtest,
@@ -122,6 +124,13 @@ async fn agent_main() -> Result<()> {
             return Ok(());
         }
         Some(Command::DetectIpv6) => unreachable!("handled above"),
+        Some(Command::Doctor) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&runman_agent::doctor::report(&cfg).await?)?
+            );
+            return Ok(());
+        }
         Some(Command::Speedtest) => {
             let speed = runman_agent::speedtest::SpeedTest::load(&store.get().data_dir);
             let m = speed.run().await?;
@@ -201,6 +210,7 @@ async fn agent_main() -> Result<()> {
     );
 
     let local_wg = Arc::new(LocalWg::load(&cfg.data_dir)?);
+    let verify_update = runman_agent::updater::startup_verification_pending()?;
     #[cfg(target_os = "linux")]
     let mut local_control: Option<(
         Arc<runman_agent::connlimit::Manager>,
@@ -214,6 +224,9 @@ async fn agent_main() -> Result<()> {
         #[cfg(target_os = "linux")]
         BackendKind::Container => {
             let rt = Arc::new(Runtime::new(Options::from_config(&cfg))?.with_config(store.clone()));
+            if verify_update {
+                rt.init().await?;
+            }
             let connlimit = Arc::new(runman_agent::connlimit::Manager::new(
                 cfg.data_dir.join("connlimit.json"),
                 cfg.network.bridge.clone(),
@@ -240,7 +253,7 @@ async fn agent_main() -> Result<()> {
                 let store_for_init = store.clone();
                 let local_wg_for_init = local_wg.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = rt.init().await {
+                    if !verify_update && let Err(e) = rt.init().await {
                         tracing::error!("runtime init: {e:#}");
                     }
                     // Standalone: nobody else will hand out the bindings.
@@ -311,12 +324,24 @@ async fn agent_main() -> Result<()> {
             local_wg.clone(),
         );
         let listen = cfg.web_listen.parse()?;
+        let listener = if verify_update {
+            Some(runman_agent::web::bind(listen).await?)
+        } else {
+            None
+        };
         let stop = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = web.serve(listen, stop).await {
+            let result = match listener {
+                Some(listener) => web.serve_on(listener, stop).await,
+                None => web.serve(listen, stop).await,
+            };
+            if let Err(e) = result {
                 tracing::error!("management panel: {e:#}");
             }
         });
+    }
+    if verify_update {
+        runman_agent::updater::mark_startup_ready()?;
     }
     #[cfg(target_os = "linux")]
     if let Some((connlimit, hostpolicy, runtime)) = local_control {

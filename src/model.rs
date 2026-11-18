@@ -11,6 +11,28 @@ use uuid::Uuid;
 
 use crate::proto;
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InstanceBackup {
+    pub id: String,
+    pub source_id: String,
+    pub hostname: String,
+    pub created: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct RestoredInstance {
+    pub id: VmId,
+    pub forwards: Vec<RestoredForward>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct RestoredForward {
+    pub proto: String,
+    pub previous_host_port: u16,
+    pub host_port: u16,
+    pub guest_port: u16,
+}
+
 /// Platform-assigned instance identifier (always a canonical UUID).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 #[serde(transparent)]

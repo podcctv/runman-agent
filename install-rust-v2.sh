@@ -24,6 +24,7 @@ EXT3_DATA_DIR_FSTAB_ENTRY="$EXT3_DATA_DIR_SOURCE $DATA_DIR none bind,x-systemd.r
 MIGRATION_EXT3_DATA_DIR_FALLBACK=0
 MIGRATION_EXT3_DATA_FSTAB_BACKUP=""
 BIN=/usr/local/bin/runman-agent
+UPDATE_GUARD=/usr/local/bin/runman-update-guard
 RFW_BIN=/usr/local/bin/rfw
 RFW_DIR=/var/lib/rfw
 RFW_API=127.0.0.1:7734
@@ -1097,7 +1098,7 @@ migration_rollback() {
         nft delete table inet runman >/dev/null 2>&1 || true
         nft delete table bridge runman >/dev/null 2>&1 || true
         ip link del rmbr0 >/dev/null 2>&1 || true
-        rm -f "$BIN" /etc/systemd/system/runman-agent.service
+        rm -f "$BIN" "$UPDATE_GUARD" /etc/systemd/system/runman-agent.service
         rm -rf -- "$CONFIG_DIR" "$DATA_DIR" /run/runman-agent
         rm -f /run/narwhal-agent/connlimit.sock /run/narwhal-agent/firewall.sock
         rmdir /run/narwhal-agent >/dev/null 2>&1 || true
@@ -2131,6 +2132,7 @@ uninstall() {
     fi
     rm -f /etc/systemd/system/runman-agent.service /etc/modules-load.d/runman.conf "$BIN" \
         /etc/sysctl.d/90-runman.conf /etc/systemd/system/lxcfs.service.d/runman.conf
+    rm -f "$UPDATE_GUARD" "$BIN".update-{previous,pending,attempted,ready,failed}
     rm -rf "$CONFIG_DIR" /run/runman-agent
     [ ! -S /run/narwhal-agent/connlimit.sock ] || rm -f /run/narwhal-agent/connlimit.sock
     [ ! -S /run/narwhal-agent/firewall.sock ] || rm -f /run/narwhal-agent/firewall.sock
@@ -2269,6 +2271,11 @@ fetch "$asset" "$WORK/$asset" "$RELEASE_URL" || die "cannot fetch $asset"
 is_elf_for_arch "$WORK/$asset" || die "$asset is not a binary for $ARCH"
 chmod 755 "$WORK/$asset"
 "$WORK/$asset" --version >/dev/null || die "$asset does not run on this host"
+guard_asset=runman-update-guard.sh
+fetch "$guard_asset" "$WORK/$guard_asset" "$RELEASE_URL" || die "cannot fetch $guard_asset"
+(cd "$WORK" && grep -F "  $guard_asset" SHA256SUMS | sha256sum -c --quiet -) || die "checksum mismatch for $guard_asset"
+install -m 755 "$WORK/$guard_asset" "$UPDATE_GUARD.new"
+mv -f "$UPDATE_GUARD.new" "$UPDATE_GUARD"
 install -m 755 "$WORK/$asset" "$BIN.new"
 mv -f "$BIN.new" "$BIN"
 log "installed $("$BIN" --version)"
@@ -2573,7 +2580,11 @@ After=network-online.target nftables.service lxcfs.service
 Wants=network-online.target lxcfs.service
 
 [Service]
+Environment=RUNMAN_UPDATE_GUARD=1
+ExecStartPre=$UPDATE_GUARD prepare $BIN
 ExecStart=$BIN --config $CONFIG
+ExecStartPost=$UPDATE_GUARD verify $BIN
+TimeoutStartSec=110
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576

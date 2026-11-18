@@ -14,6 +14,7 @@ pub mod connlimit;
 #[cfg(target_os = "linux")]
 pub mod controlapi;
 pub mod detect;
+pub mod doctor;
 pub mod fake;
 pub mod history;
 #[cfg(target_os = "linux")]

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -100,6 +101,7 @@ type payloadConfig struct {
 
 type diskConfig struct {
 	Path              string             `json:"path"`
+	ImageType         string             `json:"image_type"`
 	Readonly          bool               `json:"readonly,omitempty"`
 	Direct            bool               `json:"direct,omitempty"`
 	IoUring           bool               `json:"io_uring"`
@@ -355,6 +357,13 @@ func (m *Manager) getNetworkConfig(vmID string) (*netConfig, error) {
 		return nil, fmt.Errorf("no network config for VM %s: %w", vmID, err)
 	}
 	return m.netConfigFromDB(conf), nil
+}
+
+func removeTap(tap string) error {
+	if _, err := os.Stat(filepath.Join("/sys/class/net", tap)); os.IsNotExist(err) {
+		return nil
+	}
+	return runCmd("ip", "link", "delete", tap)
 }
 
 func (m *Manager) netConfigFromDB(conf *db.CloudHVVMConfig) *netConfig {
@@ -777,7 +786,7 @@ func (m *Manager) isRunning(vmID string) bool {
 	return proc.Signal(syscall.Signal(0)) == nil
 }
 
-func (m *Manager) launchProcess(vmID string) error {
+func (m *Manager) launchProcess(vmID string) (*os.Process, error) {
 	sockPath := m.sockPath(vmID)
 	_ = os.Remove(sockPath)
 	_ = os.Remove(m.serialSockPath(vmID))
@@ -787,22 +796,58 @@ func (m *Manager) launchProcess(vmID string) error {
 
 	logFile, _ := os.OpenFile(filepath.Join(runDir, vmID+".log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if logFile != nil {
+		defer logFile.Close()
 		cmd.Stdout = logFile
 		cmd.Stderr = logFile
 	}
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start cloud-hypervisor: %w", err)
+		return nil, fmt.Errorf("start cloud-hypervisor: %w", err)
 	}
-	_ = os.WriteFile(m.pidFile(vmID), []byte(strconv.Itoa(cmd.Process.Pid)), 0644)
+	if err := os.WriteFile(m.pidFile(vmID), []byte(strconv.Itoa(cmd.Process.Pid)), 0644); err != nil {
+		return cmd.Process, fmt.Errorf("write cloud-hypervisor PID: %w", err)
+	}
 
 	for i := 0; i < 60; i++ {
 		if _, err := os.Stat(sockPath); err == nil {
-			return nil
+			return cmd.Process, nil
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	return fmt.Errorf("timed out waiting for API socket: %s", sockPath)
+	return cmd.Process, fmt.Errorf("timed out waiting for API socket: %s", sockPath)
+}
+
+func (m *Manager) bootNewProcess(vmID string, vmCfg *vmCreateReq) (err error) {
+	process, err := m.launchProcess(vmID)
+	if process != nil {
+		defer func() {
+			if err == nil {
+				go func() { _, _ = process.Wait() }()
+				return
+			}
+			if killErr := process.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+				err = errors.Join(err, fmt.Errorf("kill failed cloud-hypervisor process: %w", killErr))
+				go func() { _, _ = process.Wait() }()
+				return
+			}
+			_, _ = process.Wait()
+			for _, path := range []string{m.pidFile(vmID), m.sockPath(vmID), m.serialSockPath(vmID)} {
+				if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
+					err = errors.Join(err, removeErr)
+				}
+			}
+		}()
+	}
+	if err != nil {
+		return err
+	}
+	if err := m.apiPut(vmID, "vm.create", vmCfg); err != nil {
+		return fmt.Errorf("vm.create: %w", err)
+	}
+	if err := m.apiPut(vmID, "vm.boot", nil); err != nil {
+		return fmt.Errorf("vm.boot: %w", err)
+	}
+	return nil
 }
 
 // ─── REST API 客户端 ───────────────────────────────────────────────────────────
@@ -944,6 +989,7 @@ func (m *Manager) buildVmConfig(vmID string, icfg *instanceConfig, net *netConfi
 	disks := []diskConfig{
 		{
 			Path:              filepath.Join(m.instDir, vmID, "system.raw"),
+			ImageType:         "Raw",
 			NumQueues:         1,
 			Direct:            false,
 			IoUring:           true,
@@ -953,6 +999,7 @@ func (m *Manager) buildVmConfig(vmID string, icfg *instanceConfig, net *netConfi
 	if _, err := os.Stat(filepath.Join(m.instDir, vmID, "cloudinit.img")); err == nil {
 		disks = append(disks, diskConfig{
 			Path:      filepath.Join(m.instDir, vmID, "cloudinit.img"),
+			ImageType: "Raw",
 			Readonly:  true,
 			Direct:    false,
 			IoUring:   false,
@@ -1013,7 +1060,7 @@ func (m *Manager) CreateVM(ctx context.Context, req *agent.CmdCreateVM) error {
 	return m.createVM(ctx, req)
 }
 
-func (m *Manager) createVM(_ context.Context, req *agent.CmdCreateVM) error {
+func (m *Manager) createVM(_ context.Context, req *agent.CmdCreateVM) (err error) {
 	log.Printf("[CreateVM] start: vmID=%s image=%s cpu=%d ramMb=%d diskGb=%d", req.VmId, req.OsImage, req.Cpu, req.RamMb, req.DiskGb)
 
 	// 限制最低配置：CPU 1核，内存 256MB，磁盘 3GB
@@ -1028,13 +1075,18 @@ func (m *Manager) createVM(_ context.Context, req *agent.CmdCreateVM) error {
 	}
 
 	dir := filepath.Join(m.instDir, req.VmId)
-	// 确保目录干净（重装时删除旧目录）
-	_ = os.RemoveAll(dir)
-	log.Printf("[CreateVM] directory cleaned: %s", dir)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if m.isRunning(req.VmId) {
+		return fmt.Errorf("cloud-hypervisor instance %q is already running", req.VmId)
+	}
+	if err := os.Mkdir(dir, 0755); err != nil {
 		log.Printf("[CreateVM] error: failed to create directory: %v", err)
 		return err
 	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, os.RemoveAll(dir))
+		}
+	}()
 
 	icfg := &instanceConfig{
 		Distro:        req.OsImage,
@@ -1067,6 +1119,16 @@ func (m *Manager) createVM(_ context.Context, req *agent.CmdCreateVM) error {
 		log.Printf("[CreateVM] error: failed to allocate network: %v", err)
 		return err
 	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		if cleanupErr := removeTap(netCfg.Tap); cleanupErr != nil {
+			err = errors.Join(err, cleanupErr)
+			return
+		}
+		err = errors.Join(err, m.db.DeleteCloudHVConfig(req.VmId))
+	}()
 	log.Printf("[CreateVM] network allocated: tap=%s ipv4=%s ipv6=%s", netCfg.Tap, netCfg.IPv4, netCfg.IPv6)
 
 	if err := m.prepareDisks(req.VmId, req.OsImage, req.DiskGb); err != nil {
@@ -1087,25 +1149,12 @@ func (m *Manager) createVM(_ context.Context, req *agent.CmdCreateVM) error {
 	}
 	log.Printf("[CreateVM] network setup completed: tap=%s", netCfg.Tap)
 
-	if err := m.launchProcess(req.VmId); err != nil {
-		log.Printf("[CreateVM] error: failed to launch process: %v", err)
-		return err
-	}
-	log.Printf("[CreateVM] process launched: vmID=%s", req.VmId)
-
 	vmCfg, err := m.buildVmConfig(req.VmId, icfg, netCfg)
 	if err != nil {
 		log.Printf("[CreateVM] error: failed to build vm config: %v", err)
 		return err
 	}
-	if err := m.apiPut(req.VmId, "vm.create", vmCfg); err != nil {
-		log.Printf("[CreateVM] error: vm.create API failed: %v", err)
-		return err
-	}
-	log.Printf("[CreateVM] vm.create API called: vmID=%s", req.VmId)
-
-	if err := m.apiPut(req.VmId, "vm.boot", nil); err != nil {
-		log.Printf("[CreateVM] error: vm.boot API failed: %v", err)
+	if err := m.bootNewProcess(req.VmId, vmCfg); err != nil {
 		return err
 	}
 	log.Printf("[CreateVM] vm.boot API called: vmID=%s", req.VmId)
@@ -1136,7 +1185,7 @@ func (m *Manager) StartVM(ctx context.Context, vmID string) error {
 	return m.startVM(ctx, vmID)
 }
 
-func (m *Manager) startVM(_ context.Context, vmID string) error {
+func (m *Manager) startVM(_ context.Context, vmID string) (err error) {
 	if !m.isRunning(vmID) {
 		icfg, err := m.loadInstanceConfig(vmID)
 		if err != nil {
@@ -1146,20 +1195,19 @@ func (m *Manager) startVM(_ context.Context, vmID string) error {
 		if err != nil {
 			return err
 		}
+		defer func() {
+			if err != nil {
+				err = errors.Join(err, removeTap(netCfg.Tap))
+			}
+		}()
 		if err := m.setupNetwork(netCfg, icfg.CPU); err != nil {
-			return err
-		}
-		if err := m.launchProcess(vmID); err != nil {
 			return err
 		}
 		vmCfg, err := m.buildVmConfig(vmID, icfg, netCfg)
 		if err != nil {
 			return err
 		}
-		if err := m.apiPut(vmID, "vm.create", vmCfg); err != nil {
-			return err
-		}
-		return m.apiPut(vmID, "vm.boot", nil)
+		return m.bootNewProcess(vmID, vmCfg)
 	}
 
 	var info vmInfoResp
@@ -1280,11 +1328,9 @@ func (m *Manager) ReinstallVM(ctx context.Context, req *agent.CmdReinstallVM) er
 
 	log.Printf("[ReinstallVM] start: vmID=%s image=%s", req.VmId, req.OsImage)
 	if err := m.deleteVM(ctx, req.VmId); err != nil {
-		log.Printf("[ReinstallVM] warning: DeleteVM returned error: %v", err)
-		// 继续重建，不因为删除失败而中止
+		return fmt.Errorf("delete old instance before reinstall: %w", err)
 	}
 	log.Printf("[ReinstallVM] deleted old VM, now creating new one: vmID=%s", req.VmId)
-	// CreateVM 会先删除旧目录再重建，确保干净的重装
 	return m.createVM(ctx, &agent.CmdCreateVM{
 		VmId:         req.VmId,
 		OsImage:      req.OsImage,

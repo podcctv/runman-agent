@@ -7,10 +7,13 @@
 //!   result instead of executing it twice.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use prost::Message;
+use rusqlite::{Connection, params};
 use tracing::{info, warn};
 
 use super::Link;
@@ -33,15 +36,24 @@ pub struct CommandRunner {
     link: Link,
     cache: Mutex<HashMap<String, Entry>>,
     vm_locks: Mutex<HashMap<VmId, Arc<tokio::sync::Mutex<()>>>>,
+    journal: Option<PathBuf>,
+    platform: String,
 }
 
 impl CommandRunner {
-    pub fn new(services: Services, link: Link) -> Arc<Self> {
+    pub fn new(
+        services: Services,
+        link: Link,
+        journal: Option<PathBuf>,
+        platform: String,
+    ) -> Arc<Self> {
         Arc::new(Self {
             services,
             link,
             cache: Mutex::default(),
             vm_locks: Mutex::default(),
+            journal,
+            platform,
         })
     }
 
@@ -69,7 +81,7 @@ impl CommandRunner {
 
         let this = self.clone();
         tokio::spawn(async move {
-            let reply = this.execute(&command_id, payload).await;
+            let reply = this.execute_once(&command_id, payload).await;
             if !command_id.is_empty() {
                 this.cache.lock().unwrap().insert(
                     command_id.clone(),
@@ -80,6 +92,55 @@ impl CommandRunner {
                 warn!("command {command_id}: no platform connection; result kept for replay");
             }
         });
+    }
+
+    async fn execute_once(&self, id: &str, payload: Option<Down>) -> Up {
+        let Some(path) = self.journal.as_ref().filter(|_| {
+            !id.is_empty()
+                && matches!(
+                    payload,
+                    Some(
+                        Down::CreateVm(_)
+                            | Down::ReinstallVm(_)
+                            | Down::DeleteVm(_)
+                            | Down::RestartVm(_)
+                            | Down::StartVm(_)
+                            | Down::StopVm(_)
+                            | Down::ResetPassword(_)
+                            | Down::SetPortFwd(_)
+                            | Down::DelPortFwd(_)
+                    )
+                )
+        }) else {
+            return self.execute(id, payload).await;
+        };
+        let connection = match open_journal(path) {
+            Ok(connection) => connection,
+            Err(error) => return journal_error(id, error, "open"),
+        };
+        match claim(&connection, &self.platform, id) {
+            Ok(Claim::New) => {}
+            Ok(Claim::Finished(reply)) => return Up::CmdResult(reply),
+            Ok(Claim::Interrupted) => {
+                return result(
+                    id,
+                    Err(anyhow::anyhow!(
+                        "previous execution was interrupted; inspect the instance before retrying under a new command ID"
+                    )),
+                );
+            }
+            Err(error) => return journal_error(id, error, "claim"),
+        }
+        let reply = self.execute(id, payload).await;
+        if let Up::CmdResult(completed) = &reply
+            && let Err(error) = connection.execute(
+                "UPDATE commands SET result = ?3 WHERE platform = ?1 AND id = ?2",
+                params![self.platform, id, completed.encode_to_vec()],
+            )
+        {
+            return journal_error(id, error.into(), "record result");
+        }
+        reply
     }
 
     async fn execute(&self, command_id: &str, payload: Option<Down>) -> Up {
@@ -194,6 +255,56 @@ impl CommandRunner {
     }
 }
 
+fn open_journal(path: &Path) -> Result<Connection> {
+    let connection = Connection::open(path)?;
+    connection.execute_batch(
+        "PRAGMA synchronous = FULL;
+         CREATE TABLE IF NOT EXISTS commands (
+             platform TEXT NOT NULL,
+             id TEXT NOT NULL,
+             result BLOB,
+             PRIMARY KEY (platform, id)
+         );",
+    )?;
+    Ok(connection)
+}
+
+enum Claim {
+    New,
+    Finished(CommandResult),
+    Interrupted,
+}
+
+fn claim(connection: &Connection, platform: &str, id: &str) -> Result<Claim> {
+    let inserted = connection.execute(
+        "INSERT INTO commands (platform, id) VALUES (?1, ?2)
+         ON CONFLICT(platform, id) DO NOTHING",
+        params![platform, id],
+    )?;
+    if inserted == 1 {
+        return Ok(Claim::New);
+    }
+    let recorded: Option<Vec<u8>> = connection.query_row(
+        "SELECT result FROM commands WHERE platform = ?1 AND id = ?2",
+        params![platform, id],
+        |row| row.get(0),
+    )?;
+    match recorded {
+        Some(bytes) => Ok(Claim::Finished(CommandResult::decode(bytes.as_slice())?)),
+        None => Ok(Claim::Interrupted),
+    }
+}
+
+fn journal_error(id: &str, error: anyhow::Error, operation: &str) -> Up {
+    warn!("command {id}: could not {operation} in persistent command journal: {error:#}");
+    result(
+        id,
+        Err(anyhow::anyhow!(
+            "persistent command journal error; inspect the node before retrying"
+        )),
+    )
+}
+
 fn prune(cache: &mut HashMap<String, Entry>) {
     if cache.len() >= CACHE_SOFT_LIMIT {
         cache.retain(|_, e| match e {
@@ -230,5 +341,44 @@ fn kind_name(p: &Down) -> &'static str {
         Down::ConsoleResize(_) => "console_resize",
         Down::ConsoleClose(_) => "console_close",
         Down::WgSyncResponse(_) => "wg_sync_response",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn journal_distinguishes_completed_and_interrupted_replays() -> Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("runman-commands-{}.db", uuid::Uuid::new_v4()));
+        let check = (|| {
+            let first = open_journal(&path)?;
+            assert!(matches!(claim(&first, "platform", "done")?, Claim::New));
+            assert!(matches!(claim(&first, "platform", "pending")?, Claim::New));
+            let reply = CommandResult {
+                command_id: "done".into(),
+                success: true,
+                ..Default::default()
+            };
+            first.execute(
+                "UPDATE commands SET result = ?1 WHERE id = 'done'",
+                [reply.encode_to_vec()],
+            )?;
+            drop(first);
+            let reopened = open_journal(&path)?;
+            assert!(matches!(
+                claim(&reopened, "platform", "done")?,
+                Claim::Finished(recorded) if recorded == reply
+            ));
+            assert!(matches!(
+                claim(&reopened, "platform", "pending")?,
+                Claim::Interrupted
+            ));
+            assert!(matches!(claim(&reopened, "other", "done")?, Claim::New));
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&path);
+        check
     }
 }

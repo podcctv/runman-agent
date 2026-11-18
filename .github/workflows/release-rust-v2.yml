@@ -33,6 +33,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
   build:
     runs-on: ubuntu-24.04
     strategy:
@@ -68,7 +73,7 @@ jobs:
           retention-days: 3
 
   publish:
-    needs: build
+    needs: [build, verify]
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/rust-v')
     runs-on: ubuntu-24.04
     steps:
@@ -82,9 +87,10 @@ jobs:
           cp install-rust-v2.sh dist/install.sh
           cp scripts/migrate-go-state.py dist/
           cp scripts/diagnose-go-rust-migration.sh dist/
+          cp scripts/runman-update-guard.sh dist/
           cd dist
-          chmod 755 runman-agent-linux-* install.sh migrate-go-state.py diagnose-go-rust-migration.sh
-          sha256sum runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh migrate-go-state.py diagnose-go-rust-migration.sh > SHA256SUMS
+          chmod 755 runman-agent-linux-* install.sh migrate-go-state.py diagnose-go-rust-migration.sh runman-update-guard.sh
+          sha256sum runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh migrate-go-state.py diagnose-go-rust-migration.sh runman-update-guard.sh > SHA256SUMS
           ls -l
       - name: Reject superseded continuous build
         if: github.ref == 'refs/heads/main'

@@ -129,6 +129,9 @@ impl Web {
                 axum::routing::delete(delete_instance),
             )
             .route("/api/instances/{id}/reinstall", post(reinstall_instance))
+            .route("/api/instances/{id}/backup", post(backup_instance))
+            .route("/api/backups", get(list_backups))
+            .route("/api/backups/{id}/restore", post(restore_backup))
             .route("/api/instances/{id}/forwards", post(add_forward))
             .route(
                 "/api/instances/{id}/forwards/{proto}/{port}",
@@ -247,7 +250,7 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
 /// Listen on `addr`. `0.0.0.0` and `[::]` both mean every address, IPv4 and
 /// IPv6 (existing configs say `0.0.0.0`), falling back to IPv4 on hosts
 /// without IPv6. A specific address is used as it is.
-async fn bind(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+pub async fn bind(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
     if !addr.ip().is_unspecified() {
         return tokio::net::TcpListener::bind(addr).await;
     }
@@ -659,6 +662,31 @@ async fn delete_instance(
     }
     info!("panel: deleted {id}");
     Ok(Json(json!({ "ok": true })))
+}
+
+async fn list_backups(State(web): State<Arc<Web>>) -> ApiResult<Json<Value>> {
+    web.require_standalone()?;
+    Ok(Json(json!(web.services.instances.backups().await?)))
+}
+
+async fn backup_instance(
+    State(web): State<Arc<Web>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    web.require_standalone()?;
+    Ok(Json(json!(
+        web.services.instances.backup_stopped(&vm(&id)?).await?
+    )))
+}
+
+async fn restore_backup(
+    State(web): State<Arc<Web>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    web.require_standalone()?;
+    Ok(Json(json!(
+        web.services.instances.restore_backup(&vm(&id)?).await?
+    )))
 }
 
 #[derive(Deserialize)]

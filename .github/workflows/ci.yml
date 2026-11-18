@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [main, rust-v2]
     paths:
@@ -55,17 +56,15 @@ jobs:
       - name: Installer
         run: |
           sudo apt-get install -y -qq shellcheck
-          shellcheck -S style install-rust-v2.sh images/build.sh
+          shellcheck -S style install-rust-v2.sh images/build.sh scripts/runman-update-guard.sh
           bash install-rust-v2.sh --help >/dev/null
           bash install-rust-v2.sh --help | grep -q -- '--repair-rfw'
+          bash tests/test_update_guard.sh
           python3 -m py_compile scripts/patch-rfw-ring-provider.py
 
   # Real containers on the runner VM: needs root, systemd and network.
   integration:
     runs-on: ubuntu-24.04
-    # Not verified on GitHub-hosted runners yet; keep it informative until it
-    # has passed there a few times.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -86,7 +85,8 @@ jobs:
           set -o pipefail
           sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" \
             cargo test --release --test runtime_linux -- --ignored --test-threads=1 \
-            instance_lifecycle ipv6_snat_mode concurrent_creates_get_distinct_slots 2>&1 | tee test.log
+            instance_lifecycle ipv6_snat_mode ipv6_routed_pool concurrent_creates_get_distinct_slots \
+            stopped_backup_restore 2>&1 | tee test.log
       - name: Report integration failure
         if: failure()
         run: |

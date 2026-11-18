@@ -250,6 +250,10 @@ impl Store {
         self.cfg.read().expect("config lock poisoned").clone()
     }
 
+    pub(crate) fn is_persistent(&self) -> bool {
+        !self.path.as_os_str().is_empty()
+    }
+
     pub fn update(&self, f: impl FnOnce(&mut Config)) -> Result<()> {
         let mut guard = self.cfg.write().expect("config lock poisoned");
         let mut next = guard.clone();

@@ -3,9 +3,9 @@
 //! A release publishes `runman-agent-linux-<arch>` and `SHA256SUMS` on the
 //! official GitHub repository. An update is applied only when the download
 //! matches its checksum, is an ELF for this architecture and runs
-//! `--version`. The new binary then atomically replaces the running one and
-//! the agent exits so systemd starts the new version; instances keep
-//! running. Only CI release builds (`RUNMAN_BUILD_ID` set) self-update, so a
+//! `--version`. The updater keeps the previous binary and stages a pending
+//! digest. The installed systemd guard restores the previous binary if the
+//! candidate fails startup. Only CI release builds self-update, so a
 //! locally built binary is never replaced behind its developer's back.
 
 use std::path::{Path, PathBuf};
@@ -54,6 +54,7 @@ pub struct Status {
     pub auto_update: bool,
     pub last_check: Option<u64>,
     pub last_error: String,
+    pub failed_digest: Option<String>,
     /// SHA-256 of the newer binary waiting to be applied.
     pub pending: Option<String>,
 }
@@ -62,6 +63,7 @@ pub struct Updater {
     cfg: Arc<config::Store>,
     exe: PathBuf,
     status: Mutex<Status>,
+    update_lock: tokio::sync::Mutex<()>,
     /// Cancelled to make the process exit after an update was installed.
     restart: CancellationToken,
 }
@@ -80,6 +82,7 @@ impl Updater {
             cfg,
             exe,
             status: Mutex::default(),
+            update_lock: tokio::sync::Mutex::new(()),
             restart,
         }))
     }
@@ -88,6 +91,9 @@ impl Updater {
         let mut s = self.status.lock().unwrap().clone();
         s.release_build = BUILD_ID.is_some();
         s.auto_update = self.cfg.get().auto_update;
+        s.failed_digest = std::fs::read_to_string(sidecar(&self.exe, "failed"))
+            .ok()
+            .map(|digest| digest.trim().to_owned());
         s
     }
 
@@ -130,6 +136,7 @@ impl Updater {
     /// Check and, if there is a newer release, install it and request
     /// a restart.
     pub async fn update_now(&self) -> Result<Outcome> {
+        let _guard = self.update_lock.lock().await;
         let result = self.update_inner().await;
         let mut st = self.status.lock().unwrap();
         st.last_check = SystemTime::now()
@@ -153,6 +160,13 @@ impl Updater {
     }
 
     async fn update_inner(&self) -> Result<Outcome> {
+        if !guard_installed() {
+            bail!("re-run the Rust installer to enable guarded self-updates");
+        }
+        let pending = sidecar(&self.exe, "pending");
+        if pending.try_exists()? {
+            bail!("an update is already awaiting startup verification");
+        }
         let Some(sha) = self.newer_release().await? else {
             return Ok(Outcome::UpToDate);
         };
@@ -178,9 +192,17 @@ impl Updater {
                     String::from_utf8_lossy(&out.stderr).trim()
                 );
             }
-            tokio::fs::rename(&staged, &self.exe)
-                .await
-                .context("replace binary")?;
+            std::fs::File::open(&staged)?.sync_all()?;
+            let previous = sidecar(&self.exe, "previous");
+            let backup = sidecar(&self.exe, "backup-tmp");
+            std::fs::copy(&self.exe, &backup).context("save previous binary")?;
+            std::fs::File::open(&backup)?.sync_all()?;
+            std::fs::rename(&backup, &previous)?;
+            config::write_atomic(&pending, sha.as_bytes())?;
+            if let Err(err) = std::fs::rename(&staged, &self.exe) {
+                let _ = std::fs::remove_file(&pending);
+                return Err(err).context("replace binary");
+            }
             Ok(Outcome::Installed(sha.clone()))
         }
         .await;
@@ -210,9 +232,32 @@ impl Updater {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         let sums = fetched?;
         let want = expected_sha(&String::from_utf8_lossy(&sums), asset_name()?)?;
+        if std::fs::read_to_string(sidecar(&self.exe, "failed"))
+            .is_ok_and(|failed| failed.trim() == want)
+        {
+            bail!("release {} failed startup and was rolled back", &want[..12]);
+        }
         let current = hex_sha256(&tokio::fs::read(&self.exe).await?);
         Ok((current != want).then_some(want))
     }
+}
+
+fn guard_installed() -> bool {
+    std::env::var_os("RUNMAN_UPDATE_GUARD").is_some_and(|value| value == "1")
+}
+
+fn sidecar(exe: &Path, name: &str) -> PathBuf {
+    let mut path = exe.as_os_str().to_owned();
+    path.push(format!(".update-{name}"));
+    PathBuf::from(path)
+}
+
+pub fn startup_verification_pending() -> Result<bool> {
+    Ok(guard_installed() && sidecar(&std::env::current_exe()?, "pending").try_exists()?)
+}
+
+pub fn mark_startup_ready() -> Result<()> {
+    config::write_atomic(&sidecar(&std::env::current_exe()?, "ready"), b"ready\n")
 }
 
 /// The checksum listed for `asset` (`sha256sum` format).

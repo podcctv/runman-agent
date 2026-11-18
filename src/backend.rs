@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::model::{
-    BuildInfo, BuildRequest, ConsoleSize, HostSnapshot, ImageInfo, ImageSettings, InstanceDetails,
-    InstanceSpec, L4Proto, PortForward, VmId,
+    BuildInfo, BuildRequest, ConsoleSize, HostSnapshot, ImageInfo, ImageSettings, InstanceBackup,
+    InstanceDetails, InstanceSpec, L4Proto, PortForward, RestoredInstance, VmId,
 };
 use crate::proto;
 
@@ -32,6 +32,18 @@ pub trait Instances: Send + Sync {
     async fn list(&self) -> Result<Vec<proto::VmSummary>>;
     async fn images(&self) -> Result<Vec<proto::OsImageInfo>>;
     async fn open_console(&self, id: &VmId, size: Option<ConsoleSize>) -> Result<ConsoleIo>;
+
+    async fn backups(&self) -> Result<Vec<InstanceBackup>> {
+        Ok(Vec::new())
+    }
+
+    async fn backup_stopped(&self, _id: &VmId) -> Result<InstanceBackup> {
+        anyhow::bail!("instance backup is unavailable on this backend")
+    }
+
+    async fn restore_backup(&self, _id: &VmId) -> Result<RestoredInstance> {
+        anyhow::bail!("instance restore is unavailable on this backend")
+    }
 
     /// Richer view for the management panel.
     async fn details(&self) -> Result<Vec<InstanceDetails>> {
