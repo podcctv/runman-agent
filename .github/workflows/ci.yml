@@ -100,6 +100,8 @@ jobs:
         run: |
           target/release/runman-agent --config config.example.toml doctor | \
             jq -e '.platform == "standalone" and .cgroup_v2 and has("network") and has("rfw_api")'
+      - name: Verify local instance CLI with the web panel disabled
+        run: sudo bash tests/test_instance_cli.sh "$PWD/target/release/runman-agent"
       - name: Roll back a failing systemd startup
         run: sudo bash tests/test_update_systemd.sh
       - name: Runtime integration tests

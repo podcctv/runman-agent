@@ -79,6 +79,25 @@ Rust v2 源码现已合入 `main`。Rust 代码更新会发布到独立的 `cont
 
 常规 Rust 安装不会接管 Go 配置、数据库或 Podman/Incus 实例。Go fork 安装器的 Rust v2 子菜单 **2** 可启动有损的 clean-rebuild 迁移：保留受支持的主机/面板设置、实例 UUID/资源/运行状态和端口转发，在健康核验后删除旧容器根文件系统。它不保留客体文件、应用、IP、WireGuard 和挂载卷关联；删除阶段开始后无法承诺完整回滚。开始前先读 [Go 到 Rust v2 迁移计划](MIGRATION_GO_TO_RUST_V2.md) 并备份关键数据。此迁移会复用现有平台主机标识和 Token，且先停用 Go agent，避免两个 agent 同时协调同一节点。迁移成功并确认旧实例删除后，会自动执行 7 天日志/缓存清理；只有盘点确认没有其他容器、数据卷或 rootless Podman 数据时，才尝试清除旧 Podman/Incus 服务。Docker 不会被选中、不运行 `autoremove`；Rust 实例所需的 `lxcfs` 会保留。
 
+### 容器管理命令
+
+在节点执行 `sudo runman-agent instance` 打开交互菜单。输入容器序号后，可查看配置、日志和端口转发，也可启动、停止、重启或备份已关停的容器。
+
+```bash
+sudo runman-agent instance list
+sudo runman-agent instance list --json
+sudo runman-agent instance inspect <UUID>
+sudo runman-agent instance logs <UUID>
+sudo runman-agent instance stop <UUID>
+sudo runman-agent instance create --image alpine --cpus 2 --memory-mib 1024 --disk-gib 10
+sudo runman-agent instance port add <UUID> --host-port 22022 --guest-port 22
+sudo runman-agent instance backup <UUID>
+sudo runman-agent instance backups
+sudo runman-agent instance restore <备份ID>
+```
+
+命令通过本机 Unix socket 访问正在运行的 Agent，关闭 Web 面板后也可以使用。平台托管节点可查询实例和执行启停；创建、修改端口转发、备份与恢复走独立模式权限。
+
 ### 实例备份与恢复
 
 在独立模式面板关停实例后点「备份」。备份包含基础镜像、实例磁盘、规格和端口转发，保存在 `<data_dir>/backups/<备份 ID>/`。备份目录含客体凭据和应用数据，应由宿主机管理员保管。跨同架构节点迁移时，将可信的完整备份目录以 root 权限复制到目标节点的备份目录。

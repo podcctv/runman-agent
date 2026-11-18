@@ -64,6 +64,31 @@ pub struct Web {
 }
 
 impl Web {
+    #[cfg(target_os = "linux")]
+    pub async fn serve_local_instances(
+        self: Arc<Self>,
+        listener: tokio::net::UnixListener,
+        shutdown: CancellationToken,
+    ) -> Result<()> {
+        let app = Router::new()
+            .route("/v1/instances", get(instances).post(create_instance))
+            .route("/v1/instances/{id}/power", post(power))
+            .route("/v1/instances/{id}/console-log", get(console_log))
+            .route("/v1/instances/{id}/forwards", post(add_forward))
+            .route(
+                "/v1/instances/{id}/forwards/{proto}/{port}",
+                axum::routing::delete(delete_forward),
+            )
+            .route("/v1/instances/{id}/backup", post(backup_instance))
+            .route("/v1/backups", get(list_backups))
+            .route("/v1/backups/{id}/restore", post(restore_backup))
+            .with_state(self);
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { shutdown.cancelled().await })
+            .await?;
+        Ok(())
+    }
+
     pub fn new(
         agent: Arc<Agent>,
         services: Services,

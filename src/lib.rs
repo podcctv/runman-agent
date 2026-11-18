@@ -19,6 +19,7 @@ pub mod fake;
 pub mod history;
 #[cfg(target_os = "linux")]
 pub mod hostpolicy;
+pub mod instance_cli;
 pub mod local_wg;
 #[cfg(target_os = "linux")]
 pub mod metrics;

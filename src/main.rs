@@ -53,6 +53,11 @@ enum Command {
     DetectIpv6,
     /// Report node readiness and connectivity without changing node state.
     Doctor,
+    /// Manage instances using the running agent.
+    Instance {
+        #[command(subcommand)]
+        action: Option<runman_agent::instance_cli::Action>,
+    },
     /// Measure the uplink bandwidth now and save it (restart the agent to
     /// report a result measured here).
     Speedtest,
@@ -102,6 +107,9 @@ async fn agent_main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if let Some(Command::Instance { action }) = cli.command {
+        return runman_agent::instance_cli::run(action).await;
+    }
     if let Some(Command::DetectIpv6) = cli.command {
         print!("{}", runman_agent::detect::detect_ipv6().await?.toml());
         return Ok(());
@@ -124,6 +132,7 @@ async fn agent_main() -> Result<()> {
             return Ok(());
         }
         Some(Command::DetectIpv6) => unreachable!("handled above"),
+        Some(Command::Instance { .. }) => unreachable!("handled above"),
         Some(Command::Doctor) => {
             println!(
                 "{}",
@@ -316,13 +325,25 @@ async fn agent_main() -> Result<()> {
         let (speed, stop) = (agent.speed.clone(), shutdown.clone());
         tokio::spawn(async move { speed.schedule(stop).await });
     }
+    let web = Web::new(
+        agent.clone(),
+        services,
+        Some(updater.clone()),
+        local_wg.clone(),
+    );
+    #[cfg(target_os = "linux")]
+    if cfg.backend == BackendKind::Container {
+        let (listener, lock) = runman_agent::instance_cli::bind()?;
+        let local = web.clone();
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            let _lock = lock;
+            if let Err(e) = local.serve_local_instances(listener, stop).await {
+                tracing::error!("local instance management: {e:#}");
+            }
+        });
+    }
     if !cfg.web_listen.is_empty() {
-        let web = Web::new(
-            agent.clone(),
-            services,
-            Some(updater.clone()),
-            local_wg.clone(),
-        );
         let listen = cfg.web_listen.parse()?;
         let listener = if verify_update {
             Some(runman_agent::web::bind(listen).await?)
