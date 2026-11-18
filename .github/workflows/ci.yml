@@ -56,7 +56,7 @@ jobs:
       - name: Installer
         run: |
           sudo apt-get install -y -qq shellcheck
-          shellcheck -S style install-rust-v2.sh images/build.sh scripts/runman-update-guard.sh
+          shellcheck -S style install-rust-v2.sh images/build.sh scripts/runman-update-guard.sh tests/with_wireguard_peer.sh
           bash install-rust-v2.sh --help >/dev/null
           bash install-rust-v2.sh --help | grep -q -- '--repair-rfw'
           bash tests/test_update_guard.sh
@@ -71,7 +71,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Host packages and limits (as install-rust-v2.sh sets them)
         run: |
-          sudo apt-get install -y -qq nftables wireguard-tools e2fsprogs lxcfs
+          sudo apt-get install -y -qq nftables wireguard-tools e2fsprogs lxcfs iputils-ping
           sudo install -d /etc/systemd/system/lxcfs.service.d
           printf '[Service]\nExecStart=\nExecStart=/usr/bin/lxcfs --enable-cfs -l /var/lib/lxcfs\n' \
             | sudo tee /etc/systemd/system/lxcfs.service.d/runman.conf >/dev/null
@@ -84,9 +84,9 @@ jobs:
         run: |
           set -o pipefail
           sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" \
-            cargo test --release --test runtime_linux -- --ignored --test-threads=1 \
+            bash tests/with_wireguard_peer.sh cargo test --release --test runtime_linux -- --ignored --test-threads=1 \
             instance_lifecycle ipv6_snat_mode ipv6_routed_pool concurrent_creates_get_distinct_slots \
-            stopped_backup_restore 2>&1 | tee test.log
+            stopped_backup_restore wireguard_local_peer 2>&1 | tee test.log
       - name: Report integration failure
         if: failure()
         run: |

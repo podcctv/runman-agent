@@ -57,10 +57,10 @@ pub async fn report(config: &Config) -> Result<Value> {
             return Value::Null;
         }
         let net = &config.network;
-        let (bridge, nft_table) = tokio::join!(
-            succeeds("ip", &["link", "show", "dev", &net.bridge]),
-            succeeds("nft", &["list", "table", "inet", &net.nft_table]),
-        );
+        let bridge_args = ["link", "show", "dev", &net.bridge];
+        let nft_args = ["list", "table", "inet", &net.nft_table];
+        let (bridge, nft_table) =
+            tokio::join!(succeeds("ip", &bridge_args), succeeds("nft", &nft_args),);
         json!({
             "bridge_present": bridge,
             "nft_table_readable": nft_table,

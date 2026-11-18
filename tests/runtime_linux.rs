@@ -835,6 +835,65 @@ fn binding_from_conf(path: &str, vm: &VmId, resource: &str) -> runman_agent::pro
     }
 }
 
+#[tokio::test]
+#[ignore = "needs root, systemd and tests/with_wireguard_peer.sh"]
+async fn wireguard_local_peer() {
+    use runman_agent::backend::WgBindings;
+
+    let path = std::env::var("RUNMAN_TEST_LOCAL_WG_CONF").expect("local WireGuard fixture");
+    let peer = std::env::var("RUNMAN_TEST_LOCAL_WG_NS").expect("peer namespace");
+    let rt = side_runtime(
+        "testlocalwg",
+        NetworkConfig {
+            bridge: "rmtestlwg".into(),
+            ipv4_subnet: "10.100.0.0/20".into(),
+            veth_prefix: "lv".into(),
+            wg_prefix: "lw".into(),
+            nft_table: "runman_lw".into(),
+            wg_table_base: 28000,
+            ..Default::default()
+        },
+    )
+    .await;
+    let id = VmId::parse(&uuid::Uuid::new_v4().to_string()).unwrap();
+    rt.create(&spec(&id, "alpine", "Local-wg-pass1"))
+        .await
+        .unwrap();
+    let desired = vec![binding_from_conf(&path, &id, "local-peer")];
+    WgBindings::reconcile(&rt, desired.clone()).await.unwrap();
+    WgBindings::reconcile(&rt, desired).await.unwrap();
+    let ping = wait_for(
+        &rt,
+        &id,
+        "ping -I 198.19.97.2 -c 1 -W 2 198.19.97.1 >/dev/null 2>&1 && echo ok",
+        |output| output == "ok",
+    )
+    .await;
+    assert_eq!(ping, "ok", "guest must reach the peer through WireGuard");
+    let inbound = std::process::Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &peer,
+            "ping",
+            "-c",
+            "2",
+            "-W",
+            "2",
+            "198.19.97.2",
+        ])
+        .status()
+        .unwrap();
+    assert!(
+        inbound.success(),
+        "peer must reach the guest's dedicated address"
+    );
+    WgBindings::reconcile(&rt, vec![]).await.unwrap();
+    let addresses = console_run(&rt, &id, "ip -4 addr show dev eth0").await;
+    assert!(!addresses.contains("198.19.97.2"));
+    rt.delete(&id).await.unwrap();
+}
+
 /// Dedicated IPs over kernel WireGuard. Set `RUNMAN_TEST_WG_CONFS` to a
 /// comma-separated list of wg-quick configs (one dedicated address each).
 #[tokio::test]

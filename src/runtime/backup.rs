@@ -303,7 +303,8 @@ impl Runtime {
             let port = if available(rule.host_port) {
                 rule.host_port
             } else {
-                AUTO_PORTS
+                let mut candidates = AUTO_PORTS;
+                candidates
                     .find(|port| available(*port))
                     .context("no free host port")?
             };
