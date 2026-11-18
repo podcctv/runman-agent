@@ -3,6 +3,7 @@ package cloudhv
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -67,6 +68,32 @@ func TestBootCloudHVOnKVM(t *testing.T) {
 	if err := manager.ensureBridge(); err != nil {
 		t.Fatal(err)
 	}
+	slot, err := database.NextCloudHVIdx()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.binary = cloudHVFixture(t, dir)
+	err = manager.CreateVM(context.Background(), &agent.CmdCreateVM{
+		VmId: "failed", OsImage: "alpine", Cpu: 1, RamMb: 512, DiskGb: 3,
+		RootPassword: "CloudHV-fixture-only",
+	})
+	if err == nil || !strings.Contains(err.Error(), "fixture boot failure") {
+		t.Fatalf("expected fixture boot failure, got %v", err)
+	}
+	for _, path := range []string{
+		manager.pidFile("failed"),
+		manager.sockPath("failed"),
+		filepath.Join(dir, "failed"),
+		filepath.Join("/sys/class/net", fmt.Sprintf("%s%d", tapBase, slot)),
+	} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("failed VM left %s behind: %v", path, err)
+		}
+	}
+	if next, err := database.NextCloudHVIdx(); next != slot || err != nil {
+		t.Fatalf("failed VM retained its address/slot: got %d, want %d (%v)", next, slot, err)
+	}
+	manager.binary = binary
 	id := "kvm"
 	t.Cleanup(func() {
 		if t.Failed() {
@@ -104,8 +131,8 @@ func TestBootCloudHVOnKVM(t *testing.T) {
 	t.Fatalf("guest at %s did not present an SSH banner", cfg.IPv4)
 }
 
-func TestBootFailureCleansUpNewProcess(t *testing.T) {
-	dir := t.TempDir()
+func cloudHVFixture(t *testing.T, dir string) string {
+	t.Helper()
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -118,11 +145,17 @@ func TestBootFailureCleansUpNewProcess(t *testing.T) {
 	), 0700); err != nil {
 		t.Fatal(err)
 	}
+	return launcher
+}
+
+func TestBootFailureCleansUpNewProcess(t *testing.T) {
+	dir := t.TempDir()
+	launcher := cloudHVFixture(t, dir)
 	if err := os.WriteFile(filepath.Join(dir, "cloudinit.img"), nil, 0600); err != nil {
 		t.Fatal(err)
 	}
 	manager := Manager{binary: launcher, runDir: dir}
-	err = manager.bootNewProcess("vm", &vmCreateReq{Disks: buildDisks(dir, 0)})
+	err := manager.bootNewProcess("vm", &vmCreateReq{Disks: buildDisks(dir, 0)})
 	if err == nil || !strings.Contains(err.Error(), "vm.boot") ||
 		!strings.Contains(err.Error(), "fixture boot failure") {
 		t.Fatalf("expected a boot failure after successful disk validation, got %v", err)

@@ -96,6 +96,10 @@ jobs:
           sudo sysctl -q -w fs.inotify.max_user_instances=65536
       - name: Build tests
         run: cargo test --release --test runtime_linux --no-run
+      - name: Check read-only doctor output
+        run: |
+          target/release/runman-agent --config config.example.toml doctor | \
+            jq -e '.platform == "standalone" and .cgroup_v2 and has("network") and has("rfw_api")'
       - name: Roll back a failing systemd startup
         run: sudo bash tests/test_update_systemd.sh
       - name: Runtime integration tests

@@ -25,7 +25,7 @@ PODMAN_NETWORK="narwhal-net"
 
 AGENT_RELEASE_TAG="${AGENT_RELEASE_TAG:-continuous}"
 DOWNLOAD_BASE="${RUNMAN_AGENT_DOWNLOAD_BASE:-https://github.com/podcctv/runman-agent/releases/download/$AGENT_RELEASE_TAG}"
-CLOUD_HYPERVISOR_VERSION="v54.0"
+CLOUD_HYPERVISOR_VERSION="v54.1"
 CLOUD_HYPERVISOR_BASE="https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/$CLOUD_HYPERVISOR_VERSION"
 # 预构建系统镜像（cloudhv/incus），由 narwhal-cloud/images 仓库 CI 每月构建
 VM_IMAGES_BASE="https://github.com/narwhal-cloud/images/releases/download/vm-latest"

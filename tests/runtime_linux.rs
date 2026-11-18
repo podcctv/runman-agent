@@ -705,7 +705,7 @@ async fn stopped_backup_restore() {
         console_run(
             &rt,
             &source,
-            "echo saved >/root/runman-backup-test; chmod 640 /root/runman-backup-test; cat /root/runman-backup-test",
+            "echo saved >/root/runman-backup-test; chmod 640 /root/runman-backup-test; rm /etc/alpine-release; cat /root/runman-backup-test",
         )
         .await,
         "saved"
@@ -746,10 +746,19 @@ async fn stopped_backup_restore() {
         console_run(
             &rt,
             &restored.id,
-            "cat /root/runman-backup-test; stat -c '%a %u:%g' /root/runman-backup-test",
+            "cat /root/runman-backup-test; stat -c '%a %u:%g' /root/runman-backup-test; test ! -e /etc/alpine-release && echo deleted",
         )
         .await,
-        "saved\n640 0:0"
+        "saved\n640 0:0\ndeleted"
+    );
+    let sshd = wait_for(&rt, &restored.id, "rc-service sshd status", |output| {
+        output.contains("started")
+    })
+    .await;
+    assert!(sshd.contains("started"), "{sshd}");
+    assert_eq!(
+        ssh_banner(&format!("{}:{}", host_ip(), restored.forwards[0].host_port)),
+        "SSH-2.0"
     );
     rt.delete(&restored.id).await.unwrap();
     rt.delete(&source).await.unwrap();
