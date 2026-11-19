@@ -787,6 +787,15 @@ runcmd:
 		}
 	}
 
+	// Cloud-init installs packages while preparing this image. Attach the NIC
+	// explicitly because some Incus hosts keep their default profile disk-only.
+	builderDevices := map[string]map[string]string{
+		"eth0": {
+			"type":    "nic",
+			"network": IncusBridge,
+		},
+	}
+
 	op, err := m.client.CreateInstance(api.InstancesPost{
 		Name:   builderName,
 		Type:   api.InstanceTypeContainer,
@@ -795,6 +804,7 @@ runcmd:
 			Config: map[string]string{
 				"cloud-init.user-data": builderUserData,
 			},
+			Devices: builderDevices,
 		},
 	})
 	if err != nil {
@@ -815,6 +825,7 @@ runcmd:
 					Config: map[string]string{
 						"cloud-init.user-data": builderUserData,
 					},
+					Devices: builderDevices,
 				},
 			})
 		}
