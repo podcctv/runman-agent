@@ -155,6 +155,12 @@ bash install.sh
 - 至少保留一个已启用的镜像（空列表在协议中表示「未变化」，平台会继续展示旧列表）；
 - 未排序的镜像（例如新同步的官方镜像）排在已排序镜像之后。
 
+## 容器防滥用策略
+
+`GET /v1/firewall/readback` 的 `abuse` 字段按地址族列出容器转发防滥用链、`FORWARD` 跳转和每条规则的包数、字节数。`in_sync` 表示链和规则与当前策略一致。关闭策略后为 `disabled`，缺少规则或跳转为 `drifted`，同名链没有 Agent 的归属标记时为 `unowned`，无法读取内核规则时为 `unavailable`。规则未变化时，周期对账保留命中计数。
+
+主机防火墙策略的 `abuse` 对象需要显式填写容器桥接接口 `interfaces`。Go 与 Rust 均支持独立开启 `smtp`，按 TCP 目标端口 25、465、587、2525 拒绝容器出站 SMTP。可选的 `observe_mining` 和 `observe_bt` 分别启用明文 Stratum、BitTorrent 握手和 DHT 请求特征计数。观察项只记录包数和字节数，依赖内核 `xt_string`，仅检查单包内有界的可见特征。启用或关闭时沿用主机防火墙策略修订号递增的规则。
+
 ## 开发
 
 在节点执行 `sudo runman-agent doctor` 可查看服务、cgroup v2、网桥、nftables、RFW API 和平台传输层连通状态。命令以 JSON 输出，诊断平台连通性时不发送 Token。

@@ -76,6 +76,12 @@ pub struct AbusePolicy {
     #[serde(default)]
     pub bt: bool,
     #[serde(default)]
+    pub smtp: bool,
+    #[serde(default)]
+    pub observe_mining: bool,
+    #[serde(default)]
+    pub observe_bt: bool,
+    #[serde(default)]
     pub interfaces: Vec<String>,
 }
 
@@ -156,6 +162,8 @@ pub struct Readback {
     pub missing_count: usize,
     pub rules: Vec<RuleReadback>,
     pub expected_rules: Vec<ExpectedRuleReadback>,
+    #[serde(default)]
+    pub abuse: Vec<AbuseFamilyReadback>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,6 +292,7 @@ impl Manager {
             missing_count: 0,
             rules: Vec::new(),
             expected_rules: Vec::new(),
+            abuse: read_abuse(&state.policy.abuse).await,
         };
         for row in &rows {
             let mut item = readback_rule(row);
@@ -693,16 +702,14 @@ fn normalize_policy(mut policy: Policy) -> Result<Policy> {
         interfaces.insert(iface.clone());
     }
     policy.abuse.interfaces = interfaces.into_iter().collect();
-    if (policy.abuse.speedtest || policy.abuse.mining || policy.abuse.bt)
-        && policy.abuse.interfaces.is_empty()
-    {
+    if policy.abuse.enabled() && policy.abuse.interfaces.is_empty() {
         bail!("container abuse rules require an explicit bridge interface");
     }
     Ok(policy)
 }
 
 fn verify_bridges(policy: &AbusePolicy) -> Result<()> {
-    if !(policy.speedtest || policy.mining || policy.bt) {
+    if !policy.enabled() {
         return Ok(());
     }
     for iface in &policy.interfaces {
@@ -814,6 +821,9 @@ fn summary(state: &State) -> String {
     if state.policy.abuse.bt {
         enabled.push("bt");
     }
+    if state.policy.abuse.smtp {
+        enabled.push("smtp");
+    }
     format!(
         "policy_revision={}; managed_rfw_rules={}; abuse_ports={}",
         state.revision,
@@ -826,25 +836,309 @@ fn summary(state: &State) -> String {
     )
 }
 
+impl AbusePolicy {
+    fn enabled(&self) -> bool {
+        self.speedtest
+            || self.mining
+            || self.bt
+            || self.smtp
+            || self.observe_mining
+            || self.observe_bt
+    }
+}
+
+const ABUSE_MARKER_ARGS: &[&str] = &["-m", "comment", "--comment", ABUSE_MARKER, "-j", "RETURN"];
+
+struct ExpectedAbuseRule<'a> {
+    interface: &'a str,
+    category: &'static str,
+    transport: &'static str,
+    ports: &'static str,
+    signature: &'static str,
+    args: Vec<&'a str>,
+}
+
+#[derive(Default)]
+struct LiveAbuseRule<'a> {
+    args: Vec<std::borrow::Cow<'a, str>>,
+    packets: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbuseFamilyReadback {
+    family: String,
+    status: String,
+    chain_present: bool,
+    forward_jump: bool,
+    rules: Vec<AbuseRuleReadback>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AbuseRuleReadback {
+    interface: String,
+    category: String,
+    transport: String,
+    destination_ports: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    signature: String,
+    present: bool,
+    packets: u64,
+    bytes: u64,
+}
+
+fn abuse_rules(policy: &AbusePolicy) -> Vec<ExpectedAbuseRule<'_>> {
+    let mut rules = Vec::new();
+    for iface in &policy.interfaces {
+        let mut add = |category, transport, ports, multiport, reset| {
+            let mut args = vec!["-i", iface.as_str(), "-p", transport];
+            if multiport {
+                args.extend_from_slice(&["-m", "multiport", "--dports", ports]);
+            } else {
+                args.extend_from_slice(&["--dport", ports]);
+            }
+            if reset {
+                args.extend_from_slice(&["-j", "REJECT", "--reject-with", "tcp-reset"]);
+            } else {
+                args.extend_from_slice(&["-j", "DROP"]);
+            }
+            rules.push(ExpectedAbuseRule {
+                interface: iface,
+                category,
+                transport,
+                ports,
+                signature: "",
+                args,
+            });
+        };
+        if policy.speedtest {
+            add("speedtest", "tcp", "5201", false, true);
+            add("speedtest", "udp", "5201", false, false);
+        }
+        if policy.mining {
+            add(
+                "mining",
+                "tcp",
+                "3333,4444,5555,6666,7777,8888,9999,14433,14444",
+                true,
+                true,
+            );
+        }
+        if policy.bt {
+            for protocol in ["tcp", "udp"] {
+                for port in ["6881:6889", "6969", "51413"] {
+                    add("bt", protocol, port, false, false);
+                }
+                add("bt", protocol, "4662,4672", true, false);
+            }
+        }
+        if policy.smtp {
+            add("smtp", "tcp", "25,465,587,2525", true, true);
+        }
+    }
+    // Match the order produced by earlier versions inserting at position 1.
+    rules.reverse();
+    let mut observers = Vec::new();
+    for iface in &policy.interfaces {
+        let mut add = |category, transport, signature, matches: &[(&'static str, &'static str)]| {
+            let mut args = vec!["-i", iface.as_str(), "-p", transport];
+            for &(kind, pattern) in matches {
+                args.extend_from_slice(&[
+                    "-m", "string", kind, pattern, "--algo", "kmp", "--from", "28", "--to", "256",
+                ]);
+            }
+            // A rule without a target increments its counter and continues.
+            observers.push(ExpectedAbuseRule {
+                interface: iface,
+                category,
+                transport,
+                ports: "",
+                signature,
+                args,
+            });
+        };
+        if policy.observe_mining {
+            add(
+                "mining",
+                "tcp",
+                "stratum_subscribe",
+                &[
+                    ("--string", r#""method""#),
+                    ("--string", r#""mining.subscribe""#),
+                ],
+            );
+            add(
+                "mining",
+                "tcp",
+                "stratum_authorize",
+                &[
+                    ("--string", r#""method""#),
+                    ("--string", r#""mining.authorize""#),
+                ],
+            );
+        }
+        if policy.observe_bt {
+            add(
+                "bt",
+                "tcp",
+                "bittorrent_handshake",
+                &[("--hex-string", "|13426974546f7272656e742070726f746f636f6c|")],
+            );
+            add(
+                "bt",
+                "udp",
+                "dht_get_peers",
+                &[
+                    ("--string", "d1:ad2:id20:"),
+                    ("--string", "e1:q9:get_peers1:t"),
+                    ("--string", "1:y1:qe"),
+                ],
+            );
+            add(
+                "bt",
+                "udp",
+                "dht_announce_peer",
+                &[
+                    ("--string", "d1:ad2:id20:"),
+                    ("--string", "e1:q13:announce_peer1:t"),
+                    ("--string", "1:y1:qe"),
+                ],
+            );
+        }
+    }
+    observers.extend(rules);
+    observers
+}
+
+fn parse_abuse_rule<'a>(line: &'a str, chain: &str) -> Option<LiveAbuseRule<'a>> {
+    let mut fields = line.split_whitespace().peekable();
+    if fields.next() != Some("-A") || fields.next() != Some(chain) {
+        return None;
+    }
+    let mut rule = LiveAbuseRule::default();
+    while let Some(field) = fields.next() {
+        match field {
+            "-c" => {
+                rule.packets = fields.next()?.parse().ok()?;
+                rule.bytes = fields.next()?.parse().ok()?;
+            }
+            "-m" if matches!(fields.peek(), Some(&"tcp") | Some(&"udp")) => {
+                // iptables prints the implicit transport match explicitly.
+                fields.next();
+            }
+            _ if field.starts_with('"') => match serde_json::from_str(field) {
+                Ok(decoded) => rule.args.push(std::borrow::Cow::Owned(decoded)),
+                Err(_) => rule.args.push(std::borrow::Cow::Borrowed(field)),
+            },
+            _ => rule.args.push(std::borrow::Cow::Borrowed(field)),
+        }
+    }
+    Some(rule)
+}
+
+fn same_abuse_rules(live: &[LiveAbuseRule<'_>], want: &[ExpectedAbuseRule<'_>]) -> bool {
+    live.len() == want.len() + 1
+        && live
+            .last()
+            .is_some_and(|rule| rule.args == ABUSE_MARKER_ARGS)
+        && live.iter().zip(want).all(|(a, b)| a.args == b.args)
+}
+
+fn ipv6_abuse_supported() -> bool {
+    std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+        .is_ok_and(|s| s.trim() != "1")
+}
+
+async fn read_abuse(policy: &AbusePolicy) -> Vec<AbuseFamilyReadback> {
+    let want = abuse_rules(policy);
+    let mut families = vec![read_abuse_family("iptables", "ipv4", &want).await];
+    if ipv6_abuse_supported() {
+        families.push(read_abuse_family("ip6tables", "ipv6", &want).await);
+    }
+    families
+}
+
+async fn read_abuse_family(
+    tool: &str,
+    family: &str,
+    want: &[ExpectedAbuseRule<'_>],
+) -> AbuseFamilyReadback {
+    let mut result = AbuseFamilyReadback {
+        family: family.into(),
+        status: "unavailable".into(),
+        chain_present: false,
+        forward_jump: false,
+        rules: Vec::new(),
+    };
+    let Ok(data) = fw_output(tool, &["-S", "-v"]).await else {
+        return result;
+    };
+    inspect_abuse(&data, want, &mut result);
+    result
+}
+
+fn inspect_abuse(data: &str, want: &[ExpectedAbuseRule<'_>], result: &mut AbuseFamilyReadback) {
+    result.chain_present = data
+        .lines()
+        .any(|line| line.split_whitespace().eq(["-N", ABUSE_CHAIN]));
+    result.forward_jump = data
+        .lines()
+        .filter_map(|line| parse_abuse_rule(line, "FORWARD"))
+        .any(|r| r.args == ["-j", ABUSE_CHAIN]);
+    let mut live: Vec<_> = data
+        .lines()
+        .filter_map(|line| parse_abuse_rule(line, ABUSE_CHAIN))
+        .collect();
+    result.status = if want.is_empty() && !result.chain_present && !result.forward_jump {
+        "disabled"
+    } else if result.chain_present && !live.iter().any(|rule| rule.args == ABUSE_MARKER_ARGS) {
+        live.clear();
+        "unowned"
+    } else if !want.is_empty()
+        && result.chain_present
+        && result.forward_jump
+        && same_abuse_rules(&live, want)
+    {
+        "in_sync"
+    } else {
+        "drifted"
+    }
+    .into();
+    for expected in want {
+        let rule = live.iter().find(|rule| rule.args == expected.args);
+        result.rules.push(AbuseRuleReadback {
+            interface: expected.interface.into(),
+            category: expected.category.into(),
+            transport: expected.transport.into(),
+            destination_ports: expected.ports.into(),
+            signature: expected.signature.into(),
+            present: rule.is_some(),
+            packets: rule.map_or(0, |r| r.packets),
+            bytes: rule.map_or(0, |r| r.bytes),
+        });
+    }
+}
+
 async fn apply_abuse(policy: &AbusePolicy) -> Result<()> {
     apply_abuse_family("iptables", policy).await?;
-    if std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/disable_ipv6")
-        .is_ok_and(|s| s.trim() != "1")
-    {
+    if ipv6_abuse_supported() {
         apply_abuse_family("ip6tables", policy).await?;
     }
     Ok(())
 }
 
 async fn apply_abuse_family(tool: &str, policy: &AbusePolicy) -> Result<()> {
-    let enabled = policy.speedtest || policy.mining || policy.bt;
     let existing = fw_output(tool, &["-S", ABUSE_CHAIN]).await;
-    if let Ok(lines) = &existing
-        && !lines.contains(ABUSE_MARKER)
-    {
+    let mut live: Vec<_> = existing
+        .as_deref()
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| parse_abuse_rule(line, ABUSE_CHAIN))
+        .collect();
+    if existing.is_ok() && !live.iter().any(|r| r.args == ABUSE_MARKER_ARGS) {
         bail!("refusing to modify an existing unowned firewall chain");
     }
-    if !enabled {
+    if !policy.enabled() {
         if existing.is_err() {
             return Ok(());
         }
@@ -858,106 +1152,56 @@ async fn apply_abuse_family(tool: &str, policy: &AbusePolicy) -> Result<()> {
         fw_command(tool, &["-X", ABUSE_CHAIN]).await?;
         return Ok(());
     }
+    let mut marker = vec!["-A", ABUSE_CHAIN];
+    marker.extend_from_slice(ABUSE_MARKER_ARGS);
     if existing.is_err() {
         fw_command(tool, &["-N", ABUSE_CHAIN]).await?;
-        fw_command(
-            tool,
-            &[
-                "-A",
-                ABUSE_CHAIN,
-                "-m",
-                "comment",
-                "--comment",
-                ABUSE_MARKER,
-                "-j",
-                "RETURN",
-            ],
-        )
-        .await?;
-    } else {
-        fw_command(tool, &["-F", ABUSE_CHAIN]).await?;
-        fw_command(
-            tool,
-            &[
-                "-A",
-                ABUSE_CHAIN,
-                "-m",
-                "comment",
-                "--comment",
-                ABUSE_MARKER,
-                "-j",
-                "RETURN",
-            ],
-        )
-        .await?;
+        if let Err(err) = fw_command(tool, &marker).await {
+            let _ = fw_command(tool, &["-X", ABUSE_CHAIN]).await;
+            return Err(err.context("mark managed abuse chain ownership"));
+        }
+        live.push(LiveAbuseRule {
+            args: ABUSE_MARKER_ARGS
+                .iter()
+                .copied()
+                .map(std::borrow::Cow::Borrowed)
+                .collect(),
+            ..Default::default()
+        });
     }
-    for iface in &policy.interfaces {
-        if policy.speedtest {
-            insert_abuse(
-                tool,
-                iface,
-                &[
-                    "-p",
-                    "tcp",
-                    "--dport",
-                    "5201",
-                    "-j",
-                    "REJECT",
-                    "--reject-with",
-                    "tcp-reset",
-                ],
-            )
-            .await?;
-            insert_abuse(tool, iface, &["-p", "udp", "--dport", "5201", "-j", "DROP"]).await?;
+    let want = abuse_rules(policy);
+    if !same_abuse_rules(&live, &want) {
+        // Keep a terminator and ownership marker throughout reconciliation.
+        if live.last().is_none_or(|r| r.args != ABUSE_MARKER_ARGS) {
+            fw_command(tool, &marker).await?;
+            live.push(LiveAbuseRule {
+                args: ABUSE_MARKER_ARGS
+                    .iter()
+                    .copied()
+                    .map(std::borrow::Cow::Borrowed)
+                    .collect(),
+                ..Default::default()
+            });
         }
-        if policy.mining {
-            insert_abuse(
-                tool,
-                iface,
-                &[
-                    "-p",
-                    "tcp",
-                    "-m",
-                    "multiport",
-                    "--dports",
-                    "3333,4444,5555,6666,7777,8888,9999,14433,14444",
-                    "-j",
-                    "REJECT",
-                    "--reject-with",
-                    "tcp-reset",
-                ],
-            )
-            .await?;
-        }
-        if policy.bt {
-            for protocol in ["tcp", "udp"] {
-                for ports in ["6881:6889", "6969", "51413", "4662,4672"] {
-                    if ports.contains(',') {
-                        insert_abuse(
-                            tool,
-                            iface,
-                            &[
-                                "-p",
-                                protocol,
-                                "-m",
-                                "multiport",
-                                "--dports",
-                                ports,
-                                "-j",
-                                "DROP",
-                            ],
-                        )
-                        .await?;
-                    } else {
-                        insert_abuse(
-                            tool,
-                            iface,
-                            &["-p", protocol, "--dport", ports, "-j", "DROP"],
-                        )
-                        .await?;
+        for (i, rule) in want.iter().enumerate() {
+            let position = (i + 1).to_string();
+            let mut args = vec!["-I", ABUSE_CHAIN, position.as_str()];
+            args.extend_from_slice(&rule.args);
+            if let Err(err) = fw_command(tool, &args).await {
+                for position in (1..=i).rev() {
+                    let position = position.to_string();
+                    if let Err(rollback) = fw_command(tool, &["-D", ABUSE_CHAIN, &position]).await {
+                        return Err(
+                            err.context(format!("roll back added abuse rules: {rollback:#}"))
+                        );
                     }
                 }
+                return Err(err.context("add managed abuse rule"));
             }
+        }
+        for i in (0..live.len() - 1).rev() {
+            let position = (want.len() + i + 1).to_string();
+            fw_command(tool, &["-D", ABUSE_CHAIN, &position]).await?;
         }
     }
     if fw_command(tool, &["-C", "FORWARD", "-j", ABUSE_CHAIN])
@@ -967,12 +1211,6 @@ async fn apply_abuse_family(tool: &str, policy: &AbusePolicy) -> Result<()> {
         fw_command(tool, &["-I", "FORWARD", "1", "-j", ABUSE_CHAIN]).await?;
     }
     Ok(())
-}
-
-async fn insert_abuse(tool: &str, iface: &str, rest: &[&str]) -> Result<()> {
-    let mut args = vec!["-I", ABUSE_CHAIN, "1", "-i", iface];
-    args.extend_from_slice(rest);
-    fw_command(tool, &args).await
 }
 
 async fn fw_command(tool: &str, args: &[&str]) -> Result<()> {
@@ -1120,4 +1358,53 @@ fn url_encode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod abuse_tests {
+    use super::*;
+
+    #[test]
+    fn readback_distinguishes_port_rejects_and_signature_counters() {
+        let policy = AbusePolicy {
+            smtp: true,
+            observe_mining: true,
+            interfaces: vec!["rmbr0".into()],
+            ..Default::default()
+        };
+        let want = abuse_rules(&policy);
+        let mut snapshot = format!("-N {ABUSE_CHAIN}\n-A FORWARD -c 7 560 -j {ABUSE_CHAIN}\n");
+        for rule in &want {
+            snapshot.push_str(&format!("-A {ABUSE_CHAIN}"));
+            for arg in &rule.args {
+                if arg.contains('"') {
+                    snapshot.push_str(&format!(" {}", serde_json::to_string(arg).unwrap()));
+                } else {
+                    snapshot.push_str(&format!(" {arg}"));
+                }
+            }
+            snapshot.push_str(" -c 4 410\n");
+        }
+        snapshot.push_str(&format!(
+            "-A {ABUSE_CHAIN} -m comment --comment \"{ABUSE_MARKER}\" -c 0 0 -j RETURN\n"
+        ));
+
+        let mut readback = AbuseFamilyReadback {
+            family: "ipv6".into(),
+            status: "unavailable".into(),
+            chain_present: false,
+            forward_jump: false,
+            rules: Vec::new(),
+        };
+        inspect_abuse(&snapshot, &want, &mut readback);
+
+        assert_eq!(readback.status, "in_sync");
+        assert!(readback.chain_present && readback.forward_jump);
+        assert_eq!(readback.rules[0].signature, "stratum_subscribe");
+        assert_eq!(readback.rules[0].packets, 4);
+        assert_eq!(readback.rules[0].bytes, 410);
+        assert!(!want[0].args.contains(&"-j"));
+        assert_eq!(readback.rules[2].destination_ports, "25,465,587,2525");
+        assert!(want[2].args.contains(&"REJECT"));
+    }
 }

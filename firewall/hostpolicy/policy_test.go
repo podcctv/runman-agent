@@ -41,14 +41,24 @@ func (f *fakeFirewallRunner) run(_ context.Context, binary string, args ...strin
 		f.chains[chain] = true
 		f.rules[chain] = nil
 	case "-S":
+		if chain == "-v" {
+			var rows []string
+			for name, rules := range f.rules {
+				rows = append(rows, "-N "+name)
+				for _, rule := range rules {
+					rows = append(rows, "-A "+name+" "+firewallRuleText(rule)+" -c 7 420")
+				}
+			}
+			return []byte(strings.Join(rows, "\n")), nil
+		}
 		if !f.chains[chain] {
 			return nil, errors.New("chain missing")
 		}
+		var rows []string
 		for _, rule := range f.rules[chain] {
-			if strings.Contains(strings.Join(rule, " "), abuseChainMarker) {
-				return []byte("-A " + chain + " -m comment --comment " + abuseChainMarker + " -j RETURN\n"), nil
-			}
+			rows = append(rows, "-A "+chain+" "+firewallRuleText(rule))
 		}
+		return []byte(strings.Join(rows, "\n")), nil
 	case "-C":
 		if !hasArgs(f.rules[chain], rest) {
 			return nil, errors.New("rule missing")
@@ -56,11 +66,20 @@ func (f *fakeFirewallRunner) run(_ context.Context, binary string, args ...strin
 	case "-A":
 		f.rules[chain] = append(f.rules[chain], append([]string(nil), rest...))
 	case "-I":
-		if len(rest) < 2 || rest[0] != "1" {
+		index, err := strconv.Atoi(rest[0])
+		if err != nil || index < 1 || index > len(f.rules[chain])+1 {
 			return nil, errors.New("unexpected insert")
 		}
-		f.rules[chain] = append([][]string{append([]string(nil), rest[1:]...)}, f.rules[chain]...)
+		f.rules[chain] = slices.Insert(f.rules[chain], index-1, append([]string(nil), rest[1:]...))
 	case "-D":
+		if len(rest) == 1 {
+			index, err := strconv.Atoi(rest[0])
+			if err != nil || index < 1 || index > len(f.rules[chain]) {
+				return nil, errors.New("unexpected delete index")
+			}
+			f.rules[chain] = slices.Delete(f.rules[chain], index-1, index)
+			return nil, nil
+		}
 		for i, rule := range f.rules[chain] {
 			if equalArgs(rule, rest) {
 				f.rules[chain] = append(f.rules[chain][:i], f.rules[chain][i+1:]...)
@@ -83,6 +102,16 @@ func (f *fakeFirewallRunner) run(_ context.Context, binary string, args ...strin
 		return nil, errors.New("unexpected firewall operation: " + op)
 	}
 	return nil, nil
+}
+
+func firewallRuleText(rule []string) string {
+	args := slices.Clone(rule)
+	for i, arg := range args {
+		if strings.ContainsAny(arg, "\" ") {
+			args[i] = strconv.Quote(arg)
+		}
+	}
+	return strings.Join(args, " ")
 }
 
 func hasArgs(rows [][]string, wanted []string) bool {
@@ -168,6 +197,11 @@ func TestApplyOwnsOnlyWatcherRulesAndForwardAbuseChain(t *testing.T) {
 	if !hasArgs(runner.rules[abuseChain], []string{"-i", "incusbr0", "-p", "tcp", "--dport", "5201", "-j", "REJECT", "--reject-with", "tcp-reset"}) {
 		t.Fatalf("abuse policy was not scoped to the selected container bridge: %#v", runner.rules[abuseChain])
 	}
+	readback, err := m.Readback(context.Background())
+	if err != nil || len(readback.Abuse) != 1 || readback.Abuse[0].Status != "in_sync" {
+		t.Fatalf("managed policy did not expose live abuse readback: %+v, %v", readback.Abuse, err)
+	}
+
 	for _, command := range runner.commands {
 		joined := strings.Join(command, " ")
 		if strings.Contains(joined, " INPUT ") || strings.Contains(joined, " OUTPUT ") {
@@ -665,5 +699,108 @@ func TestEventsReportsUnsupportedWhenRFWHasNoEventsRoute(t *testing.T) {
 	m := &Manager{rfwURL: server.URL, client: server.Client()}
 	if _, err := m.Events(context.Background(), "", 25); !errors.Is(err, ErrRFWEventsUnsupported) {
 		t.Fatalf("expected explicit unsupported result for absent RFW events route, got %v", err)
+	}
+}
+
+func TestAbuseReadbackAndReconcileKeepLiveCounters(t *testing.T) {
+	ctx := context.Background()
+	runner := newFakeFirewallRunner()
+	policy := AbusePolicy{SMTP: true, Speedtest: true, Interfaces: []string{"incusbr0"}}
+	if err := applyAbuseFamily(ctx, runner.run, "iptables", policy); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyAbuseFamily(ctx, runner.run, "iptables", policy); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAbuseFamily(ctx, runner.run, "iptables", "ipv4", abuseRules(policy)); got.Status != "in_sync" ||
+		!got.ChainPresent || !got.ForwardJump || len(got.Rules) != 3 ||
+		got.Rules[0] != (AbuseRuleReadback{Interface: "incusbr0", Category: "smtp", Transport: "tcp", DestinationPorts: "25,465,587,2525", Present: true, Packets: 7, Bytes: 420}) {
+		t.Fatalf("unexpected readback: %+v", got)
+	}
+	runner.commands = nil
+	if err := applyAbuseFamily(ctx, runner.run, "iptables", policy); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range runner.commands {
+		if !slices.Contains([]string{"-S", "-C"}, command[4]) {
+			t.Fatalf("unchanged reconciliation mutated counters: %v", command)
+		}
+	}
+	runner.rules["FORWARD"] = nil
+	runner.rules[abuseChain] = runner.rules[abuseChain][1:]
+	got := readAbuseFamily(ctx, runner.run, "iptables", "ipv4", abuseRules(policy))
+	if got.Status != "drifted" || got.Rules[0].Present || got.ForwardJump {
+		t.Fatalf("missing rule and jump were not reported: %+v", got)
+	}
+	if err := applyAbuseFamily(ctx, runner.run, "iptables", policy); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAbuseFamily(ctx, runner.run, "iptables", "ipv4", abuseRules(policy)); got.Status != "in_sync" {
+		t.Fatalf("drift repair did not converge: %+v", got)
+	}
+}
+
+func TestAbuseReadbackParsesLegacyCountersBeforeTarget(t *testing.T) {
+	data := []byte("-N " + abuseChain + "\n" +
+		"-A FORWARD -c 2 80 -j " + abuseChain + "\n" +
+		"-A " + abuseChain + " -i incusbr0 -p tcp -m tcp --dport 5201 -c 9 987 -j REJECT --reject-with tcp-reset\n" +
+		"-A " + abuseChain + " -m comment --comment \"" + abuseChainMarker + "\" -c 0 0 -j RETURN\n")
+	run := func(context.Context, string, ...string) ([]byte, error) { return data, nil }
+	got := readAbuseFamily(context.Background(), run, "ip6tables", "ipv6", abuseRules(AbusePolicy{Speedtest: true, Interfaces: []string{"incusbr0"}}))
+	if got.Status != "drifted" || !got.ForwardJump || got.Rules[0].Present || got.Rules[1].Packets != 9 || got.Rules[1].Bytes != 987 {
+		t.Fatalf("legacy counter row was not decoded: %+v", got)
+	}
+}
+
+func TestObserveAbuseCountsWithoutBlockingAndPreservesLegacyRules(t *testing.T) {
+	ctx := context.Background()
+	runner := newFakeFirewallRunner()
+	policy := AbusePolicy{Mining: true, ObserveMining: true, ObserveBT: true, Interfaces: []string{"rmbr0"}}
+	if err := applyAbusePolicy(ctx, runner.run, policy, true, func(string) bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+	for i, rule := range runner.rules[abuseChain] {
+		if i < 5 && (slices.Contains(rule, "-j") || !slices.Contains(rule, "string")) {
+			t.Fatalf("observation rule should count and continue: %v", rule)
+		}
+	}
+	report := readAbuse(ctx, runner.run, policy, true)
+	for _, family := range report {
+		if family.Status != "in_sync" || len(family.Rules) != 6 || family.Rules[0].Signature != "stratum_subscribe" ||
+			family.Rules[4].Signature != "dht_announce_peer" || family.Rules[5].DestinationPorts == "" {
+			t.Fatalf("unexpected observation readback: %+v", family)
+		}
+	}
+	policy.ObserveMining = false
+	policy.ObserveBT = false
+	if err := applyAbuseFamily(ctx, runner.run, "iptables", policy); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAbuseFamily(ctx, runner.run, "iptables", "ipv4", abuseRules(policy)); got.Status != "in_sync" || len(got.Rules) != 1 {
+		t.Fatalf("disabling observation did not converge: %+v", got)
+	}
+}
+
+func TestAbuseApplyRestoresPriorRulesOnMatchExtensionFailure(t *testing.T) {
+	ctx := context.Background()
+	runner := newFakeFirewallRunner()
+	policy := AbusePolicy{Mining: true, Interfaces: []string{"incusbr0"}}
+	if err := applyAbuseFamily(ctx, runner.run, "iptables", policy); err != nil {
+		t.Fatal(err)
+	}
+	unsupported := func(ctx context.Context, tool string, args ...string) ([]byte, error) {
+		if args[3] == "-I" && slices.Contains(args, `"mining.authorize"`) {
+			return nil, errors.New("test string match insertion failure")
+		}
+		return runner.run(ctx, tool, args...)
+	}
+	updated := policy
+	updated.ObserveMining = true
+	if err := applyAbuseFamily(ctx, unsupported, "iptables", updated); err == nil {
+		t.Fatal("expected observation rule insertion to fail")
+	}
+	got := readAbuseFamily(ctx, runner.run, "iptables", "ipv4", abuseRules(policy))
+	if got.Status != "in_sync" || !got.Rules[0].Present {
+		t.Fatalf("failed apply changed the previous rules: %+v", got)
 	}
 }

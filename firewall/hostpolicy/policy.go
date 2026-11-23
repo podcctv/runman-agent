@@ -90,10 +90,13 @@ type Rule struct {
 }
 
 type AbusePolicy struct {
-	Speedtest  bool     `json:"speedtest"`
-	Mining     bool     `json:"mining"`
-	BT         bool     `json:"bt"`
-	Interfaces []string `json:"interfaces"`
+	Speedtest     bool     `json:"speedtest"`
+	Mining        bool     `json:"mining"`
+	BT            bool     `json:"bt"`
+	SMTP          bool     `json:"smtp,omitempty"`
+	ObserveMining bool     `json:"observe_mining,omitempty"`
+	ObserveBT     bool     `json:"observe_bt,omitempty"`
+	Interfaces    []string `json:"interfaces"`
 }
 
 type managedRule struct {
@@ -142,6 +145,7 @@ type Readback struct {
 	DriftCount         int                    `json:"drift_count"`
 	MissingCount       int                    `json:"missing_count"`
 	Rules              []RuleReadback         `json:"rules"`
+	Abuse              []AbuseFamilyReadback  `json:"abuse,omitempty"`
 	ExpectedRules      []ExpectedRuleReadback `json:"expected_rules"`
 }
 
@@ -371,7 +375,7 @@ func validatePolicy(policy Policy) (Policy, error) {
 			seenInterfaces[name] = true
 		}
 	}
-	if (policy.Abuse.Speedtest || policy.Abuse.Mining || policy.Abuse.BT) && len(interfaces) == 0 {
+	if policy.Abuse.enabled() && len(interfaces) == 0 {
 		return Policy{}, errors.New("container abuse rules require an explicit bridge interface")
 	}
 	normalized.Abuse.Interfaces = interfaces
@@ -661,6 +665,7 @@ func (m *Manager) Readback(ctx context.Context) (Readback, error) {
 	actualByID := make(map[int]rfwRule, len(rows))
 	actualFingerprints := make(map[int]string, len(rows))
 	result := Readback{
+		Abuse:  readAbuse(ctx, m.run, m.state.Policy.Abuse, m.ipv6 != nil && m.ipv6()),
 		Status: "in_sync", ObservedAt: time.Now().Unix(), RFWAPIVersion: apiVersion,
 		PolicyConfigured:  m.state.Revision > 0,
 		CapabilitiesKnown: capabilitiesKnown, SupportedProtocols: make([]string, 0, len(supportedProtocols)),
@@ -1059,6 +1064,9 @@ func abuseSummary(policy AbusePolicy) string {
 	}
 	if policy.BT {
 		enabled = append(enabled, "bt")
+	}
+	if policy.SMTP {
+		enabled = append(enabled, "smtp")
 	}
 	if len(enabled) == 0 {
 		return "off"
