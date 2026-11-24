@@ -123,7 +123,6 @@ func (m *Manager) ReinstallVM(ctx context.Context, req *agent.CmdReinstallVM) er
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	_ = m.deleteVM(ctx, req.VmId)
 	return m.createVM(ctx, &agent.CmdCreateVM{
 		VmId:          req.VmId,
 		OsImage:       req.OsImage,
@@ -150,7 +149,9 @@ func (m *Manager) createVM(ctx context.Context, req *agent.CmdCreateVM) error {
 	}
 
 	// 0. 清理同名旧实例（如果存在）
-	_ = m.deleteVM(ctx, req.VmId)
+	if err := m.deleteVM(ctx, req.VmId); err != nil {
+		return fmt.Errorf("clean up previous instance: %w", err)
+	}
 
 	// 1. 分配索引
 	idx, err := m.db.NextIncusIdx()
@@ -500,8 +501,12 @@ write_files:
 }
 
 func (m *Manager) deleteVM(ctx context.Context, vmID string) error {
-	// 先删 DB 记录：DB 失败时中止，避免出现"实例已删但 DB 仍有记录"的不一致状态。
-	// 若 DB 成功但后续实例删除失败，下次 Cleanup 会将其作为幽灵实例清理。
+	if err := removeInstance(ctx, vmID); err != nil {
+		return err
+	}
+
+	// Keep registration and networking intact until Incus confirms deletion.
+	// A retry also cleans up registration when the instance is already absent.
 	if err := m.db.DeleteVMConfig(vmID); err != nil {
 		log.Printf("[Incus][DeleteVM] error: failed to delete VMConfig for %s: %v", vmID, err)
 		return fmt.Errorf("delete VMConfig: %w", err)
@@ -510,25 +515,11 @@ func (m *Manager) deleteVM(ctx context.Context, vmID string) error {
 		log.Printf("[Incus][DeleteVM] warning: failed to delete IncusConfig for %s: %v", vmID, err)
 	}
 
-	// 强杀并删除实例
-	stopOp, _ := m.client.UpdateInstanceState(vmID, api.InstanceStatePut{Action: "stop", Timeout: -1, Force: true}, "")
-	if stopOp != nil {
-		_ = stopOp.Wait()
-	}
-
-	op, err := m.client.DeleteInstance(vmID)
-	if err != nil {
-		return err
-	}
-	return op.Wait()
+	return nil
 }
 
 func (m *Manager) startVM(ctx context.Context, vmID string) error {
-	op, err := m.client.UpdateInstanceState(vmID, api.InstanceStatePut{Action: "start", Timeout: -1}, "")
-	if err != nil {
-		return err
-	}
-	return op.Wait()
+	return changeInstanceState(ctx, vmID, api.InstanceStatePut{Action: "start"})
 }
 
 func (m *Manager) configureRunningInstance(ctx context.Context, vmID, distro, rootPassword, ipv4 string, ipv6s []string, ipv6Mask, gw6 string) error {
@@ -687,23 +678,11 @@ func (m *Manager) execInstanceWithRetry(ctx context.Context, vmID string, comman
 }
 
 func (m *Manager) stopVM(ctx context.Context, vmID string, force bool) error {
-	op, err := m.client.UpdateInstanceState(vmID, api.InstanceStatePut{Action: "stop", Timeout: -1, Force: force}, "")
-	if err != nil {
-		return err
-	}
-	return op.Wait()
+	return changeInstanceState(ctx, vmID, stopRequest(force))
 }
 
 func (m *Manager) restartVM(ctx context.Context, vmID string) error {
-	// An infinite graceful timeout can leave the API request and Incus operation
-	// stuck forever when a minimal OpenRC guest doesn't handle the reboot signal.
-	// Force makes restart deterministic while the finite timeout remains useful
-	// to Incus implementations that attempt a graceful shutdown first.
-	op, err := m.client.UpdateInstanceState(vmID, api.InstanceStatePut{Action: "restart", Timeout: 10, Force: true}, "")
-	if err != nil {
-		return err
-	}
-	return op.Wait()
+	return changeInstanceState(ctx, vmID, api.InstanceStatePut{Action: "restart", Force: true})
 }
 
 func (m *Manager) ensureReadyImage(ctx context.Context, baseAlias, readyAlias, distro string, baseIsLocal bool) error {
@@ -833,13 +812,16 @@ runcmd:
 			return err
 		}
 	}
-	_ = op.Wait()
+	if err := op.Wait(); err != nil {
+		return fmt.Errorf("create image builder: %w", err)
+	}
 
+	cleanupBuilder := true
 	defer func() {
-		_ = m.stopVM(ctx, builderName, true)
-		op, _ := m.client.DeleteInstance(builderName)
-		if op != nil {
-			_ = op.Wait()
+		if cleanupBuilder {
+			if err := removeInstance(context.WithoutCancel(ctx), builderName); err != nil {
+				log.Printf("[Incus] Cleanup image builder %s: %v", builderName, err)
+			}
 		}
 	}()
 
@@ -866,6 +848,7 @@ runcmd:
 	_ = m.client.DeleteInstanceFile(builderName, "/root/build_done")
 
 	if err := m.stopVM(ctx, builderName, false); err != nil {
+		cleanupBuilder = false
 		return err
 	}
 

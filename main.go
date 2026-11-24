@@ -783,10 +783,12 @@ func (a *Agent) handleCommand(stream agent.AgentGateway_ConnectClient, env *agen
 		}
 	case *agent.PlatformEnvelope_DeleteVm:
 		err = a.mgr.DeleteVM(ctx, p.DeleteVm.VmId)
-		// DeleteVM already removes VMConfig from DB; only clean up ancillary records here.
-		_ = a.db.DeleteTraffic(p.DeleteVm.VmId)
-		a.pf.DeleteVM(ctx, p.DeleteVm.VmId)
-		a.wg.DeleteVM(p.DeleteVm.VmId)
+		if err == nil {
+			// DeleteVM already removes VMConfig from DB; clean up ancillary records here.
+			_ = a.db.DeleteTraffic(p.DeleteVm.VmId)
+			a.pf.DeleteVM(ctx, p.DeleteVm.VmId)
+			a.wg.DeleteVM(p.DeleteVm.VmId)
+		}
 
 	case *agent.PlatformEnvelope_StartVm:
 		err = a.mgr.StartVM(ctx, p.StartVm.VmId)
